@@ -4,6 +4,8 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 import type { ConnectorConfig } from "./config";
+import { spawnDetached } from "./spawn";
+import type { ConnectorState } from "./state";
 
 /**
  * Claude Code resumes a conversation by scanning
@@ -115,4 +117,35 @@ export function executeForkPlan(plan: ForkPlan, sourceWorktreePath: string): voi
       );
     }
   }
+}
+
+/**
+ * Carries out a Fork end to end -- plans it, executes it against git and the
+ * filesystem, then spawns and waits for the new Session's own connector
+ * process -- and returns its published state, which is where the new
+ * Session's Control URL lives. No printing: shared by the CLI's `fork()`
+ * (cli/commands.ts, which prints for a human at a terminal) and the poll
+ * loop's own handling of a `fork_request` (session/watchers.ts), which
+ * reports the outcome as a transcript event instead. See
+ * docs/specs/session-forking.md and .scratch/fork-from-chat-ui/spec.md.
+ */
+export async function runFork(
+  config: ConnectorConfig,
+  sdkSessionId: string | undefined,
+  name: string,
+  fromRef: string | undefined,
+): Promise<ConnectorState> {
+  const plan = planFork({
+    sourceWorktreePath: config.projectDir,
+    sourceConfig: config,
+    sdkSessionId,
+    name,
+    fromRef,
+  });
+
+  executeForkPlan(plan, config.projectDir);
+
+  const forkConfig: ConnectorConfig = { ...config, projectDir: plan.worktreePath };
+  const forkConfigPath = join(plan.worktreePath, "connector.config.json");
+  return spawnDetached(forkConfig, forkConfigPath);
 }

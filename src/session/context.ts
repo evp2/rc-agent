@@ -6,6 +6,11 @@ import type { CommandRecord, EventInput, RelayClient } from "../relay/client";
 import type { InFlight } from "./inFlight";
 import type { ConnectorState } from "../state";
 
+/** What a Fork attempt resolves to on success -- see {@link SessionContext.executeFork}. */
+export interface ForkOutcome {
+  controlUrl: string | undefined;
+}
+
 /**
  * The Turn currently executing, if any -- shared between {@link runTurn} in
  * turn.ts and {@link watchForSteers} in watchers.ts.
@@ -82,6 +87,22 @@ export interface SessionContext {
    * request isn't re-sent to the SDK on every poll.
    */
   lastHandledKillAt: string | undefined;
+
+  /**
+   * The `requested_at` of the most recent Fork already actioned, so the same
+   * `fork_request` isn't re-run on every poll -- mirrors {@link lastHandledKillAt}.
+   */
+  lastHandledForkAt: string | undefined;
+
+  /**
+   * Carries out a Fork by name: `git worktree add`, a generated config, a
+   * best-effort transcript copy, and a new connector process, returning that
+   * process's Control URL. A field rather than a direct import for the same
+   * reason `query` is -- the real implementation spawns a detached OS process
+   * and waits on its state file, which a test must not do; a test hands this
+   * a stub instead.
+   */
+  readonly executeFork: (name: string) => Promise<ForkOutcome>;
 
   /**
    * In-memory only, by design: a Command the current Turn was too late to

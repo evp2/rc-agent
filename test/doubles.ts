@@ -261,6 +261,8 @@ export function makeTurnHarness(
     projectDir?: string;
     /** Overrides merged into the fake config -- e.g. `inactivityCompact` for Auto-compact tests. */
     config?: Partial<SessionContext["config"]>;
+    /** Stubs `ctx.executeFork` -- defaults to a no-op success, overridden by Fork tests to assert what it was called with or to simulate a failure. */
+    executeFork?: SessionContext["executeFork"];
   } = {},
 ): TurnHarness {
   const relay = new FakeRelay();
@@ -313,6 +315,8 @@ export function makeTurnHarness(
     sessionEnded: false,
     runningTasks: [],
     lastHandledKillAt: undefined,
+    lastHandledForkAt: undefined,
+    executeFork: opts.executeFork ?? (async () => ({ controlUrl: undefined })),
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,

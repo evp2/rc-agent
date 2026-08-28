@@ -1,4 +1,5 @@
 import { PERMISSION_MODE, type ConnectorConfig, type InactivityCompactConfig } from "../config";
+import { runFork } from "../fork";
 import { buildProviderEnv } from "../provider";
 import { createSdkMessageMapper } from "../sdk/bridge";
 import { RelayClient, SessionEndedError } from "../relay/client";
@@ -10,7 +11,7 @@ import type { SessionContext } from "./context";
 import { flushEvents } from "./events";
 import { InFlight } from "./inFlight";
 import { runTurn } from "./turn";
-import { watchForKills, watchForSteers } from "./watchers";
+import { watchForForkRequests, watchForKills, watchForSteers } from "./watchers";
 
 const POLL_INTERVAL_MS = 1750;
 const FLUSH_INTERVAL_MS = 750;
@@ -199,6 +200,11 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     sessionEnded: false,
     runningTasks: [],
     lastHandledKillAt: undefined,
+    lastHandledForkAt: undefined,
+    executeFork: async (name) => {
+      const state = await runFork(config, ctx.sdkSessionId, name, undefined);
+      return { controlUrl: state.controlUrl };
+    },
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,
@@ -262,6 +268,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   }, INFLIGHT_RECONCILE_INTERVAL_MS);
   const stopWatchingKills = watchForKills(ctx);
   const stopWatchingSteers = watchForSteers(ctx);
+  const stopWatchingForks = watchForForkRequests(ctx);
 
   let shuttingDown = false;
   let resolveDone: () => void = () => undefined;
@@ -283,6 +290,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     clearInterval(inFlightReconcileTimer);
     stopWatchingKills();
     stopWatchingSteers();
+    stopWatchingForks();
     if (!ctx.sessionEnded) await flushEvents(ctx).catch(() => undefined);
     resolveDone();
   }

@@ -1,26 +1,13 @@
-import { spawn } from "node:child_process";
-import { closeSync, openSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 import type { ConnectorConfig } from "../config";
-import { executeForkPlan, planFork } from "../fork";
+import { runFork } from "../fork";
 import { printPairingQrCode } from "../qr";
 import { RelayClient, SessionEndedError } from "../relay/client";
 import { runConnector } from "../session/loop";
-import {
-  ensureStateDir,
-  isProcessAlive,
-  liveConnector,
-  logPath,
-  readState,
-  statePath,
-  writeState,
-} from "../state";
+import { spawnDetached } from "../spawn";
+import { isProcessAlive, liveConnector, logPath, readState, statePath, writeState } from "../state";
 import { CONNECTOR_VERSION } from "../version";
-
-// How long `crc start` waits for the detached process to publish a session.
-const START_TIMEOUT_MS = 45_000;
-const START_POLL_MS = 250;
 
 /** Prints the share link, if this relay minted one -- absent against an older deployment. */
 function printShareUrl(staticUrl: string | undefined): void {
@@ -34,6 +21,22 @@ function printShareUrl(staticUrl: string | undefined): void {
  */
 function printControlUrl(controlUrl: string | undefined): void {
   if (controlUrl) console.log(`Control (full access -- do not share):\n  ${controlUrl}\n`);
+}
+
+/**
+ * The phone URL, QR code, Control link, and share link -- the tail every
+ * "here's your running connector" report ends with, whether the connector
+ * was already running, was just started, or was just forked.
+ */
+function printConnectionReport(state: {
+  phoneUrl: string;
+  controlUrl?: string;
+  staticUrl?: string;
+}): void {
+  console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
+  printPairingQrCode(state.phoneUrl);
+  printControlUrl(state.controlUrl);
+  printShareUrl(state.staticUrl);
 }
 
 export async function runForeground(config: ConnectorConfig): Promise<void> {
@@ -68,64 +71,25 @@ export async function start(config: ConnectorConfig, configPath: string): Promis
   const existing = liveConnector(config.projectDir);
   if (existing) {
     console.log(`Already running for ${config.projectDir} (pid ${existing.pid}).`);
-    console.log(`Open on your phone:\n  ${existing.phoneUrl}\n`);
-    printPairingQrCode(existing.phoneUrl);
-    printControlUrl(existing.controlUrl);
-    printShareUrl(existing.staticUrl);
+    printConnectionReport(existing);
     return;
   }
 
-  const entry = process.argv[1];
-  if (!entry || entry.endsWith(".ts")) {
-    throw new Error(
-      "'crc start' needs the built entrypoint -- run 'npm run build' and start " +
-        "via dist/index.js (or use 'crc run' to stay in the foreground).",
-    );
+  let state;
+  try {
+    state = await spawnDetached(config, configPath);
+  } catch (e) {
+    const log = logPath(config.projectDir);
+    throw new Error(`${(e as Error).message}\n\n${tailLog(log, 20)}`);
   }
-
-  ensureStateDir();
-  const log = logPath(config.projectDir);
-  const logFd = openSync(log, "a");
-  const startedAt = Date.now();
-
-  const child = spawn(process.execPath, [entry, "run", "--config", configPath], {
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-    cwd: config.projectDir,
-    env: process.env,
-  });
-  child.unref();
-  closeSync(logFd);
-
-  // Wait for the child to publish its own pid alongside a session, so a state
-  // file left by a previous run can't be mistaken for this one's.
-  const deadline = Date.now() + START_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const state = readState(config.projectDir);
-    if (state && state.pid === child.pid && Date.parse(state.startedAt) >= startedAt - 1000) {
-      console.log(`Connector started for ${config.projectDir} (pid ${state.pid}).`);
-      console.log(`Logging to ${log}`);
-      console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
-      printPairingQrCode(state.phoneUrl);
-      printControlUrl(state.controlUrl);
-      printShareUrl(state.staticUrl);
-      return;
-    }
-    if (child.pid && !isProcessAlive(child.pid)) break;
-    await sleep(START_POLL_MS);
-  }
-
-  throw new Error(
-    `Connector did not start within ${Math.round(START_TIMEOUT_MS / 1000)}s.\n` +
-      `Check the log for why:\n  ${log}\n\n${tailLog(log, 20)}`,
-  );
+  console.log(`Connector started for ${config.projectDir} (pid ${state.pid}).`);
+  console.log(`Logging to ${logPath(config.projectDir)}`);
+  printConnectionReport(state);
 }
 
 /**
  * Creates a new Session in a new git Worktree of `config.projectDir`'s repo
- * and starts it -- `git worktree add`, a generated config, a best-effort
- * transcript copy so the new Session resumes the source's conversation, then
- * the same detached-spawn path `start()` already uses. See
+ * and starts it, printing the same start-up report `crc start` does. See
  * docs/specs/session-forking.md.
  */
 export async function fork(
@@ -134,19 +98,10 @@ export async function fork(
   fromRef: string | undefined,
 ): Promise<void> {
   const sourceState = readState(config.projectDir);
-  const plan = planFork({
-    sourceWorktreePath: config.projectDir,
-    sourceConfig: config,
-    sdkSessionId: sourceState?.sdkSessionId,
-    name,
-    fromRef,
-  });
-
-  executeForkPlan(plan, config.projectDir);
-
-  const forkConfig: ConnectorConfig = { ...config, projectDir: plan.worktreePath };
-  const forkConfigPath = join(plan.worktreePath, "connector.config.json");
-  await start(forkConfig, forkConfigPath);
+  const state = await runFork(config, sourceState?.sdkSessionId, name, fromRef);
+  console.log(`Connector started for ${state.projectDir} (pid ${state.pid}).`);
+  console.log(`Logging to ${logPath(state.projectDir)}`);
+  printConnectionReport(state);
 }
 
 export async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
