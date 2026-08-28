@@ -5,7 +5,7 @@ import { parseArgs } from "node:util";
 import { resolve } from "node:path";
 
 import { loadConfig } from "../config";
-import { qr, runForeground, start, status, stop } from "./commands";
+import { fork, qr, runForeground, start, status, stop } from "./commands";
 
 const USAGE = `crc -- claude-remote-control connector
 
@@ -17,6 +17,11 @@ Usage:
   crc status  [--config <path>]   Report connector and session health
   crc qr      [--config <path>]   Print the pairing URL and QR code (add
                                   --share for the Netlify share link instead)
+  crc fork <name> [--from <ref>] [--config <path>]
+                                  Create a new Session in a new git worktree
+                                  (sibling to this one, branched from <ref> or
+                                  HEAD), seeded with this Session's
+                                  conversation, and start it
   crc run     [--config <path>]   Run in the foreground (Ctrl-C to stop)
 
 With no subcommand, crc runs in the foreground.
@@ -24,7 +29,7 @@ With no subcommand, crc runs in the foreground.
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const known = ["start", "stop", "status", "qr", "run"];
+  const known = ["start", "stop", "status", "qr", "fork", "run"];
   const subcommand = argv[0] && !argv[0].startsWith("-") ? argv[0] : "run";
   const rest = subcommand === argv[0] ? argv.slice(1) : argv;
 
@@ -36,14 +41,15 @@ async function main(): Promise<void> {
     throw new Error(`Unknown subcommand '${subcommand}'.\n\n${USAGE}`);
   }
 
-  const { values } = parseArgs({
+  const { values, positionals } = parseArgs({
     args: rest,
     options: {
       config: { type: "string", short: "c", default: "./connector.config.json" },
       end: { type: "boolean", default: false },
       share: { type: "boolean", default: false },
+      from: { type: "string" },
     },
-    allowPositionals: false,
+    allowPositionals: subcommand === "fork",
   });
 
   const configPath = resolve(values.config as string);
@@ -60,6 +66,11 @@ async function main(): Promise<void> {
       return status(config);
     case "qr":
       return qr(config, values.share as boolean);
+    case "fork": {
+      const name = positionals[0];
+      if (!name) throw new Error(`'crc fork' requires a name.\n\n${USAGE}`);
+      return fork(config, name, values.from as string | undefined);
+    }
   }
 }
 

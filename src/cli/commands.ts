@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { closeSync, openSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import type { ConnectorConfig } from "../config";
+import { executeForkPlan, planFork } from "../fork";
 import { printPairingQrCode } from "../qr";
 import { RelayClient, SessionEndedError } from "../relay/client";
 import { runConnector } from "../session/loop";
@@ -117,6 +119,34 @@ export async function start(config: ConnectorConfig, configPath: string): Promis
     `Connector did not start within ${Math.round(START_TIMEOUT_MS / 1000)}s.\n` +
       `Check the log for why:\n  ${log}\n\n${tailLog(log, 20)}`,
   );
+}
+
+/**
+ * Creates a new Session in a new git Worktree of `config.projectDir`'s repo
+ * and starts it -- `git worktree add`, a generated config, a best-effort
+ * transcript copy so the new Session resumes the source's conversation, then
+ * the same detached-spawn path `start()` already uses. See
+ * docs/specs/session-forking.md.
+ */
+export async function fork(
+  config: ConnectorConfig,
+  name: string,
+  fromRef: string | undefined,
+): Promise<void> {
+  const sourceState = readState(config.projectDir);
+  const plan = planFork({
+    sourceWorktreePath: config.projectDir,
+    sourceConfig: config,
+    sdkSessionId: sourceState?.sdkSessionId,
+    name,
+    fromRef,
+  });
+
+  executeForkPlan(plan, config.projectDir);
+
+  const forkConfig: ConnectorConfig = { ...config, projectDir: plan.worktreePath };
+  const forkConfigPath = join(plan.worktreePath, "connector.config.json");
+  await start(forkConfig, forkConfigPath);
 }
 
 export async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
