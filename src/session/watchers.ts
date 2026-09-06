@@ -1,6 +1,7 @@
 import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 
 import { userTextMessage } from "../sdk/asyncQueue";
+import { ForkError } from "../fork";
 import { SessionEndedError, type CommandRecord } from "../relay/client";
 import type { SessionContext } from "./context";
 
@@ -88,6 +89,10 @@ export async function checkForkRequest(ctx: SessionContext): Promise<void> {
           fork_requested_at: request.requested_at,
           fork_name: request.name,
           fork_error: (e as Error).message,
+          // Spread rather than set: an unclassified failure must post the same
+          // shape it always has, so a relay and phone that predate the code
+          // see nothing new and behave exactly as before.
+          ...(e instanceof ForkError && e.code ? { fork_error_code: e.code } : {}),
         },
       ])
       .catch((postErr) => {

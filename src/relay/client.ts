@@ -1,3 +1,4 @@
+import type { ForkErrorCode } from "../fork";
 import { CONNECTOR_VERSION } from "../version";
 
 /** One skill the connector discovered, for the phone's "/" menu. */
@@ -105,6 +106,8 @@ export interface EventInput {
   fork_control_url?: string;
   /** git's own error text, unmodified, on a `status` event reporting a failed Fork. */
   fork_error?: string;
+  /** Why the Fork failed, when it could be classified -- an addition to `fork_error`, never a replacement. */
+  fork_error_code?: ForkErrorCode;
 }
 
 export interface CreateSessionInput {

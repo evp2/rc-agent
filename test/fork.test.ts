@@ -6,7 +6,16 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { ConnectorConfig } from "../src/config.ts";
-import { encodeProjectPath, executeForkPlan, planFork, transcriptPath } from "../src/fork.ts";
+import {
+  ForkError,
+  classifyForkFailure,
+  encodeProjectPath,
+  executeForkPlan,
+  planFork,
+  readForkNameState,
+  runFork,
+  transcriptPath,
+} from "../src/fork.ts";
 
 const baseConfig: ConnectorConfig = {
   relayBaseUrl: "http://relay.test",
@@ -221,4 +230,73 @@ test("executeForkPlan lets git's own error propagate for a branch name collision
 
   executeForkPlan(plan, repo);
   assert.throws(() => executeForkPlan(plan, repo));
+});
+
+// --- classification, the domain rule from CONTEXT.md ---
+
+function planFor(repo: string, name: string): ReturnType<typeof planFork> {
+  return planFork({
+    sourceWorktreePath: repo,
+    sourceConfig: baseConfig,
+    sdkSessionId: undefined,
+    name,
+    fromRef: undefined,
+  });
+}
+
+test("classifyForkFailure calls an existing branch name_taken", () => {
+  const repo = initRepo();
+  execFileSync("git", ["branch", "taken-branch"], { cwd: repo });
+  const plan = planFor(repo, "taken-branch");
+
+  assert.equal(classifyForkFailure(plan, repo, readForkNameState(plan, repo)), "name_taken");
+});
+
+test("classifyForkFailure calls an existing worktree directory name_taken, with no branch of that name", () => {
+  const repo = initRepo();
+  const plan = planFor(repo, "taken-dir");
+  mkdirSync(plan.worktreePath);
+
+  assert.equal(classifyForkFailure(plan, repo, readForkNameState(plan, repo)), "name_taken");
+});
+
+test("classifyForkFailure calls a name git rejects as a ref invalid_name", () => {
+  const repo = initRepo();
+  const plan = planFor(repo, "fix login bug");
+
+  assert.equal(classifyForkFailure(plan, repo, readForkNameState(plan, repo)), "invalid_name");
+});
+
+test("classifyForkFailure returns undefined for a failure that is neither", () => {
+  const repo = initRepo();
+  const plan = planFor(repo, "perfectly-fine");
+
+  assert.equal(classifyForkFailure(plan, repo, readForkNameState(plan, repo)), undefined);
+});
+
+// `git worktree add` creates the branch and the directory, and the steps after
+// it can still fail. Asking what exists *after* that would find the failed
+// attempt's own leftovers and call a name that was free taken.
+test("classifyForkFailure ignores a branch and directory the failed attempt created itself", () => {
+  const repo = initRepo();
+  const plan = planFor(repo, "half-done");
+  const before = readForkNameState(plan, repo);
+
+  executeForkPlan(plan, repo);
+
+  assert.equal(classifyForkFailure(plan, repo, before), undefined);
+});
+
+test("runFork throws a ForkError carrying git's text unmodified and the code", async () => {
+  const repo = initRepo();
+  execFileSync("git", ["branch", "already-here"], { cwd: repo });
+
+  const error = await runFork({ ...baseConfig, projectDir: repo }, undefined, "already-here", undefined).then(
+    () => undefined,
+    (e: unknown) => e,
+  );
+
+  assert.ok(error instanceof ForkError);
+  assert.equal(error.code, "name_taken");
+  assert.match(error.message, /already exists/);
 });

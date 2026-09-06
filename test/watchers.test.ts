@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { ForkError } from "../src/fork.ts";
 import { checkForkRequest } from "../src/session/watchers.ts";
 import { SessionEndedError } from "../src/relay/client.ts";
 import { makeTurnHarness } from "./doubles.ts";
@@ -57,6 +58,51 @@ test("checkForkRequest posts the failure shape with git's own error text, unmodi
       fork_requested_at: "2026-01-01T00:00:00.000Z",
       fork_name: "fix-login-bug",
       fork_error: "fatal: a branch named 'fix-login-bug' already exists",
+    },
+  ]);
+});
+
+test("checkForkRequest carries a classified fork_error_code alongside the raw text", async () => {
+  const h = makeTurnHarness([], {
+    executeFork: async () => {
+      throw new ForkError("fatal: a branch named 'fix-login-bug' already exists", "name_taken");
+    },
+  });
+  h.relay.getSession = async () => ({
+    fork_request: { name: "fix-login-bug", requested_at: "2026-01-01T00:00:00.000Z" },
+  });
+
+  await checkForkRequest(h.ctx);
+
+  assert.deepEqual(h.relay.posted, [
+    {
+      type: "status",
+      fork_requested_at: "2026-01-01T00:00:00.000Z",
+      fork_name: "fix-login-bug",
+      fork_error: "fatal: a branch named 'fix-login-bug' already exists",
+      fork_error_code: "name_taken",
+    },
+  ]);
+});
+
+test("checkForkRequest omits fork_error_code when the failure could not be classified", async () => {
+  const h = makeTurnHarness([], {
+    executeFork: async () => {
+      throw new ForkError("fatal: something nobody anticipated", undefined);
+    },
+  });
+  h.relay.getSession = async () => ({
+    fork_request: { name: "fix-login-bug", requested_at: "2026-01-01T00:00:00.000Z" },
+  });
+
+  await checkForkRequest(h.ctx);
+
+  assert.deepEqual(h.relay.posted, [
+    {
+      type: "status",
+      fork_requested_at: "2026-01-01T00:00:00.000Z",
+      fork_name: "fix-login-bug",
+      fork_error: "fatal: something nobody anticipated",
     },
   ]);
 });
