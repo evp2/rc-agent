@@ -1,0 +1,11 @@
+{
+  "relayBaseUrl": "https://okykx6ve84.execute-api.us-east-1.amazonaws.com/test",
+  "_connectorCredentialB64": "WGszbVE5cFJ0TDdi",
+  "projectDir": "",
+  "provider": {
+    "type": "anthropic"
+  },
+  "inactivityCompact": {
+    "afterMinutes": 30
+  }
+}
