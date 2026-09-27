@@ -385,6 +385,7 @@ export async function makeTurnHarness(
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,
+    engineTurn: undefined,
     contextWarningActive: false,
     flushChain: Promise.resolve(),
   };

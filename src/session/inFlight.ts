@@ -143,6 +143,12 @@ export class InFlight {
   private readonly entries = new Map<string, ClaimEntry>();
   private cursorSeq: string | undefined;
   private live: TurnClaimsImpl | undefined;
+  /**
+   * A Turn the Engine started on its own is running. It holds no Command, so
+   * it has no entry and nothing for a restart to report, but it is work the
+   * brake can stop, so it counts toward the relay-facing fact all the same.
+   */
+  private engineTurnHeld = false;
   private readonly deps: InFlightDeps;
 
   constructor(deps: InFlightDeps, opts: { cursor?: string } = {}) {
@@ -177,11 +183,29 @@ export class InFlight {
    * work reads as continuous rather than flickering.
    */
   async hold(command: CommandRecord, status: ClaimStatus): Promise<void> {
-    const wasEmpty = this.entries.size === 0;
+    const wasIdle = !this.busy;
     this.entries.set(command.seq, { seq: command.seq, text: command.text, status });
     this.cursorSeq = command.seq;
     this.mirror();
-    if (wasEmpty) await this.report(true);
+    if (wasIdle) await this.report(true);
+  }
+
+  /** A Turn the Engine started on its own began. Reports in-flight true on the transition from holding nothing. */
+  async holdEngineTurn(): Promise<void> {
+    if (this.engineTurnHeld) return;
+    const wasIdle = !this.busy;
+    this.engineTurnHeld = true;
+    if (wasIdle) await this.report(true);
+  }
+
+  /**
+   * That Turn ended. A Command Steered into it is already held by then, so
+   * the relay-facing fact stays true across the seam rather than flickering.
+   */
+  async releaseEngineTurn(): Promise<void> {
+    if (!this.engineTurnHeld) return;
+    this.engineTurnHeld = false;
+    if (!this.busy) await this.report(false);
   }
 
   /** Moves an already-held Command to `running`. No cursor movement -- holding it already advanced the cursor. */
@@ -196,7 +220,7 @@ export class InFlight {
   async settle(seq: string): Promise<void> {
     if (!this.entries.delete(seq)) return;
     this.mirror();
-    if (this.entries.size === 0) await this.report(false);
+    if (!this.busy) await this.report(false);
   }
 
   /**
@@ -301,7 +325,12 @@ export class InFlight {
    * the module stays drivable from a test without fake timers.
    */
   async reconcileOnce(): Promise<void> {
-    await this.report(this.entries.size > 0);
+    await this.report(this.busy);
+  }
+
+  /** Whether anything counts as in flight: a held Command, or a Turn the Engine started on its own. */
+  private get busy(): boolean {
+    return this.entries.size > 0 || this.engineTurnHeld;
   }
 
   private mirror(): void {

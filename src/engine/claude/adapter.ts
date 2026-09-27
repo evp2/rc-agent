@@ -245,6 +245,14 @@ class ClaudeEngineSession implements EngineSession {
         // instant the real init followed it.
         if (!this.isRecognizedNonInit(message)) continue;
 
+        // A Background task outlives the Turn that started it, so news of one
+        // landing between Turns is the session's, not a Turn of its own --
+        // the Turn it may wake the agent into comes with its own `init`.
+        if (!turnStartedForCurrentSubturn && this.isBackgroundTaskNews(message)) {
+          this.translateNonInit(message);
+          continue;
+        }
+
         // A Local command Steered in is answered by the CLI itself, inside
         // whatever Turn is running, with no fresh `init` to confirm it. Its
         // output is the first sign it was taken, so the Steer's Turn starts
@@ -396,6 +404,15 @@ class ClaudeEngineSession implements EngineSession {
       );
     }
     return message.type === "conversation_reset" || message.type === "assistant" || message.type === "user" || message.type === "result";
+  }
+
+  private isBackgroundTaskNews(message: SDKMessage): boolean {
+    return (
+      message.type === "system" &&
+      (message.subtype === "task_started" ||
+        message.subtype === "task_notification" ||
+        message.subtype === "background_tasks_changed")
+    );
   }
 
   /** Translates every message shape except `init`/`compact_boundary`/`result`, which the caller handles itself. Returns true when handled. */

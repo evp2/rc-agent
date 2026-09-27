@@ -46,9 +46,9 @@ export function isAutoCompactDue(
  * Submits Auto-compact when it's due, through the same endpoint the phone
  * uses so it inherits the ordinary cursor/at-most-once/Steer handling every
  * other Command gets, rather than running as a special case here. Called once
- * per poll-loop tick, only when nothing is currently in flight -- the loop is
- * never mid-`runTurn` at this point, so "not busy" is automatic, not checked
- * explicitly.
+ * per poll-loop tick, when the loop is never mid-`runTurn`; the one thing
+ * that can still be busy then is a Turn the Engine started on its own, which
+ * a `/compact` would otherwise Steer.
  *
  * `lastAutoCompactAt` is persisted only on a confirmed submission, never
  * speculatively: a failed POST must retry on the next tick, not be silently
@@ -56,7 +56,7 @@ export function isAutoCompactDue(
  */
 export async function maybeSubmitAutoCompact(ctx: SessionContext): Promise<void> {
   const cfg = ctx.config.inactivityCompact;
-  if (!cfg || !isAutoCompactDue(ctx.state, cfg)) return;
+  if (!cfg || ctx.engineTurn || !isAutoCompactDue(ctx.state, cfg)) return;
   try {
     await ctx.client.postCommand("/compact");
     persist(ctx, { lastAutoCompactAt: new Date().toISOString() });
@@ -260,6 +260,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,
+    engineTurn: undefined,
     contextWarningActive: false,
     flushChain: Promise.resolve(),
   };
@@ -350,8 +351,8 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       }
       if (!ctx.running) break;
 
-      // Nothing is in flight at this point in the loop -- runTurn is always
-      // awaited before control gets back here -- so this is exactly the
+      // No Command is in flight at this point in the loop -- runTurn is
+      // always awaited before control gets back here -- so this is the
       // "idle and not busy" moment Auto-compact's trigger condition needs.
       await maybeSubmitAutoCompact(ctx);
 
