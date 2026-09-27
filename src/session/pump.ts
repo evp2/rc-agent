@@ -3,15 +3,21 @@ import { persist, publishSkills, trackBackgroundTasks } from "./commands";
 import { attributionKey } from "./contribution";
 import type { CurrentTurn, SessionContext } from "./context";
 import { mapContentEvent } from "./engineEvents";
+import { EngineStartedTurn, WakeCauses } from "./engineTurn";
 import { reportTurnEnded, stampContextReading } from "./turn";
 
 /** Said on the phone when the Engine could not resume the Conversation the state file named, and started a fresh one. */
 export const LOST_CONVERSATION_TEXT =
   "couldn't resume the previous conversation -- this is a fresh one, with no memory of it";
 
-/** Who the Turn running right now belongs to: a Command's chain, or nobody (the Engine started it on its own). */
+/**
+ * Who the Turn running right now belongs to: a Command's chain, the Engine
+ * itself, or nobody -- a Command's or a Steer's Turn whose chain already gave
+ * up on it, such as one a Stop paired off after the fact.
+ */
 interface PumpState {
-  owner: CurrentTurn | "engine" | undefined;
+  owner: CurrentTurn | EngineStartedTurn | "unowned" | undefined;
+  wakeCauses: WakeCauses;
 }
 
 /**
@@ -45,13 +51,14 @@ export async function handleEngineEvent(
       return;
 
     case "turn_started": {
+      const wakeCause = state.wakeCauses.take();
       const chain = ctx.currentTurn;
       if (chain?.owns(event.cause)) {
         state.owner = chain;
         await chain.onTurnStarted(event.cause);
       } else {
         chain?.onOtherTurnStarted();
-        state.owner = "engine";
+        state.owner = event.cause === "engine" ? await EngineStartedTurn.begin(ctx, wakeCause) : "unowned";
       }
       return;
     }
@@ -59,16 +66,19 @@ export async function handleEngineEvent(
     case "turn_ended": {
       const owner = state.owner;
       state.owner = undefined;
-      if (owner && owner !== "engine") {
+      if (owner instanceof EngineStartedTurn) {
+        await owner.end(event);
+      } else if (owner && owner !== "unowned") {
         await owner.onTurnEnded(event);
       } else {
-        // A Turn no Command is waiting on -- the Engine started it on its own.
         reportTurnEnded(ctx, event, { repo: await attributionKey(ctx.config.projectDir) });
       }
       return;
     }
 
     default: {
+      if (event.type === "task_started") state.wakeCauses.noteStarted(event);
+      if (event.type === "task_settled") state.wakeCauses.noteSettled(event);
       const mapped = mapContentEvent(event);
       if (event.type === "compacted" && mapped[0]) stampContextReading(ctx, mapped[0], event.contextPercentage);
       trackBackgroundTasks(ctx, mapped);
@@ -84,7 +94,7 @@ export async function handleEngineEvent(
  * chain still waiting on a Turn boundary that can no longer come.
  */
 export async function pumpEngineEvents(ctx: SessionContext): Promise<void> {
-  const state: PumpState = { owner: undefined };
+  const state: PumpState = { owner: undefined, wakeCauses: new WakeCauses() };
   for await (const event of ctx.engineSession.events) {
     try {
       await handleEngineEvent(ctx, event, state);

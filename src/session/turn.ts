@@ -123,6 +123,8 @@ class CommandChain implements CurrentTurn {
     private readonly claims: TurnClaims,
     readonly abortController: AbortController,
     private readonly repo: string | undefined,
+    /** How the chain's first Turn starts: its Command's own, or a Steer into a Turn the Engine started on its own. */
+    private readonly firstCause: "command" | "steer",
   ) {
     this.sawRealActivity = command.source !== "auto";
     abortController.signal.addEventListener("abort", this.onAbort, { once: true });
@@ -130,8 +132,8 @@ class CommandChain implements CurrentTurn {
 
   owns(cause: TurnCause): boolean {
     if (this.finished) return false;
-    if (cause === "command") return !this.started;
-    return cause === "steer" && this.started && !this.running;
+    if (!this.started) return cause === this.firstCause;
+    return cause === "steer" && !this.running;
   }
 
   async onTurnStarted(cause: TurnCause): Promise<void> {
@@ -178,11 +180,21 @@ class CommandChain implements CurrentTurn {
   }
 
   onOtherTurnStarted(): void {
-    if (this.started && !this.running) this.finish();
+    // A chain Steered into the Engine's own Turn is, before it starts,
+    // waiting on a Steer just like one between two of its own Turns.
+    if (!this.running && (this.started || this.firstCause === "steer")) this.finish();
   }
 
   release(): void {
     this.finish();
+  }
+
+  /**
+   * True once a Stop has discarded the Steer this chain began with, into a
+   * Turn the Engine started on its own, before that Steer's Turn began.
+   */
+  get steerDiscarded(): boolean {
+    return this.firstCause === "steer" && !this.started && this.abortController.signal.aborted;
   }
 
   private readonly onAbort = (): void => {
@@ -195,6 +207,9 @@ class CommandChain implements CurrentTurn {
       this.ctx.eventBuffer.push({ type: "status", text: "turn stopped" });
       this.finish();
     }
+    // Waiting on a Steer into the Engine's own Turn: the Stop discards it the
+    // same way, and that Turn reports its own stop.
+    if (this.steerDiscarded) this.finish();
   };
 
   private finish(): void {
@@ -248,10 +263,18 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
         );
         return;
       }
-      const chain = new CommandChain(ctx, command, claims, abortController, repo);
+      // A Command arriving while the Engine works on its own Steers that
+      // Turn, just as it would Steer a Command's. No await between the Steer
+      // and the chain taking over: the pump must find the chain in place
+      // before the Steer's own Turn can start.
+      const firstCause = ctx.engineTurn?.steer(command.text) ? "steer" : "command";
+      const chain = new CommandChain(ctx, command, claims, abortController, repo, firstCause);
       ctx.currentTurn = chain;
-      ctx.engineSession.send(command.text);
+      if (firstCause === "command") ctx.engineSession.send(command.text);
       await chain.done;
+      // Discarded visibly, as a pending Steer always is under Stop: the
+      // brake starting fresh work is not a brake.
+      if (chain.steerDiscarded) await ctx.inFlight.drop(command.seq);
     } finally {
       stopWatching();
       ctx.currentTurn = undefined;

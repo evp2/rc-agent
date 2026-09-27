@@ -2,6 +2,7 @@ import type { ConnectorConfig } from "../config";
 import type { Engine, EngineEvent, EngineSession } from "../engine/types";
 import type { CommandRecord, EventInput, RelayClient } from "../relay/client";
 import type { createBannerDeduper } from "./engineEvents";
+import type { EngineStartedTurn } from "./engineTurn";
 import type { InFlight } from "./inFlight";
 import type { ConnectorState } from "../state";
 
@@ -119,6 +120,9 @@ export interface SessionContext {
   questionPending: boolean;
 
   currentTurn: CurrentTurn | undefined;
+
+  /** The Turn the Engine started on its own, while one is running -- what a Command arriving meanwhile Steers. */
+  engineTurn: EngineStartedTurn | undefined;
 
   /**
    * Whether a Context-window warning has already fired for the current

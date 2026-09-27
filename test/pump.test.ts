@@ -167,6 +167,7 @@ test("a Turn the Engine starts on its own is reported, and holds no Command", as
 
   assert.ok(h.ctx.eventBuffer.some((e) => e.text === "picked the work back up"));
   assert.equal(h.ledger.snapshot(), undefined);
-  assert.deepEqual(h.relay.reports, []);
+  await until(() => h.relay.lastReport === false);
+  assert.deepEqual(h.relay.reports, [true, false], "In flight while it ran, though it held no Command");
   await h.close();
 });
