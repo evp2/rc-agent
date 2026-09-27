@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { loadConfig } from "../src/config.ts";
+import { engineKindFor, loadConfig } from "../src/config.ts";
 
 function writeConfig(body: Record<string, unknown>): string {
   const dir = mkdtempSync(join(tmpdir(), "crc-config-"));
@@ -84,4 +84,13 @@ test("a non-numeric contextWarningThresholdPercent is rejected", () => {
     () => loadConfig(writeConfig({ ...base, contextWarningThresholdPercent: "70" })),
     /contextWarningThresholdPercent/,
   );
+});
+
+test("an anthropic provider means the Claude Engine", () => {
+  assert.equal(engineKindFor(loadConfig(writeConfig(base)).provider), "claude");
+});
+
+test("a bedrock provider means the Claude Engine", () => {
+  const config = loadConfig(writeConfig({ ...base, provider: { type: "bedrock", region: "us-east-1" } }));
+  assert.equal(engineKindFor(config.provider), "claude");
 });

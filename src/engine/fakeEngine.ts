@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { AsyncQueue } from "../sdk/asyncQueue";
+import { AsyncQueue } from "../asyncQueue";
 import type { SkillInfo } from "../relay/client";
 import type {
   Engine,

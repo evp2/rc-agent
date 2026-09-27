@@ -1,13 +1,12 @@
 import { PERMISSION_MODE, type ConnectorConfig, type InactivityCompactConfig } from "../config";
-import { createClaudeEngine } from "../engine/claude/adapter";
+import { createEngine } from "../engine/create";
 import { fakeEnginePersona } from "../engine/fakePersonas";
-import type { Engine } from "../engine/types";
+import type { Engine, EngineKind } from "../engine/types";
 import { runFork } from "../fork";
-import { buildProviderEnv } from "../provider";
 import { RelayClient, SessionEndedError } from "../relay/client";
-import { probeSkills } from "../skills";
-import { readState, writeState, type ConnectorState } from "../state";
-import { persist, publishSkills } from "./commands";
+import { takeForkedConversation } from "../spawn";
+import { isReusableState, readState, writeState, type ConnectorState } from "../state";
+import { persist } from "./commands";
 import type { SessionContext } from "./context";
 import { createBannerDeduper } from "./engineEvents";
 import { flushEvents } from "./events";
@@ -100,10 +99,10 @@ export function reportTasksInterruptedByRestart(
  * harness, naming a scripted persona (see engine/fakePersonas.ts) to play
  * instead of a real, model-backed agent. Unset in every real deployment.
  */
-function selectEngine(config: ConnectorConfig, providerEnv: NodeJS.ProcessEnv): Engine {
+function selectEngine(config: ConnectorConfig): Engine {
   const persona = process.env.CRC_FAKE_ENGINE;
   if (persona) return fakeEnginePersona(persona, config.projectDir);
-  return createClaudeEngine(providerEnv);
+  return createEngine(config);
 }
 
 export interface RunHandle {
@@ -122,11 +121,10 @@ export interface RunHandle {
  * in the state file over minting a new one, so an ordinary restart costs the
  * phone no re-pairing.
  *
- * State belonging to a different relay or project directory is ignored rather
- * than trusted -- a config edit should not silently reattach the connector to a
- * session created under the old settings.
+ * State belonging to a different relay, project directory or Engine is ignored
+ * rather than trusted -- see {@link isReusableState}.
  */
-async function acquireSession(config: ConnectorConfig): Promise<{
+async function acquireSession(config: ConnectorConfig, engine: EngineKind): Promise<{
   client: RelayClient;
   phoneUrl: string;
   staticUrl: string | undefined;
@@ -134,12 +132,8 @@ async function acquireSession(config: ConnectorConfig): Promise<{
   resumed: ConnectorState | undefined;
 }> {
   const previous = readState(config.projectDir);
-  const reusable =
-    previous &&
-    previous.relayBaseUrl === config.relayBaseUrl &&
-    previous.projectDir === config.projectDir;
 
-  if (reusable) {
+  if (isReusableState(previous, config, engine)) {
     try {
       const client = await RelayClient.resume(
         config.relayBaseUrl,
@@ -185,9 +179,14 @@ async function acquireSession(config: ConnectorConfig): Promise<{
  * session is live, so a caller can report the phone URL before the loop ends.
  */
 export async function runConnector(config: ConnectorConfig): Promise<RunHandle> {
-  const providerEnv = buildProviderEnv(config.provider);
-  const engine = selectEngine(config, providerEnv);
-  const { client, phoneUrl, staticUrl, controlUrl, resumed } = await acquireSession(config);
+  // Taken before the Engine is built, which copies the environment for the
+  // agent process.
+  const forkedConversation = takeForkedConversation();
+  const engine = selectEngine(config);
+  const { client, phoneUrl, staticUrl, controlUrl, resumed } = await acquireSession(config, engine.kind);
+  // A state file's Conversation wins; failing that, the one a Fork carried
+  // into this brand-new worktree.
+  const conversationId = resumed?.conversationId ?? forkedConversation;
 
   // Declared before the context so the ledger's dependencies can close over
   // it: the ledger persists and emits through the same paths everything else
@@ -211,7 +210,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   // can no longer be resumed, which the Engine reports as lost instead.
   const engineSession = await engine.open({
     projectDir: config.projectDir,
-    resume: resumed?.sdkSessionId,
+    resume: conversationId,
     onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
   });
 
@@ -235,7 +234,8 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       staticUrl,
       controlUrl,
       commandCursor: resumed?.commandCursor,
-      sdkSessionId: resumed?.sdkSessionId,
+      conversationId,
+      engine: engine.kind,
       inFlight: undefined,
       // Auto-compact's `lastRealTurnCompletedAt`/`lastAutoCompactAt` are
       // omitted on purpose, not forgotten: a restart resets the idle clock so
@@ -246,7 +246,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       updatedAt: new Date().toISOString(),
     },
     lastSkillsJson: undefined,
-    conversationId: resumed?.sdkSessionId,
+    conversationId,
     eventBuffer: [],
     running: true,
     sessionEnded: false,
@@ -254,7 +254,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     lastHandledKillAt: undefined,
     lastHandledForkAt: undefined,
     executeFork: async (name) => {
-      const state = await runFork(config, ctx.conversationId, name, undefined);
+      const state = await runFork(config, engine, ctx.conversationId, name, undefined);
       return { controlUrl: state.controlUrl };
     },
     handBackBuffer: [],
@@ -267,22 +267,6 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   persist(ctx, {});
 
   const pumping = pumpEngineEvents(ctx);
-
-  // Populates the phone's menu before the first turn ever runs. Spawns a
-  // throwaway query() purely to read the skill list -- see probeSkills for why
-  // this costs no model spend. Not awaited: the phone URL should be handed
-  // back immediately, and an empty menu for the few hundred ms this takes is
-  // harmless. A fake Engine announces its own menu instead.
-  if (!process.env.CRC_FAKE_ENGINE) {
-    void (async () => {
-      try {
-        const { skills, localCommands } = await probeSkills(config.projectDir, providerEnv);
-        await publishSkills(ctx, skills, localCommands);
-      } catch (e) {
-        console.error("Failed to probe skills at startup:", (e as Error).message);
-      }
-    })();
-  }
 
   // Explains, and corrects the relay for, whatever a previous process died
   // holding.

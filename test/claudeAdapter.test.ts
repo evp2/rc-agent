@@ -1,18 +1,23 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { HookInput, Options } from "@anthropic-ai/claude-agent-sdk";
 
 import { ClaudeEngine } from "../src/engine/claude/adapter.ts";
+import { transcriptPath } from "../src/engine/claude/transcript.ts";
 import type { EngineAnswer, EngineEvent, EngineQuestion } from "../src/engine/types.ts";
 import {
   assistantText,
   compactBoundary,
   init,
+  initWithSkills,
   result,
   scriptedQuery,
   taskStarted,
-} from "./doubles.ts";
+} from "./claudeDoubles.ts";
 import { runEngineGuaranteeSuite, type EngineGuaranteeHarness } from "./engineGuaranteeSuite.ts";
 import { reactiveQuery } from "./engineReactiveQuery.ts";
 
@@ -452,4 +457,112 @@ test("ClaudeEngine: a Steer pending when the query ends cleanly still gets its T
 
   assert.deepEqual(turnBoundaries(events), ["started:command", "ended:success", "started:steer", "ended:success"]);
   await session.close();
+});
+
+// --- The menu, and Fork's Conversation carry ---------------------------------
+
+const probedMenu = {
+  skills: [{ name: "probed-skill", description: "from the startup probe", argumentHint: "" }],
+  localCommands: [{ name: "compact", description: "compact the conversation", argumentHint: "" }],
+};
+
+test("ClaudeEngine: the menu is published at open, before any Turn runs", async () => {
+  const probedDirs: string[] = [];
+  const engine = new ClaudeEngine({
+    query: scriptedQuery([]).query,
+    env: {},
+    probeMenu: async (projectDir) => {
+      probedDirs.push(projectDir);
+      return probedMenu;
+    },
+  });
+  const session = await engine.open({ projectDir: "/tmp/probe", onQuestion: noQuestionsExpected() });
+  const [menu] = await collect(session.events[Symbol.asyncIterator](), (e) => e.type === "menu");
+
+  assert.deepEqual(menu, { type: "menu", ...probedMenu });
+  assert.deepEqual(probedDirs, ["/tmp/probe"]);
+  await session.close();
+});
+
+test("ClaudeEngine: the menu is refreshed after a Turn's init, and a slower startup probe never overwrites it", async () => {
+  let finishProbe: (menu: typeof probedMenu) => void = () => undefined;
+  const { query } = scriptedQuery([initWithSkills(["fresh-skill"]), result()], {
+    commands: [{ name: "fresh-skill", description: "installed (project)", argumentHint: "" }],
+  });
+  const engine = new ClaudeEngine({
+    query,
+    env: {},
+    probeMenu: () => new Promise((resolve) => (finishProbe = resolve)),
+  });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("hello");
+  const [menu] = (await collect(it, (e) => e.type === "menu")).filter((e) => e.type === "menu");
+  assert.deepEqual(menu, {
+    type: "menu",
+    skills: [{ name: "fresh-skill", description: "installed", argumentHint: "" }],
+    localCommands: [],
+  });
+
+  finishProbe(probedMenu);
+  await session.close();
+  const rest: EngineEvent[] = [];
+  for (let next = await it.next(); !next.done; next = await it.next()) rest.push(next.value);
+  assert.ok(!rest.some((e) => e.type === "menu"), `a stale menu was published: ${JSON.stringify(rest)}`);
+});
+
+test("ClaudeEngine: a startup probe that fails leaves the menu for the first Turn to fill", async () => {
+  const engine = new ClaudeEngine({
+    query: scriptedQuery([]).query,
+    env: {},
+    probeMenu: async () => {
+      throw new Error("no CLI");
+    },
+  });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  await session.close();
+  const events: EngineEvent[] = [];
+  for await (const e of session.events) events.push(e);
+  assert.deepEqual(events, []);
+});
+
+test("ClaudeEngine: forkConversation copies the transcript to the new worktree, to resume there under the same id", async () => {
+  const projectsDir = mkdtempSync(join(tmpdir(), "crc-claude-projects-"));
+  const sourcePath = transcriptPath("/home/dev/repo", "conv-1", projectsDir);
+  mkdirSync(dirname(sourcePath), { recursive: true });
+  writeFileSync(sourcePath, '{"hello":"world"}\n');
+  const engine = new ClaudeEngine({ query: scriptedQuery([]).query, env: {}, claudeProjectsDir: projectsDir });
+
+  const resumeId = await engine.forkConversation({
+    conversationId: "conv-1",
+    fromDir: "/home/dev/repo",
+    toDir: "/home/dev/repo.feature",
+  });
+
+  assert.equal(resumeId, "conv-1");
+  assert.equal(
+    readFileSync(join(projectsDir, "-home-dev-repo-feature", "conv-1.jsonl"), "utf-8"),
+    '{"hello":"world"}\n',
+  );
+});
+
+test("ClaudeEngine: forkConversation with no transcript to copy carries nothing", async () => {
+  const projectsDir = mkdtempSync(join(tmpdir(), "crc-claude-projects-"));
+  const engine = new ClaudeEngine({ query: scriptedQuery([]).query, env: {}, claudeProjectsDir: projectsDir });
+
+  const resumeId = await engine.forkConversation({
+    conversationId: "missing",
+    fromDir: "/home/dev/repo",
+    toDir: "/home/dev/repo.feature",
+  });
+
+  assert.equal(resumeId, undefined);
+  assert.ok(!existsSync(join(projectsDir, "-home-dev-repo-feature")));
+});
+
+test("transcriptPath encodes the worktree path the way Claude Code files transcripts", () => {
+  assert.equal(
+    transcriptPath("/private/tmp/crc-encode-test.v1/sub.dir", "abc-123", "/projects"),
+    "/projects/-private-tmp-crc-encode-test-v1-sub-dir/abc-123.jsonl",
+  );
 });

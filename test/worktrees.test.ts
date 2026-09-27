@@ -32,6 +32,7 @@ const baseState: Omit<ConnectorState, "projectDir" | "pid"> = {
   sessionId: "sess",
   secret: "sec",
   phoneUrl: "http://relay.test/?s=sess",
+  engine: "claude",
   startedAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 };

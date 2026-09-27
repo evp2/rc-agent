@@ -2,20 +2,23 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import type { ConnectorConfig } from "../src/config.ts";
+import { FakeEngine, sayAndFinish } from "../src/engine/fakeEngine.ts";
+import type { Engine } from "../src/engine/types.ts";
 import {
   ForkError,
   classifyForkFailure,
-  encodeProjectPath,
   executeForkPlan,
   planFork,
   readForkNameState,
   runFork,
-  transcriptPath,
+  type SpawnConnector,
 } from "../src/fork.ts";
+import { takeForkedConversation } from "../src/spawn.ts";
+import type { ConnectorState } from "../src/state.ts";
 
 const baseConfig: ConnectorConfig = {
   relayBaseUrl: "http://relay.test",
@@ -24,22 +27,10 @@ const baseConfig: ConnectorConfig = {
   provider: { type: "anthropic" },
 };
 
-function projectsDir(): string {
-  return mkdtempSync(join(tmpdir(), "crc-fork-projects-"));
-}
-
-test("encodeProjectPath replaces slashes and dots with dashes", () => {
-  assert.equal(
-    encodeProjectPath("/private/tmp/crc-encode-test.v1/sub.dir"),
-    "-private-tmp-crc-encode-test-v1-sub-dir",
-  );
-});
-
 test("planFork defaults fromRef to HEAD", () => {
   const plan = planFork({
     sourceWorktreePath: "/home/dev/repo",
     sourceConfig: baseConfig,
-    sdkSessionId: undefined,
     name: "my-feature",
     fromRef: undefined,
   });
@@ -50,7 +41,6 @@ test("planFork uses an explicit fromRef", () => {
   const plan = planFork({
     sourceWorktreePath: "/home/dev/repo",
     sourceConfig: baseConfig,
-    sdkSessionId: undefined,
     name: "my-feature",
     fromRef: "origin/main",
   });
@@ -61,7 +51,6 @@ test("planFork names the worktree as a sibling of the source, suffixed by name",
   const plan = planFork({
     sourceWorktreePath: "/home/dev/repo",
     sourceConfig: baseConfig,
-    sdkSessionId: undefined,
     name: "my-feature",
     fromRef: undefined,
   });
@@ -73,7 +62,6 @@ test("planFork writes a config with the source's relay/provider settings and a b
   const plan = planFork({
     sourceWorktreePath: "/home/dev/repo",
     sourceConfig: { ...baseConfig, inactivityCompact: { afterMinutes: 30 } },
-    sdkSessionId: undefined,
     name: "my-feature",
     fromRef: undefined,
   });
@@ -86,41 +74,12 @@ test("planFork writes a config with the source's relay/provider settings and a b
   });
 });
 
-test("planFork omits a transcript plan when there is no sdkSessionId", () => {
-  const plan = planFork({
-    sourceWorktreePath: "/home/dev/repo",
-    sourceConfig: baseConfig,
-    sdkSessionId: undefined,
-    name: "my-feature",
-    fromRef: undefined,
-  });
-  assert.equal(plan.transcript, undefined);
-});
-
-test("planFork derives transcript source/dest paths from the cwd-encoding scheme", () => {
-  const pd = projectsDir();
-  const plan = planFork({
-    sourceWorktreePath: "/home/dev/repo",
-    sourceConfig: baseConfig,
-    sdkSessionId: "abc-123",
-    name: "my-feature",
-    fromRef: undefined,
-    claudeProjectsDir: pd,
-  });
-  assert.equal(plan.transcript?.sourcePath, join(pd, "-home-dev-repo", "abc-123.jsonl"));
-  assert.equal(
-    plan.transcript?.destPath,
-    join(pd, "-home-dev-repo-my-feature", "abc-123.jsonl"),
-  );
-});
-
 test("planFork rejects an empty name", () => {
   assert.throws(() =>
     planFork({
       sourceWorktreePath: "/home/dev/repo",
       sourceConfig: baseConfig,
-      sdkSessionId: undefined,
-      name: "  ",
+        name: "  ",
       fromRef: undefined,
     }),
   );
@@ -144,7 +103,6 @@ test("executeForkPlan creates the worktree on the new branch and writes the conf
   const plan = planFork({
     sourceWorktreePath: repo,
     sourceConfig: baseConfig,
-    sdkSessionId: undefined,
     name: "feature-a",
     fromRef: undefined,
   });
@@ -165,52 +123,11 @@ test("executeForkPlan creates the worktree on the new branch and writes the conf
   assert.equal(config.projectDir, "");
 });
 
-test("executeForkPlan copies the transcript file when one exists", () => {
-  const repo = initRepo();
-  const pd = projectsDir();
-  const sdkSessionId = "abc-123";
-  const sourcePath = transcriptPath(repo, sdkSessionId, pd);
-  mkdirSync(dirname(sourcePath), { recursive: true });
-  writeFileSync(sourcePath, '{"hello":"world"}\n');
-
-  const plan = planFork({
-    sourceWorktreePath: repo,
-    sourceConfig: baseConfig,
-    sdkSessionId,
-    name: "feature-b",
-    fromRef: undefined,
-    claudeProjectsDir: pd,
-  });
-
-  executeForkPlan(plan, repo);
-
-  assert.ok(plan.transcript);
-  const copied = readFileSync(plan.transcript!.destPath, "utf-8");
-  assert.equal(copied, '{"hello":"world"}\n');
-});
-
-test("executeForkPlan does not fail when the transcript file is missing", () => {
-  const repo = initRepo();
-  const pd = projectsDir();
-  const plan = planFork({
-    sourceWorktreePath: repo,
-    sourceConfig: baseConfig,
-    sdkSessionId: "does-not-exist",
-    name: "feature-c",
-    fromRef: undefined,
-    claudeProjectsDir: pd,
-  });
-
-  assert.doesNotThrow(() => executeForkPlan(plan, repo));
-  assert.ok(!existsSync(plan.transcript!.destPath));
-});
-
 test("executeForkPlan lets git's own error propagate for a bad --from ref", () => {
   const repo = initRepo();
   const plan = planFork({
     sourceWorktreePath: repo,
     sourceConfig: baseConfig,
-    sdkSessionId: undefined,
     name: "feature-d",
     fromRef: "no-such-ref",
   });
@@ -223,7 +140,6 @@ test("executeForkPlan lets git's own error propagate for a branch name collision
   const plan = planFork({
     sourceWorktreePath: repo,
     sourceConfig: baseConfig,
-    sdkSessionId: undefined,
     name: "feature-e",
     fromRef: undefined,
   });
@@ -238,7 +154,6 @@ function planFor(repo: string, name: string): ReturnType<typeof planFork> {
   return planFork({
     sourceWorktreePath: repo,
     sourceConfig: baseConfig,
-    sdkSessionId: undefined,
     name,
     fromRef: undefined,
   });
@@ -291,7 +206,7 @@ test("runFork throws a ForkError carrying git's text unmodified and the code", a
   const repo = initRepo();
   execFileSync("git", ["branch", "already-here"], { cwd: repo });
 
-  const error = await runFork({ ...baseConfig, projectDir: repo }, undefined, "already-here", undefined).then(
+  const error = await runFork({ ...baseConfig, projectDir: repo }, fakeEngine(), undefined, "already-here", undefined).then(
     () => undefined,
     (e: unknown) => e,
   );
@@ -299,4 +214,83 @@ test("runFork throws a ForkError carrying git's text unmodified and the code", a
   assert.ok(error instanceof ForkError);
   assert.equal(error.code, "name_taken");
   assert.match(error.message, /already exists/);
+});
+
+// --- the Conversation carry, through the Engine ---
+
+function fakeEngine(forkConversation?: Engine["forkConversation"]): Engine {
+  return new FakeEngine({ handlerFor: () => sayAndFinish("ok"), ...(forkConversation ? { forkConversation } : {}) });
+}
+
+function recordingSpawn(): { spawn: SpawnConnector; calls: { projectDir: string; resumeConversation?: string }[] } {
+  const calls: { projectDir: string; resumeConversation?: string }[] = [];
+  const spawn: SpawnConnector = async (config, _configPath, options) => {
+    calls.push({ projectDir: config.projectDir, resumeConversation: options?.resumeConversation });
+    return { projectDir: config.projectDir } as ConnectorState;
+  };
+  return { spawn, calls };
+}
+
+test("runFork asks the Engine to carry the Conversation into the new worktree, and the forked connector resumes it", async () => {
+  const repo = initRepo();
+  const asked: Parameters<Engine["forkConversation"]>[0][] = [];
+  const engine = fakeEngine(async (input) => {
+    asked.push(input);
+    return "conv-carried";
+  });
+  const { spawn, calls } = recordingSpawn();
+
+  await runFork({ ...baseConfig, projectDir: repo }, engine, "conv-1", "carry", undefined, spawn);
+
+  assert.deepEqual(asked, [{ conversationId: "conv-1", fromDir: repo, toDir: `${repo}.carry` }]);
+  assert.deepEqual(calls, [{ projectDir: `${repo}.carry`, resumeConversation: "conv-carried" }]);
+});
+
+test("runFork with no Conversation yet asks the Engine for nothing, and the fork starts fresh", async () => {
+  const repo = initRepo();
+  let asked = false;
+  const engine = fakeEngine(async () => {
+    asked = true;
+    return "unexpected";
+  });
+  const { spawn, calls } = recordingSpawn();
+
+  await runFork({ ...baseConfig, projectDir: repo }, engine, undefined, "fresh", undefined, spawn);
+
+  assert.equal(asked, false);
+  assert.deepEqual(calls, [{ projectDir: `${repo}.fresh`, resumeConversation: undefined }]);
+});
+
+test("runFork starts the fork fresh when the Engine had nothing to carry", async () => {
+  const repo = initRepo();
+  const { spawn, calls } = recordingSpawn();
+
+  await runFork({ ...baseConfig, projectDir: repo }, fakeEngine(async () => undefined), "conv-1", "nothing", undefined, spawn);
+
+  assert.deepEqual(calls, [{ projectDir: `${repo}.nothing`, resumeConversation: undefined }]);
+});
+
+test("runFork reports an Engine that fails to carry the Conversation as a ForkError, without starting a connector", async () => {
+  const repo = initRepo();
+  const { spawn, calls } = recordingSpawn();
+  const engine = fakeEngine(async () => {
+    throw new Error("disk full");
+  });
+
+  const error = await runFork({ ...baseConfig, projectDir: repo }, engine, "conv-1", "broken", undefined, spawn).then(
+    () => undefined,
+    (e: unknown) => e,
+  );
+
+  assert.ok(error instanceof ForkError);
+  assert.equal(error.message, "disk full");
+  assert.deepEqual(calls, []);
+});
+
+test("a Fork's carried Conversation reaches the spawned connector once, and goes no further", () => {
+  process.env.CRC_FORKED_CONVERSATION = "conv-carried";
+
+  assert.equal(takeForkedConversation(), "conv-carried");
+  assert.equal(process.env.CRC_FORKED_CONVERSATION, undefined);
+  assert.equal(takeForkedConversation(), undefined);
 });

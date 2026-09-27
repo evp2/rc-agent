@@ -94,8 +94,8 @@ export interface SessionContext {
   lastHandledForkAt: string | undefined;
 
   /**
-   * Carries out a Fork by name: `git worktree add`, a generated config, a
-   * best-effort transcript copy, and a new connector process, returning that
+   * Carries out a Fork by name: `git worktree add`, a generated config, the
+   * Engine carrying the Conversation over, and a new connector process, returning that
    * process's Control URL. A field rather than a direct import because the
    * real implementation spawns a detached OS process
    * and waits on its state file, which a test must not do; a test hands this

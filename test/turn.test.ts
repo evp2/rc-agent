@@ -17,17 +17,8 @@ import type { EngineUsage } from "../src/engine/types.ts";
 import type { CommandRecord } from "../src/relay/client.ts";
 import { contextWarningCrossing, runTurn } from "../src/session/turn.ts";
 import { checkForSteer } from "../src/session/watchers.ts";
-import {
-  assistantText,
-  cmd,
-  init,
-  makeTurnHarness,
-  result,
-  scriptedQuery,
-  taskStarted,
-  until,
-  type TurnHarness,
-} from "./doubles.ts";
+import { assistantText, init, result, scriptedQuery, taskStarted } from "./claudeDoubles.ts";
+import { cmd, makeTurnHarness, until, type TurnHarness } from "./doubles.ts";
 
 const types = (h: TurnHarness) => h.ctx.eventBuffer.map((e) => e.type);
 const statuses = (h: TurnHarness) => h.ctx.eventBuffer.filter((e) => e.type === "status").map((e) => e.text);

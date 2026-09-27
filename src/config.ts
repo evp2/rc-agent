@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import type { EngineKind } from "./engine/types";
 import type { ProviderConfig } from "./provider";
 
 /**
@@ -48,6 +49,18 @@ export interface ConnectorConfig {
   contextWarningThresholdPercent?: number;
 }
 
+/**
+ * The Engine a provider runs on. Derived rather than configured separately, so
+ * a config can never name a provider its Engine cannot reach.
+ */
+export function engineKindFor(provider: ProviderConfig): EngineKind {
+  switch (provider.type) {
+    case "anthropic":
+    case "bedrock":
+      return "claude";
+  }
+}
+
 export function loadConfig(path: string): ConnectorConfig {
   let raw: unknown;
   try {
@@ -89,7 +102,7 @@ export function loadConfig(path: string): ConnectorConfig {
       apiKeyEnv: typeof p.apiKeyEnv === "string" ? p.apiKeyEnv : undefined,
     };
   } else if (providerType === "bedrock") {
-    // Both optional -- buildProviderEnv falls back to the ambient AWS_REGION /
+    // Both optional -- the Claude adapter's provider environment falls back to the ambient AWS_REGION /
     // ANTHROPIC_MODEL, so `{"type":"bedrock"}` alone is a valid config.
     provider = {
       type: "bedrock",

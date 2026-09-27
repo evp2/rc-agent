@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import type { ConnectorConfig } from "../config";
+import { createEngine } from "../engine/create";
 import { runFork } from "../fork";
 import { printPairingQrCode } from "../qr";
 import { RelayClient, SessionEndedError } from "../relay/client";
@@ -89,8 +90,7 @@ export async function start(config: ConnectorConfig, configPath: string): Promis
 
 /**
  * Creates a new Session in a new git Worktree of `config.projectDir`'s repo
- * and starts it, printing the same start-up report `rc-agent start` does. See
- * docs/specs/session-forking.md.
+ * and starts it, printing the same start-up report `rc-agent start` does.
  */
 export async function fork(
   config: ConnectorConfig,
@@ -98,7 +98,10 @@ export async function fork(
   fromRef: string | undefined,
 ): Promise<void> {
   const sourceState = readState(config.projectDir);
-  const state = await runFork(config, sourceState?.sdkSessionId, name, fromRef);
+  const engine = createEngine(config);
+  // Only a state file this Engine wrote names a Conversation it can carry.
+  const conversationId = sourceState?.engine === engine.kind ? sourceState.conversationId : undefined;
+  const state = await runFork(config, engine, conversationId, name, fromRef);
   console.log(`Connector started for ${state.projectDir} (pid ${state.pid}).`);
   console.log(`Logging to ${logPath(state.projectDir)}`);
   printConnectionReport(state);
@@ -147,7 +150,7 @@ export async function stop(config: ConnectorConfig, end: boolean): Promise<void>
       console.error("Failed to end the session:", (e as Error).message);
     }
   }
-  writeState({ ...state, sdkSessionId: undefined, commandCursor: undefined, inFlight: undefined });
+  writeState({ ...state, conversationId: undefined, commandCursor: undefined, inFlight: undefined });
 }
 
 /**

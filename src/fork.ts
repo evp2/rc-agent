@@ -1,34 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import type { ConnectorConfig } from "./config";
+import type { Engine } from "./engine/types";
 import { spawnDetached } from "./spawn";
 import type { ConnectorState } from "./state";
-
-/**
- * Claude Code resumes a conversation by scanning
- * `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, keyed by the
- * *invoking* directory, not just the session id -- confirmed empirically
- * against a real `claude` invocation (see docs/adr/0001). The encoding
- * replaces every `/` and `.` in the absolute path with `-`.
- */
-export function defaultClaudeProjectsDir(): string {
-  return join(homedir(), ".claude", "projects");
-}
-
-export function encodeProjectPath(absPath: string): string {
-  return absPath.replace(/[/.]/g, "-");
-}
-
-export function transcriptPath(
-  worktreePath: string,
-  sdkSessionId: string,
-  claudeProjectsDir: string = defaultClaudeProjectsDir(),
-): string {
-  return join(claudeProjectsDir, encodeProjectPath(worktreePath), `${sdkSessionId}.jsonl`);
-}
 
 /**
  * Why a Fork failed, when the reason is one a phone client can put into words
@@ -61,25 +38,19 @@ export interface ForkPlan {
   fromRef: string;
   /** Contents to write as the new Worktree's `connector.config.json`. */
   configContents: Record<string, unknown>;
-  /** Absent when the source Session has no `sdkSessionId` yet -- the fork starts fresh. */
-  transcript?: { sourcePath: string; destPath: string };
 }
 
 export interface PlanForkInput {
   sourceWorktreePath: string;
   sourceConfig: ConnectorConfig;
-  sdkSessionId: string | undefined;
   name: string;
   fromRef: string | undefined;
-  /** Override for tests; production callers always use {@link defaultClaudeProjectsDir}. */
-  claudeProjectsDir?: string;
 }
 
 /**
  * Derives everything a Fork needs -- the sibling worktree path, branch name,
- * transcript source/dest paths, and the new Session's config -- with no I/O,
- * so every naming decision is covered by plain unit tests. See
- * docs/specs/session-forking.md.
+ * and the new Session's config -- with no I/O, so every naming decision is
+ * covered by plain unit tests.
  */
 export function planFork(input: PlanForkInput): ForkPlan {
   const name = input.name.trim();
@@ -104,22 +75,15 @@ export function planFork(input: PlanForkInput): ForkPlan {
     branchName: name,
     fromRef: input.fromRef?.trim() || "HEAD",
     configContents,
-    transcript: input.sdkSessionId
-      ? {
-          sourcePath: transcriptPath(input.sourceWorktreePath, input.sdkSessionId, input.claudeProjectsDir),
-          destPath: transcriptPath(worktreePath, input.sdkSessionId, input.claudeProjectsDir),
-        }
-      : undefined,
   };
 }
 
 /**
  * Carries out a Fork plan against real git and the filesystem: creates the
- * worktree on the new branch, writes its config, and copies the transcript
- * when one is planned. Errors from `git` itself (bad ref, name collision,
- * branch checked out elsewhere) propagate unmodified -- no rewording, no
- * partial cleanup, since `git worktree add` fails atomically before creating
- * anything.
+ * worktree on the new branch and writes its config. Errors from `git` itself
+ * (bad ref, name collision, branch checked out elsewhere) propagate
+ * unmodified -- no rewording, no partial cleanup, since `git worktree add`
+ * fails atomically before creating anything.
  */
 export function executeForkPlan(plan: ForkPlan, sourceWorktreePath: string): void {
   execFileSync("git", ["worktree", "add", plan.worktreePath, "-b", plan.branchName, plan.fromRef], {
@@ -130,18 +94,6 @@ export function executeForkPlan(plan: ForkPlan, sourceWorktreePath: string): voi
     join(plan.worktreePath, "connector.config.json"),
     `${JSON.stringify(plan.configContents, null, 2)}\n`,
   );
-
-  if (plan.transcript) {
-    if (existsSync(plan.transcript.sourcePath)) {
-      mkdirSync(dirname(plan.transcript.destPath), { recursive: true });
-      copyFileSync(plan.transcript.sourcePath, plan.transcript.destPath);
-    } else {
-      console.warn(
-        `Note: no transcript found at ${plan.transcript.sourcePath} -- ` +
-          `the fork will start a fresh conversation.`,
-      );
-    }
-  }
 }
 
 /** True when `git` exits 0, false on any non-zero exit -- never throws. */
@@ -163,7 +115,7 @@ export interface ForkNameState {
 /**
  * Reads what the Fork name already refers to. Must be called *before* the
  * attempt: `git worktree add` creates both the branch and the directory, and
- * the steps after it (writing the config, copying the transcript) can still
+ * the steps after it (writing the config, carrying the Conversation) can still
  * fail -- so asking afterwards would find a branch and a directory the failed
  * attempt made itself and call a free name taken.
  */
@@ -204,38 +156,54 @@ export function classifyForkFailure(
   return undefined;
 }
 
+/** Starts the new Session's connector -- {@link spawnDetached}, or a stand-in in tests. */
+export type SpawnConnector = typeof spawnDetached;
+
 /**
  * Carries out a Fork end to end -- plans it, executes it against git and the
- * filesystem, then spawns and waits for the new Session's own connector
- * process -- and returns its published state, which is where the new
- * Session's Control URL lives. No printing: shared by the CLI's `fork()`
- * (cli/commands.ts, which prints for a human at a terminal) and the poll
- * loop's own handling of a `fork_request` (session/watchers.ts), which
- * reports the outcome as a transcript event instead. See
- * docs/specs/session-forking.md and .scratch/fork-from-chat-ui/spec.md.
+ * filesystem, asks the Engine to make the Conversation available in the new
+ * worktree, then spawns and waits for the new Session's own connector
+ * process, resuming whatever the Engine carried -- and returns its published
+ * state, which is where the new Session's Control URL lives. No printing:
+ * shared by the CLI's `fork()` (cli/commands.ts, which prints for a human at
+ * a terminal) and the poll loop's own handling of a `fork_request`
+ * (session/watchers.ts), which reports the outcome as a transcript event
+ * instead.
  */
 export async function runFork(
   config: ConnectorConfig,
-  sdkSessionId: string | undefined,
+  engine: Engine,
+  conversationId: string | undefined,
   name: string,
   fromRef: string | undefined,
+  spawn: SpawnConnector = spawnDetached,
 ): Promise<ConnectorState> {
   const plan = planFork({
     sourceWorktreePath: config.projectDir,
     sourceConfig: config,
-    sdkSessionId,
     name,
     fromRef,
   });
 
   const before = readForkNameState(plan, config.projectDir);
+  let resumeConversation: string | undefined;
   try {
     executeForkPlan(plan, config.projectDir);
+    if (conversationId) {
+      resumeConversation = await engine.forkConversation({
+        conversationId,
+        fromDir: config.projectDir,
+        toDir: plan.worktreePath,
+      });
+      if (!resumeConversation) {
+        console.warn("Note: the conversation could not be carried over -- the fork will start a fresh one.");
+      }
+    }
   } catch (e) {
     throw new ForkError((e as Error).message, classifyForkFailure(plan, config.projectDir, before));
   }
 
   const forkConfig: ConnectorConfig = { ...config, projectDir: plan.worktreePath };
   const forkConfigPath = join(plan.worktreePath, "connector.config.json");
-  return spawnDetached(forkConfig, forkConfigPath);
+  return spawn(forkConfig, forkConfigPath, { resumeConversation });
 }

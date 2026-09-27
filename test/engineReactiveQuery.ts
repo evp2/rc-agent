@@ -1,6 +1,6 @@
 import type { Options, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import { AsyncQueue, takeOne } from "../src/sdk/asyncQueue.ts";
+import { AsyncQueue, takeOne } from "../src/asyncQueue.ts";
 import type { ClaudeEngineDeps } from "../src/engine/claude/adapter.ts";
 
 export interface ReactiveScript {
@@ -18,7 +18,7 @@ export interface ReactiveScript {
 }
 
 /**
- * Unlike test/doubles.ts's `scriptedQuery`, which ignores its `prompt`
+ * Unlike test/claudeDoubles.ts's `scriptedQuery`, which ignores its `prompt`
  * argument entirely, this fake actually drains it for the query's whole
  * life -- the same behaviour the Claude adapter's `send`/`steer` depend on
  * the real SDK for. It reacts the instant something is pushed, with no

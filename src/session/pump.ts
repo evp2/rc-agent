@@ -27,9 +27,7 @@ export async function handleEngineEvent(
   switch (event.type) {
     case "conversation":
       ctx.conversationId = event.id;
-      // Still the state file's old key name, so older connectors and `rc-agent`
-      // commands keep reading it.
-      persist(ctx, { sdkSessionId: event.id });
+      persist(ctx, { conversationId: event.id });
       // A blank-memory agent must never be a surprise: said out loud, since
       // nothing else on the phone would show it.
       if (event.lostPrevious) ctx.eventBuffer.push({ type: "status", text: LOST_CONVERSATION_TEXT });

@@ -17,7 +17,7 @@ test("the Conversation id is persisted once the Engine reports it, so a restart 
 
   await until(() => h.ctx.conversationId === "conv-abc");
 
-  assert.ok(h.written.some((s) => s.sdkSessionId === "conv-abc"));
+  assert.ok(h.written.some((s) => s.conversationId === "conv-abc"));
   await h.close();
 });
 
@@ -37,7 +37,7 @@ test("a Conversation that could not be resumed produces a visible status line, a
 
   const lost = h.ctx.eventBuffer.find((e) => e.text === LOST_CONVERSATION_TEXT);
   assert.equal(lost?.type, "status");
-  assert.equal(h.ctx.state.sdkSessionId, "conv-new");
+  assert.equal(h.ctx.state.conversationId, "conv-new");
   await h.close();
 });
 

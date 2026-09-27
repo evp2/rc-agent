@@ -11,11 +11,10 @@ import type {
   query as realQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
-import { transcriptPath } from "../../fork";
-import { query as defaultSdkQuery } from "../../sdk/client";
-import { AsyncQueue, userTextMessage } from "../../sdk/asyncQueue";
-import { selectLocalCommands, selectSkills } from "../../skills";
+import type { ProviderConfig } from "../../provider";
+import type { SkillInfo } from "../../relay/client";
 import type {
   Engine,
   EngineEvent,
@@ -24,15 +23,51 @@ import type {
   EngineUsage,
   OpenOptions,
 } from "../types";
+import { buildProviderEnv } from "./providerEnv";
+import { query as defaultSdkQuery } from "./sdk";
+import { probeSkills, selectLocalCommands, selectSkills } from "./skills";
+import { transcriptPath } from "./transcript";
+
+type Menu = { skills: SkillInfo[]; localCommands: SkillInfo[] };
 
 export interface ClaudeEngineDeps {
   query: typeof realQuery;
   env: NodeJS.ProcessEnv;
+  /**
+   * Reads the menu once when a session opens, so the phone has one before the
+   * first Turn. Absent means no startup menu: the first Turn's `init` fills it.
+   */
+  probeMenu?: (projectDir: string) => Promise<Menu>;
+  /** Where Claude Code files transcripts. Defaults to `~/.claude/projects`; tests override it. */
+  claudeProjectsDir?: string;
 }
 
-/** Builds a Claude adapter wired to the real SDK's `query()`. */
-export function createClaudeEngine(env: NodeJS.ProcessEnv): Engine {
-  return new ClaudeEngine({ query: defaultSdkQuery, env });
+/** Builds a Claude adapter wired to the real SDK's `query()`, in the provider's environment. */
+export function createClaudeEngine(provider: ProviderConfig): Engine {
+  const env = buildProviderEnv(provider);
+  return new ClaudeEngine({
+    query: defaultSdkQuery,
+    env,
+    probeMenu: (projectDir) => probeSkills(defaultSdkQuery, projectDir, env),
+  });
+}
+
+/**
+ * Builds the plain-text user message the adapter streams, both as a Turn's
+ * initial prompt and as a Steer delivered into an open query.
+ *
+ * `priority: 'now'` is what the measured SDK contract requires for a message
+ * streamed into a Turn already running to truncate it rather than queue
+ * behind whatever it was doing -- omitted for the initial prompt, where it
+ * has no running Turn to truncate and no effect either way.
+ */
+function userTextMessage(text: string, opts: { priority?: "now" } = {}): SDKUserMessage {
+  return {
+    type: "user",
+    message: { role: "user", content: text },
+    parent_tool_use_id: null,
+    ...opts,
+  } as SDKUserMessage;
 }
 
 /**
@@ -87,6 +122,8 @@ class ClaudeEngineSession implements EngineSession {
   private activeQueryHandle: Query | undefined;
   private turnRunning = false;
   private closed = false;
+  /** Set once a Turn's `init` has refreshed the menu, after which the startup probe's older reading is dropped. */
+  private menuRefreshed = false;
   private chainPromise: Promise<void> = Promise.resolve();
 
   constructor(
@@ -94,6 +131,16 @@ class ClaudeEngineSession implements EngineSession {
     private readonly options: OpenOptions,
   ) {
     this.conversationId = options.resume;
+    if (deps.probeMenu) this.publishStartupMenu(deps.probeMenu);
+  }
+
+  /** Not awaited by `open()`: the session is usable at once, and an empty menu for the moment this takes is harmless. */
+  private publishStartupMenu(probeMenu: NonNullable<ClaudeEngineDeps["probeMenu"]>): void {
+    void probeMenu(this.options.projectDir)
+      .then((menu) => {
+        if (!this.menuRefreshed) this.outbox.push({ type: "menu", ...menu });
+      })
+      .catch((e) => console.error("Failed to probe skills at startup:", (e as Error).message));
   }
 
   get events(): AsyncIterable<EngineEvent> {
@@ -369,6 +416,7 @@ class ClaudeEngineSession implements EngineSession {
     void activeQuery
       .supportedCommands()
       .then((commands) => {
+        this.menuRefreshed = true;
         this.outbox.push({
           type: "menu",
           skills: selectSkills(commands, initSkillNames),
@@ -488,10 +536,11 @@ export class ClaudeEngine implements Engine {
     return new ClaudeEngineSession(this.deps, options);
   }
 
+  /** Claude Code finds a transcript by the directory it runs in, so a copy filed under the new worktree resumes there under the same id. */
   async forkConversation(input: { conversationId: string; fromDir: string; toDir: string }): Promise<string | undefined> {
-    const sourcePath = transcriptPath(input.fromDir, input.conversationId);
+    const sourcePath = transcriptPath(input.fromDir, input.conversationId, this.deps.claudeProjectsDir);
     if (!existsSync(sourcePath)) return undefined;
-    const destPath = transcriptPath(input.toDir, input.conversationId);
+    const destPath = transcriptPath(input.toDir, input.conversationId, this.deps.claudeProjectsDir);
     mkdirSync(dirname(destPath), { recursive: true });
     copyFileSync(sourcePath, destPath);
     return input.conversationId;

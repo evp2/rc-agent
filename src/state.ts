@@ -11,6 +11,8 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { EngineKind } from "./engine/types";
+
 /** Bumped only when a field's meaning changes; unknown versions are discarded. */
 const STATE_VERSION = 1;
 
@@ -58,8 +60,14 @@ export interface ConnectorState {
    * both as "interrupted" would say something false about the queued one.
    */
   inFlight?: { seq: string; text: string; status: "running" | "queued" }[];
-  /** Claude's own session id, resumed across turns. Dropped when rotating. */
-  sdkSessionId?: string;
+  /** The Engine's own id for the Conversation, resumed across restarts. Dropped when rotating. */
+  conversationId?: string;
+  /**
+   * Which Engine held the Conversation. A Conversation id means nothing to a
+   * different Engine, so a state file written by one is never resumed by
+   * another.
+   */
+  engine: EngineKind;
   /**
    * Background tasks the connector last saw running, kept so a restart can
    * report each as `interrupted` rather than leaving the phone's inline card
@@ -78,8 +86,8 @@ export interface ConnectorState {
    * idle clock is measured from here, not from process start, so a session with
    * no activity yet never fires one.
    *
-   * Deliberately *not* carried across a restart, unlike the cursor and the SDK
-   * session id: a fresh process has to see the human do something before it
+   * Deliberately *not* carried across a restart, unlike the cursor and the
+   * Conversation id: a fresh process has to see the human do something before it
    * will submit anything on their behalf. Resuming the countdown instead would
    * let a connector started after a long gap fire a `/compact` into a session
    * nobody has touched yet.
@@ -130,13 +138,46 @@ export function readState(projectDir: string): ConnectorState | undefined {
   const path = statePath(projectDir);
   if (!existsSync(path)) return undefined;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as ConnectorState;
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as LegacyConnectorState;
     if (parsed.version !== STATE_VERSION) return undefined;
     if (!parsed.sessionId || !parsed.secret) return undefined;
-    return parsed;
+    // Files from before the Engine seam name the Conversation `sdkSessionId`
+    // and record no Engine -- every one of them was written by Claude.
+    // Dropping the old key here is what makes the next write use the new one.
+    const { sdkSessionId, ...rest } = parsed;
+    return {
+      ...rest,
+      conversationId: rest.conversationId ?? sdkSessionId,
+      engine: rest.engine ?? "claude",
+    };
   } catch {
     return undefined;
   }
+}
+
+/** What an older connector may have left on disk. */
+type LegacyConnectorState = Omit<ConnectorState, "engine"> & {
+  engine?: EngineKind;
+  sdkSessionId?: string;
+};
+
+/**
+ * Whether a restarting connector may resume from `previous`. State belonging
+ * to a different relay, project directory or Engine is ignored rather than
+ * trusted -- a config edit should not silently reattach the connector to a
+ * session, or a Conversation, created under the old settings.
+ */
+export function isReusableState(
+  previous: ConnectorState | undefined,
+  config: { relayBaseUrl: string; projectDir: string },
+  engine: EngineKind,
+): previous is ConnectorState {
+  return (
+    !!previous &&
+    previous.relayBaseUrl === config.relayBaseUrl &&
+    previous.projectDir === config.projectDir &&
+    previous.engine === engine
+  );
 }
 
 /**

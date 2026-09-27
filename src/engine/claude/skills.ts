@@ -1,8 +1,7 @@
-import type { Options, SlashCommand } from "@anthropic-ai/claude-agent-sdk";
+import type { Options, SlashCommand, query as realQuery } from "@anthropic-ai/claude-agent-sdk";
 
-import { PERMISSION_MODE } from "./config";
-import type { SkillInfo } from "./relay/client";
-import { query } from "./sdk/client";
+import { PERMISSION_MODE } from "../../config";
+import type { SkillInfo } from "../../relay/client";
 
 /**
  * Keeps only the skills the user installed -- project-scoped ones from
@@ -91,12 +90,13 @@ async function* neverYields() {
  * on it and aborting immediately after spends nothing.
  */
 export async function probeSkills(
+  query: typeof realQuery,
   cwd: string,
   env: Record<string, string | undefined>,
 ): Promise<{ skills: SkillInfo[]; localCommands: SkillInfo[] }> {
   const [commands, initSkillNames] = await Promise.all([
-    readSupportedCommands(cwd, env),
-    readInitSkillNames(cwd, env),
+    readSupportedCommands(query, cwd, env),
+    readInitSkillNames(query, cwd, env),
   ]);
   return {
     skills: selectSkills(commands, initSkillNames),
@@ -105,6 +105,7 @@ export async function probeSkills(
 }
 
 async function readSupportedCommands(
+  query: typeof realQuery,
   cwd: string,
   env: Record<string, string | undefined>,
 ): Promise<SlashCommand[]> {
@@ -123,6 +124,7 @@ async function readSupportedCommands(
 }
 
 async function readInitSkillNames(
+  query: typeof realQuery,
   cwd: string,
   env: Record<string, string | undefined>,
 ): Promise<string[]> {

@@ -1,10 +1,8 @@
-import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-
 /**
  * Minimal pull-based async queue: a value pushed before anyone is waiting is
  * buffered; a `next()` call arriving before any value exists parks until one
- * is pushed. Backs the Claude adapter's streaming input (each query's prompt)
- * and the Engine session's own event stream.
+ * is pushed. Backs each Engine session's event stream, and the Claude
+ * adapter's streaming input (each query's prompt).
  */
 export class AsyncQueue<T> implements AsyncIterable<T> {
   private readonly buffered: T[] = [];
@@ -51,22 +49,4 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
 export async function takeOne<T>(source: AsyncIterable<T>): Promise<T | undefined> {
   const { value, done } = await source[Symbol.asyncIterator]().next();
   return done ? undefined : value;
-}
-
-/**
- * Builds the plain-text user message shape the connector streams, both as a
- * Turn's initial prompt and as a Steer delivered via `streamInput`.
- *
- * `priority: 'now'` is what the measured SDK contract requires for a message
- * streamed into a Turn already running to truncate it rather than queue
- * behind whatever it was doing -- omitted for the initial prompt, where it
- * has no running Turn to truncate and no effect either way.
- */
-export function userTextMessage(text: string, opts: { priority?: "now" } = {}): SDKUserMessage {
-  return {
-    type: "user",
-    message: { role: "user", content: text },
-    parent_tool_use_id: null,
-    ...opts,
-  } as SDKUserMessage;
 }

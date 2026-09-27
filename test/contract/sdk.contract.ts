@@ -9,7 +9,7 @@
  * version pin in package.json fails here instead of on a developer's phone.
  *
  * They cost nothing to run. Both probes below stop before the model is ever
- * invoked, using the two techniques src/skills.ts already relies on.
+ * invoked, using the two techniques src/engine/claude/skills.ts already relies on.
  *
  * Not part of `npm test`, which stays offline. Run with `npm run test:contract`.
  */
@@ -21,9 +21,9 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { PERMISSION_MODE } from "../../src/config";
-import { buildProviderEnv } from "../../src/provider";
-import { query } from "../../src/sdk/client";
-import { probeSkills } from "../../src/skills";
+import { buildProviderEnv } from "../../src/engine/claude/providerEnv";
+import { query } from "../../src/engine/claude/sdk";
+import { probeSkills } from "../../src/engine/claude/skills";
 
 const execFileAsync = promisify(execFile);
 
@@ -96,7 +96,7 @@ test("the skills menu survives whatever the SDK now reports", async (t) => {
     return;
   }
 
-  const { skills } = await probeSkills(REPO_ROOT, buildProviderEnv({ type: "anthropic" }));
+  const { skills } = await probeSkills(query, REPO_ROOT, buildProviderEnv({ type: "anthropic" }));
 
   const names = new Set(skills.map((s) => s.name));
 

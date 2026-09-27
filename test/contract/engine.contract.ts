@@ -21,7 +21,7 @@ import { query as realQuery } from "@anthropic-ai/claude-agent-sdk";
 
 import { ClaudeEngine } from "../../src/engine/claude/adapter";
 import type { EngineAnswer, EngineEvent } from "../../src/engine/types";
-import { buildProviderEnv } from "../../src/provider";
+import { buildProviderEnv } from "../../src/engine/claude/providerEnv";
 
 const execFileAsync = promisify(execFile);
 
