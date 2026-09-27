@@ -15,10 +15,18 @@ import {
   init,
   makeTurnHarness,
   result,
+  taskStarted,
   type TurnHarness,
 } from "./doubles.ts";
 
 const types = (h: TurnHarness) => h.ctx.eventBuffer.map((e) => e.type);
+
+/** A sentinel `race` resolves to when `promise` hasn't settled within `ms`. */
+const TIMED_OUT = Symbol("timed out");
+async function raceWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => setTimeout(() => resolve(TIMED_OUT), ms));
+  return Promise.race([promise, timeout]);
+}
 
 test("an ordinary Turn holds nothing at the end", async () => {
   const h = makeTurnHarness([init(), assistantText("hello"), result()]);
@@ -33,6 +41,41 @@ test("an ordinary Turn holds nothing at the end", async () => {
   assert.ok(types(h).includes("assistant_text"));
   assert.ok(types(h).includes("turn_complete"));
 });
+
+// The probable stuck-Turn bug (see the "pin the stuck-Turn bug" ticket): a
+// real Claude query stays open for as long as its prompt input is open, and
+// that can outlast a Turn's own `result` while a Background task it started
+// keeps running. `runTurn` only closes that input in its `finally`, reached
+// only once the drain loop over the query itself ends -- so a query that
+// stays open until Stop leaves `runTurn` never resolving, and the main loop
+// never hands back to the next Command. Fixed by ticket 04's Engine seam
+// (the next Command starts at `turn_ended`, not once the query drains); this
+// is a known failure against today's code until then.
+test(
+  "a Turn that starts a Background task hands the main loop back once its own result lands, without needing a Stop",
+  { todo: "fixed by ticket 04 -- today's runTurn waits for the whole query, background task included" },
+  async () => {
+    const h = makeTurnHarness([init(), assistantText("starting a background task"), taskStarted(), result()], {
+      staysOpenAfterDrain: true,
+    });
+
+    const turnPromise = runTurn(h.ctx, cmd("kick off a background task"));
+    try {
+      const outcome = await raceWithTimeout(turnPromise, 200);
+      assert.notEqual(
+        outcome,
+        TIMED_OUT,
+        "the Turn's own result already landed; a still-running Background task must not hold the main loop hostage",
+      );
+    } finally {
+      // Todo or not, this Turn must not outlive the test: stopping it lets
+      // runTurn's own finally clear the interrupt-watcher interval it leaked
+      // while stuck, the same way a real Stop would.
+      h.ctx.currentTurn?.abortController.abort();
+      await turnPromise;
+    }
+  },
+);
 
 test("a Steer the SDK never confirms does not leak its claim", async () => {
   // The originating bug. A Local command (`/compact`) streamed into a running

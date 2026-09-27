@@ -173,6 +173,16 @@ export function compactBoundary(): SDKMessage {
   } as unknown as SDKMessage;
 }
 
+export function taskStarted(taskId = "task-1"): SDKMessage {
+  return {
+    type: "system",
+    subtype: "task_started",
+    task_id: taskId,
+    tool_use_id: "tool-1",
+    description: "a long-running background task",
+  } as unknown as SDKMessage;
+}
+
 /**
  * A Query over a fixed message list. `onStreamInput` fires when a Steer is
  * streamed in, which is what lets a test decide -- deterministically, rather
@@ -193,6 +203,15 @@ export function scriptedQuery(
     contextPercentages?: number[];
     /** Called synchronously with the `options` a real `query()` call would receive, so a test can reach into `options.hooks` (e.g. to invoke PreCompact) exactly as the real SDK would. */
     onOptions?: (options: Options) => void;
+    /**
+     * Models the measured real-SDK behavior (see ticket "pin the stuck-Turn
+     * bug"): after its last scripted message, the query's own generator does
+     * not return -- exactly as a real query stays open for as long as a
+     * Background task the Turn started keeps running -- and ends only once
+     * the Turn is stopped (`options.abortController`'s signal fires). Without
+     * a Stop, a query scripted this way never ends.
+     */
+    staysOpenAfterDrain?: boolean;
   } = {},
 ): { query: SessionContext["query"]; streamed: string[] } {
   const streamed: string[] = [];
@@ -218,6 +237,13 @@ export function scriptedQuery(
         yield* deliver(m);
       }
       while (injected.length) yield* deliver(injected.shift()!);
+      if (opts.staysOpenAfterDrain) {
+        const signal = options?.abortController?.signal;
+        await new Promise<void>((resolve) => {
+          if (!signal || signal.aborted) return resolve();
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      }
     })();
 
     const q = {
