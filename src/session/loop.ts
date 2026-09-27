@@ -1,17 +1,20 @@
 import { PERMISSION_MODE, type ConnectorConfig, type InactivityCompactConfig } from "../config";
+import { createClaudeEngine } from "../engine/claude/adapter";
+import { fakeEnginePersona } from "../engine/fakePersonas";
+import type { Engine } from "../engine/types";
 import { runFork } from "../fork";
 import { buildProviderEnv } from "../provider";
-import { createSdkMessageMapper } from "../sdk/bridge";
 import { RelayClient, SessionEndedError } from "../relay/client";
 import { probeSkills } from "../skills";
 import { readState, writeState, type ConnectorState } from "../state";
-import { query } from "../sdk/client";
 import { persist, publishSkills } from "./commands";
 import type { SessionContext } from "./context";
+import { createBannerDeduper } from "./engineEvents";
 import { flushEvents } from "./events";
 import { InFlight } from "./inFlight";
+import { pumpEngineEvents } from "./pump";
 import { runTurn } from "./turn";
-import { watchForForkRequests, watchForKills, watchForSteers } from "./watchers";
+import { answerQuestion, watchForForkRequests, watchForKills, watchForSteers } from "./watchers";
 
 const POLL_INTERVAL_MS = 1750;
 const FLUSH_INTERVAL_MS = 750;
@@ -62,6 +65,45 @@ export async function maybeSubmitAutoCompact(ctx: SessionContext): Promise<void>
     if (e instanceof SessionEndedError) return;
     console.error("Failed to submit Auto-compact:", (e as Error).message);
   }
+}
+
+/**
+ * Background tasks left running when a previous process died are gone with
+ * it -- the agent process they were children of no longer exists. Reports
+ * each as interrupted and empties the tray, so nothing sits spinning forever.
+ */
+export function reportTasksInterruptedByRestart(
+  ctx: SessionContext,
+  previous: ConnectorState["runningTasks"],
+): void {
+  if (!previous?.length) return;
+  console.log(`Reporting ${previous.length} background task(s) interrupted by restart.`);
+  for (const t of previous) {
+    ctx.eventBuffer.push({
+      type: "background_task_settled",
+      task_id: t.task_id,
+      tool_use_id: t.tool_use_id,
+      task_status: "interrupted",
+      text: t.description
+        ? `interrupted by connector restart: ${t.description}`
+        : "interrupted by connector restart",
+    });
+  }
+  // The live set is per-process and empty after a restart; say so, so a
+  // reload's replay of the last non-empty set doesn't show stale running work.
+  ctx.eventBuffer.push({ type: "background_tasks_changed", tasks: [] });
+  persist(ctx, { runningTasks: undefined });
+}
+
+/**
+ * The Engine this connector drives. `CRC_FAKE_ENGINE` is set only by the e2e
+ * harness, naming a scripted persona (see engine/fakePersonas.ts) to play
+ * instead of a real, model-backed agent. Unset in every real deployment.
+ */
+function selectEngine(config: ConnectorConfig, providerEnv: NodeJS.ProcessEnv): Engine {
+  const persona = process.env.CRC_FAKE_ENGINE;
+  if (persona) return fakeEnginePersona(persona, config.projectDir);
+  return createClaudeEngine(providerEnv);
 }
 
 export interface RunHandle {
@@ -144,6 +186,7 @@ async function acquireSession(config: ConnectorConfig): Promise<{
  */
 export async function runConnector(config: ConnectorConfig): Promise<RunHandle> {
   const providerEnv = buildProviderEnv(config.provider);
+  const engine = selectEngine(config, providerEnv);
   const { client, phoneUrl, staticUrl, controlUrl, resumed } = await acquireSession(config);
 
   // Declared before the context so the ledger's dependencies can close over
@@ -163,16 +206,25 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     { cursor: resumed?.commandCursor },
   );
 
+  // One Engine session for the connector's whole life. Throws here, at
+  // startup, for an auth or licence problem -- never for a Conversation that
+  // can no longer be resumed, which the Engine reports as lost instead.
+  const engineSession = await engine.open({
+    projectDir: config.projectDir,
+    resume: resumed?.sdkSessionId,
+    onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
+  });
+
   ctx = {
     client,
     config,
-    providerEnv,
-    query,
+    engine,
+    engineSession,
     writeState,
     inFlight,
-    // One mapper for the whole process: it remembers the session banner
-    // across turns so it is announced once, not above every reply.
-    mapMessage: createSdkMessageMapper(),
+    // One for the whole process: it remembers the session banner across
+    // Turns so it is announced once, not above every reply.
+    bannerFor: createBannerDeduper(),
     state: {
       version: 1,
       projectDir: config.projectDir,
@@ -194,7 +246,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       updatedAt: new Date().toISOString(),
     },
     lastSkillsJson: undefined,
-    sdkSessionId: resumed?.sdkSessionId,
+    conversationId: resumed?.sdkSessionId,
     eventBuffer: [],
     running: true,
     sessionEnded: false,
@@ -202,61 +254,41 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     lastHandledKillAt: undefined,
     lastHandledForkAt: undefined,
     executeFork: async (name) => {
-      const state = await runFork(config, ctx.sdkSessionId, name, undefined);
+      const state = await runFork(config, ctx.conversationId, name, undefined);
       return { controlUrl: state.controlUrl };
     },
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,
-    currentQuery: undefined,
     contextWarningActive: false,
     flushChain: Promise.resolve(),
   };
 
   persist(ctx, {});
 
+  const pumping = pumpEngineEvents(ctx);
+
   // Populates the phone's menu before the first turn ever runs. Spawns a
   // throwaway query() purely to read the skill list -- see probeSkills for why
   // this costs no model spend. Not awaited: the phone URL should be handed
   // back immediately, and an empty menu for the few hundred ms this takes is
-  // harmless.
-  void (async () => {
-    try {
-      const { skills, localCommands } = await probeSkills(config.projectDir, providerEnv);
-      await publishSkills(ctx, skills, localCommands);
-    } catch (e) {
-      console.error("Failed to probe skills at startup:", (e as Error).message);
-    }
-  })();
+  // harmless. A fake Engine announces its own menu instead.
+  if (!process.env.CRC_FAKE_ENGINE) {
+    void (async () => {
+      try {
+        const { skills, localCommands } = await probeSkills(config.projectDir, providerEnv);
+        await publishSkills(ctx, skills, localCommands);
+      } catch (e) {
+        console.error("Failed to probe skills at startup:", (e as Error).message);
+      }
+    })();
+  }
 
   // Explains, and corrects the relay for, whatever a previous process died
   // holding.
   await inFlight.resumeFrom(resumed?.inFlight);
 
-  // Background tasks left running when a previous process died are gone with it
-  // -- the CLI subprocess they were children of no longer exists. Report each
-  // as interrupted and empty the tray, so nothing sits spinning forever.
-  // Mirrors the in-flight-turn honesty above.
-  if (resumed?.runningTasks?.length) {
-    console.log(
-      `Reporting ${resumed.runningTasks.length} background task(s) interrupted by restart.`,
-    );
-    for (const t of resumed.runningTasks) {
-      ctx.eventBuffer.push({
-        type: "background_task_settled",
-        task_id: t.task_id,
-        tool_use_id: t.tool_use_id,
-        task_status: "interrupted",
-        text: t.description
-          ? `interrupted by connector restart: ${t.description}`
-          : "interrupted by connector restart",
-      });
-    }
-    // The live set is per-process and empty after a restart; say so, so a
-    // reload's replay of the last non-empty set doesn't show stale running work.
-    ctx.eventBuffer.push({ type: "background_tasks_changed", tasks: [] });
-    persist(ctx, { runningTasks: undefined });
-  }
+  reportTasksInterruptedByRestart(ctx, resumed?.runningTasks);
 
   const flushTimer = setInterval(() => {
     void flushEvents(ctx);
@@ -291,6 +323,11 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     stopWatchingKills();
     stopWatchingSteers();
     stopWatchingForks();
+    // Closing ends the pump, whose last events still make the final flush.
+    await ctx.engineSession
+      .close()
+      .catch((e) => console.error("Failed to close the Engine session:", (e as Error).message));
+    await pumping;
     if (!ctx.sessionEnded) await flushEvents(ctx).catch(() => undefined);
     resolveDone();
   }

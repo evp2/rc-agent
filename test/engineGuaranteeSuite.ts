@@ -101,6 +101,28 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
     await session.close();
   });
 
+  test(`${name}: Stop also ends a Command queued behind the stopped Turn, pairing its Turn as stopped`, async () => {
+    const session = await harness.makeHangingEngine().open(openOptions());
+    const it = session.events[Symbol.asyncIterator]();
+    session.send("keep going");
+    await readUntil(it, turnStarted);
+    session.send("queued behind it");
+    session.stop();
+    let endedCount = 0;
+    const events = await readUntil(it, (e) => {
+      if (turnEnded(e)) endedCount += 1;
+      return endedCount === 2;
+    });
+    const starts = events.filter(turnStarted);
+    assert.equal(starts.length, 1, "the queued Command's Turn is reported, so whoever sent it hears how it ended");
+    assert.equal(starts[0].cause, "command");
+    assert.deepEqual(
+      events.filter(turnEnded).map((e) => e.outcome),
+      ["stopped", "stopped"],
+    );
+    await session.close();
+  });
+
   test(`${name}: send() queues behind a running Turn and starts once it ends`, async () => {
     const session = await harness.makeQueueingEngine().open(openOptions());
     const it = session.events[Symbol.asyncIterator]();

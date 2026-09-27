@@ -235,3 +235,20 @@ test("the cursor survives a restart", async () => {
   const { ledger } = makeLedger({ cursor: "c-99" });
   assert.equal(ledger.cursor, "c-99");
 });
+
+test("a Steer the Engine refused is withdrawn but stays held, for the caller to hand back", async () => {
+  const { ledger, relay, emitted } = makeLedger();
+  const late = cmd("arrived just as the Turn ended");
+
+  await ledger.duringTurn(cmd("first"), new AbortController().signal, async (claims) => {
+    const claiming = claims.steer(late);
+    claims.withdrawSteer();
+    await claiming;
+    assert.equal(claims.pendingSteerSeq, undefined);
+    await claims.settleActive();
+  });
+
+  assert.deepEqual(ledger.snapshot(), [{ seq: late.seq, text: late.text, status: "queued" }]);
+  assert.equal(relay.lastReport, true, "the brake stays on: the withdrawn Steer still has to run");
+  assert.deepEqual(emitted, [], "nothing was discarded");
+});

@@ -47,7 +47,12 @@ export interface EngineSession {
   send(text: string): void;
   /** Streams a Command into the running Turn. Throws if it cannot be delivered. */
   steer(text: string): void;
-  /** Interrupts the running Turn, if any. Idempotent. */
+  /**
+   * Interrupts the running Turn, if any, and ends every Command still queued
+   * behind it -- each is reported as a `turn_started` followed by a
+   * `turn_ended { outcome: "stopped" }`, so whoever sent it hears how it
+   * ended. Idempotent.
+   */
   stop(): void;
   /** Kills one Background task. Idempotent; a no-op for an unknown or settled id. */
   killTask(taskId: string): Promise<void>;

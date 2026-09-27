@@ -3,9 +3,8 @@ import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 /**
  * Minimal pull-based async queue: a value pushed before anyone is waiting is
  * buffered; a `next()` call arriving before any value exists parks until one
- * is pushed. Backs both sides of the streaming-input seam -- a Turn's prompt
- * in run.ts (real SDK) and the fake SDK's per-Turn mailbox of injected input
- * (fakeSdk.ts) share this same shape.
+ * is pushed. Backs the Claude adapter's streaming input (each query's prompt)
+ * and the Engine session's own event stream.
  */
 export class AsyncQueue<T> implements AsyncIterable<T> {
   private readonly buffered: T[] = [];
@@ -70,13 +69,4 @@ export function userTextMessage(text: string, opts: { priority?: "now" } = {}): 
     parent_tool_use_id: null,
     ...opts,
   } as SDKUserMessage;
-}
-
-/** The text of a user message built by {@link userTextMessage}, or any plain-string-content SDKUserMessage. */
-export function textOf(message: SDKUserMessage): string {
-  const content = message.message.content;
-  if (typeof content === "string") return content;
-  return content
-    .map((block) => (block.type === "text" ? block.text : ""))
-    .join("");
 }

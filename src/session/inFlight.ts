@@ -34,18 +34,26 @@ export interface InFlightDeps {
 export interface TurnClaims {
   /** The Command whose entry is `running` right now. */
   readonly activeSeq: string;
-  /** Set the instant a Steer is streamed in, cleared once a fresh `init` confirms it landed. */
+  /** Set the instant a Steer is claimed, before it is delivered; cleared once the Steer's own Turn starts, confirming it landed. */
   readonly pendingSteerSeq: string | undefined;
   /** Claims a Command as this Turn's one Steer, before it is streamed in. */
   steer(command: CommandRecord): Promise<void>;
   /**
-   * A fresh `init` confirmed the Steer: it becomes the Turn's active Command,
-   * and whatever was active before it is released.
+   * The Steer's own Turn started, confirming it: it becomes the Turn's active
+   * Command, and whatever was active before it is released.
    */
   confirmSteer(): Promise<void>;
-  /** The Steer never reached the query. Reported to the phone, not left claimed. */
+  /** The Steer never reached the Engine. Reported to the phone, not left claimed. */
   abandonSteer(): Promise<void>;
-  /** This sub-turn produced its `result`. */
+  /**
+   * The Engine refused the Steer because the Turn it was aimed at had
+   * already ended. It is no longer this Turn's, but it stays held `queued`
+   * for the caller to hand back and run as a Turn of its own -- nothing the
+   * human typed is lost to that race. Synchronous, so nothing can observe
+   * the Steer as pending in between.
+   */
+  withdrawSteer(): void;
+  /** The active Command's Turn ended. */
   settleActive(): Promise<void>;
 }
 
@@ -99,6 +107,10 @@ class TurnClaimsImpl implements TurnClaims {
     if (!seq) return;
     this.pendingSteerSeq = undefined;
     await this.owner.drop(seq);
+  }
+
+  withdrawSteer(): void {
+    this.pendingSteerSeq = undefined;
   }
 
   async settleActive(): Promise<void> {

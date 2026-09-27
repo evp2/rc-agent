@@ -1,10 +1,15 @@
 import type { Options, Query, SDKMessage, SDKUserMessage, SlashCommand } from "@anthropic-ai/claude-agent-sdk";
 
+import type { ClaudeEngineDeps } from "../src/engine/claude/adapter.ts";
+import { FakeEngine, sayAndFinish, type FakeEngineScript, type FakeEngineSession } from "../src/engine/fakeEngine.ts";
+import type { Engine, EngineSession } from "../src/engine/types.ts";
 import { AsyncQueue } from "../src/sdk/asyncQueue.ts";
-import { createSdkMessageMapper } from "../src/sdk/bridge.ts";
 import type { CommandRecord, EventInput, RelayClient } from "../src/relay/client.ts";
 import type { SessionContext } from "../src/session/context.ts";
+import { createBannerDeduper } from "../src/session/engineEvents.ts";
 import { InFlight, type InFlightDeps } from "../src/session/inFlight.ts";
+import { pumpEngineEvents } from "../src/session/pump.ts";
+import { answerQuestion } from "../src/session/watchers.ts";
 import type { ConnectorState } from "../src/state.ts";
 import type { WorktreeEntry } from "../src/worktrees.ts";
 
@@ -204,8 +209,7 @@ export function scriptedQuery(
     /** Called synchronously with the `options` a real `query()` call would receive, so a test can reach into `options.hooks` (e.g. to invoke PreCompact) exactly as the real SDK would. */
     onOptions?: (options: Options) => void;
     /**
-     * Models the measured real-SDK behavior (see ticket "pin the stuck-Turn
-     * bug"): after its last scripted message, the query's own generator does
+     * Models the measured real-SDK behavior: after its last scripted message, the query's own generator does
      * not return -- exactly as a real query stays open for as long as a
      * Background task the Turn started keeps running -- and ends only once
      * the Turn is stopped (`options.abortController`'s signal fires). Without
@@ -213,9 +217,9 @@ export function scriptedQuery(
      */
     staysOpenAfterDrain?: boolean;
   } = {},
-): { query: SessionContext["query"]; streamed: string[] } {
+): { query: ClaudeEngineDeps["query"]; streamed: string[] } {
   const streamed: string[] = [];
-  const query: SessionContext["query"] = ({ options }) => {
+  const query: ClaudeEngineDeps["query"] = ({ options }) => {
     opts.onOptions?.(options ?? {});
     const pending = new AsyncQueue<SDKMessage>();
     for (const m of messages) pending.push(m);
@@ -288,17 +292,28 @@ export interface TurnHarness {
   ledger: InFlight;
   relay: FakeRelay;
   written: ConnectorState[];
-  streamed: string[];
+  /** The open Engine session the harness's pump reads -- a FakeEngineSession unless `engine` was overridden. */
+  session: FakeEngineSession;
+  /** Closes the Engine session and waits for the pump to drain what it had left. */
+  close(): Promise<void>;
 }
 
 /**
- * A SessionContext wired to fakes, with no relay, no state file and no
- * subprocess. Everything a Turn touches that leaves the process is a field on
- * the context, which is what makes this possible at all.
+ * A SessionContext driving a fake Engine, with no relay, no state file and no
+ * agent process, and the session's event pump already running. Everything a
+ * Turn touches that leaves the process is a field on the context, which is
+ * what makes this possible at all.
  */
-export function makeTurnHarness(
-  messages: SDKMessage[],
-  opts: Parameters<typeof scriptedQuery>[1] & {
+export async function makeTurnHarness(
+  opts: {
+    /** Each Turn's scripted body -- defaults to a Turn that says "ok" and ends. */
+    handlerFor?: FakeEngineScript["handlerFor"];
+    /** The rest of the fake Engine's script: a resume target, an announcement, a menu, ... */
+    script?: Partial<FakeEngineScript>;
+    /** A real Engine to drive instead of the fake -- for a regression pinned against one adapter's own behaviour. */
+    engine?: Engine;
+    /** What `open()` is asked to resume, as a state file would supply it. */
+    resume?: string;
     /** A real directory for the Turn to run in -- only tests of git-derived behaviour need one. */
     projectDir?: string;
     /** Overrides merged into the fake config -- e.g. `inactivityCompact` for Auto-compact tests. */
@@ -306,10 +321,12 @@ export function makeTurnHarness(
     /** Stubs `ctx.executeFork` -- defaults to a no-op success, overridden by Fork tests to assert what it was called with or to simulate a failure. */
     executeFork?: SessionContext["executeFork"];
   } = {},
-): TurnHarness {
+): Promise<TurnHarness> {
   const relay = new FakeRelay();
   const written: ConnectorState[] = [];
-  const { query, streamed } = scriptedQuery(messages, opts);
+  const projectDir = opts.projectDir ?? "/tmp/project";
+  const engine =
+    opts.engine ?? new FakeEngine({ handlerFor: opts.handlerFor ?? (() => sayAndFinish("ok")), ...opts.script });
 
   let ctx: SessionContext;
   const ledger = new InFlight({
@@ -323,22 +340,28 @@ export function makeTurnHarness(
     },
   });
 
+  const session: EngineSession = await engine.open({
+    projectDir,
+    resume: opts.resume,
+    onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
+  });
+
   ctx = {
     client: relay.asClient(),
     config: {
       relayBaseUrl: "http://relay.test",
       connectorCredential: "s",
-      projectDir: opts.projectDir ?? "/tmp/project",
+      projectDir,
       provider: { type: "anthropic" },
       ...opts.config,
     } as SessionContext["config"],
-    providerEnv: {},
-    query,
+    engine,
+    engineSession: session,
+    bannerFor: createBannerDeduper(),
     writeState: (state) => {
       written.push(state);
     },
     inFlight: ledger,
-    mapMessage: createSdkMessageMapper(),
     state: {
       version: 1,
       projectDir: "/tmp/project",
@@ -351,7 +374,7 @@ export function makeTurnHarness(
       updatedAt: new Date().toISOString(),
     },
     lastSkillsJson: undefined,
-    sdkSessionId: undefined,
+    conversationId: opts.resume,
     eventBuffer: [],
     running: true,
     sessionEnded: false,
@@ -362,10 +385,29 @@ export function makeTurnHarness(
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,
-    currentQuery: undefined,
     contextWarningActive: false,
     flushChain: Promise.resolve(),
   };
 
-  return { ctx, ledger, relay, written, streamed };
+  const pumping = pumpEngineEvents(ctx);
+  return {
+    ctx,
+    ledger,
+    relay,
+    written,
+    session: session as FakeEngineSession,
+    async close() {
+      await session.close();
+      await pumping;
+    },
+  };
+}
+
+/** Resolves once `condition` holds, polling every few milliseconds; throws after `timeoutMs` so a broken expectation fails fast rather than hanging. */
+export async function until(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for a condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }

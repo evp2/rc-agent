@@ -252,3 +252,204 @@ test("ClaudeEngine: an automatic PreCompact fires \"compacting\", a manual one d
   assert.ok(events.some((e) => e.type === "compacting" && e.trigger === "auto"));
   await session.close();
 });
+
+// --- Resume, and Turns that can never run ----------------------------------
+
+test("ClaudeEngine: open({ resume }) resumes that Conversation on the very first query", async () => {
+  let capturedOptions: Options | undefined;
+  const { query } = scriptedQuery([init("sdk-prev"), result()], {
+    onOptions: (options) => {
+      capturedOptions = options;
+    },
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", resume: "sdk-prev", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("hello again");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+
+  assert.equal(capturedOptions?.resume, "sdk-prev");
+  const conversation = events.find((e) => e.type === "conversation") as Extract<EngineEvent, { type: "conversation" }>;
+  assert.deepEqual(conversation, { type: "conversation", id: "sdk-prev", resumed: true });
+  await session.close();
+});
+
+test("ClaudeEngine: a Conversation id that changes mid-session is announced again, so it can be persisted", async () => {
+  const query = reactiveQuery({
+    subTurns: [
+      [init("sdk-1"), assistantText("first"), result()],
+      [init("sdk-2"), assistantText("second"), result()],
+    ],
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  const first = await collect(it, (e) => e.type === "turn_ended");
+  session.send("second");
+  const second = await collect(it, (e) => e.type === "turn_ended");
+
+  const ids = [...first, ...second].filter((e) => e.type === "conversation").map((e) => (e as { id: string }).id);
+  assert.deepEqual(ids, ["sdk-1", "sdk-2"]);
+  await session.close();
+});
+
+test("ClaudeEngine: a Command pushed into a query that then dies still gets its Turn, ended as an error", async () => {
+  let releaseDeath: () => void = () => undefined;
+  const deathGate = new Promise<void>((resolve) => {
+    releaseDeath = resolve;
+  });
+  const marker = { type: "rate_limit_event" } as unknown as Parameters<typeof scriptedQuery>[0][number];
+  const { query } = scriptedQuery([init(), result(), marker], {
+    onYield: async (message) => {
+      if (message !== marker) return;
+      await deathGate;
+      throw new Error("subprocess exited");
+    },
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await collect(it, (e) => e.type === "turn_ended");
+
+  // The query is still open (a Background task could be keeping it alive), so
+  // this is pushed into it -- and then the subprocess dies before reading it.
+  session.send("second");
+  releaseDeath();
+  const events = await collect(it, (e) => e.type === "turn_ended");
+
+  const started = events.filter((e) => e.type === "turn_started");
+  assert.deepEqual(started, [{ type: "turn_started", cause: "command" }]);
+  const ended = events.find((e) => e.type === "turn_ended") as Extract<EngineEvent, { type: "turn_ended" }>;
+  assert.equal(ended.outcome, "error");
+  assert.deepEqual(ended.errors, ["subprocess exited"]);
+  await session.close();
+});
+
+test("ClaudeEngine: a query dying between Turns, with nothing queued, starts no Turn of its own", async () => {
+  const marker = { type: "rate_limit_event" } as unknown as Parameters<typeof scriptedQuery>[0][number];
+  const { query } = scriptedQuery([init(), result(), marker], {
+    onYield: async (message) => {
+      if (message === marker) throw new Error("subprocess exited");
+    },
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await collect(it, (e) => e.type === "turn_ended");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  void session.close();
+
+  const rest: EngineEvent[] = [];
+  for (;;) {
+    const next = await it.next();
+    if (next.done) break;
+    rest.push(next.value);
+  }
+  assert.deepEqual(rest, [], "the old Turn already reported its outcome; nothing was waiting on another");
+});
+
+test("ClaudeEngine: nothing the SDK yields after a Stop is reported, even if its generator keeps going", async () => {
+  // Observed in production: a Stop mid-Turn can leave the SDK's generator
+  // yielding further messages against an already-torn-down transport instead
+  // of ending cleanly. Consuming them forever left the Turn never ending.
+  let stop: () => void = () => undefined;
+  const { query } = scriptedQuery(
+    [init(), assistantText("before"), assistantText("should not appear"), result("error_during_execution")],
+    {
+      onYield: async (message) => {
+        if (JSON.stringify(message).includes("should not appear")) stop();
+      },
+    },
+  );
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  stop = () => session.stop();
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+
+  assert.ok(!events.some((e) => e.type === "assistant_text" && e.text === "should not appear"));
+  assert.equal((events.at(-1) as Extract<EngineEvent, { type: "turn_ended" }>).outcome, "stopped");
+  await session.close();
+});
+
+// --- The two Steer orderings the real SDK produces, beyond result-then-init --
+
+function turnBoundaries(events: EngineEvent[]): string[] {
+  return events
+    .filter((e) => e.type === "turn_started" || e.type === "turn_ended")
+    .map((e) => (e.type === "turn_started" ? `started:${e.cause}` : `ended:${e.outcome}`));
+}
+
+test("ClaudeEngine: a Steer confirmed by a fresh init before the truncated Turn reports anything still ends that Turn first", async () => {
+  const query = reactiveQuery({
+    subTurns: [
+      [init(), assistantText("working")],
+      [init("sdk-2"), assistantText("corrected"), result()],
+    ],
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await collect(it, (e) => e.type === "turn_started");
+  session.steer("a correction");
+  const events = await collect(it, (e) => e.type === "turn_ended" && e.usage !== undefined);
+
+  assert.deepEqual(turnBoundaries(events), ["ended:success", "started:steer", "ended:success"]);
+  await session.close();
+});
+
+test("ClaudeEngine: a Local command Steered in and answered inside the running Turn still gets a Turn of its own", async () => {
+  // The CLI answers a Local command itself: no fresh init ever confirms it,
+  // just its own output inside whatever Turn is running. Without a Turn of
+  // its own, whoever Steered it would wait on one forever.
+  const localOutput = {
+    type: "system",
+    subtype: "local_command_output",
+    content: "Compacted the conversation.",
+  } as unknown as Parameters<typeof scriptedQuery>[0][number];
+  const query = reactiveQuery({
+    subTurns: [
+      [init(), assistantText("working")],
+      [localOutput, compactBoundary(), result()],
+    ],
+    hangAfterLast: true,
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await collect(it, (e) => e.type === "turn_started");
+  session.steer("/compact");
+  const events = await collect(it, (e) => e.type === "turn_ended" && e.usage !== undefined);
+
+  assert.deepEqual(turnBoundaries(events), ["ended:success", "started:steer", "ended:success"]);
+  assert.ok(
+    events.findIndex((e) => e.type === "turn_started") < events.findIndex((e) => e.type === "status"),
+    "the Local command's output belongs to the Steer's Turn",
+  );
+  await session.close();
+});
+
+test("ClaudeEngine: a Steer pending when the query ends cleanly still gets its Turn, ended without an error", async () => {
+  const { query } = scriptedQuery([init(), assistantText("working"), result()], {
+    onYield: async (message) => {
+      if (message.type === "result") steerNow();
+    },
+  });
+  let steerNow: () => void = () => undefined;
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  steerNow = () => session.steer("a correction");
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  let ended = 0;
+  const events = await collect(it, (e) => e.type === "turn_ended" && ++ended === 2);
+
+  assert.deepEqual(turnBoundaries(events), ["started:command", "ended:success", "started:steer", "ended:success"]);
+  await session.close();
+});

@@ -32,7 +32,7 @@ test("due again once a real Turn completes after the last Auto-compact", () => {
 });
 
 test("maybeSubmitAutoCompact does nothing when the feature is unconfigured", async () => {
-  const h = makeTurnHarness([]);
+  const h = await makeTurnHarness();
   h.ctx.state.lastRealTurnCompletedAt = minutesAgo(60);
 
   await maybeSubmitAutoCompact(h.ctx);
@@ -41,7 +41,7 @@ test("maybeSubmitAutoCompact does nothing when the feature is unconfigured", asy
 });
 
 test("maybeSubmitAutoCompact submits and persists lastAutoCompactAt once due", async () => {
-  const h = makeTurnHarness([], { config: { inactivityCompact: CFG } });
+  const h = await makeTurnHarness({ config: { inactivityCompact: CFG } });
   h.ctx.state.lastRealTurnCompletedAt = new Date(NOW - 31 * 60_000).toISOString();
 
   await maybeSubmitAutoCompact(h.ctx);
@@ -51,7 +51,7 @@ test("maybeSubmitAutoCompact submits and persists lastAutoCompactAt once due", a
 });
 
 test("maybeSubmitAutoCompact does not persist lastAutoCompactAt when the submission fails", async () => {
-  const h = makeTurnHarness([], { config: { inactivityCompact: CFG } });
+  const h = await makeTurnHarness({ config: { inactivityCompact: CFG } });
   h.ctx.state.lastRealTurnCompletedAt = new Date(NOW - 31 * 60_000).toISOString();
   h.relay.failNextPostCommand = new Error("network blip");
 
@@ -61,7 +61,7 @@ test("maybeSubmitAutoCompact does not persist lastAutoCompactAt when the submiss
 });
 
 test("maybeSubmitAutoCompact swallows a SessionEndedError like every other best-effort relay call", async () => {
-  const h = makeTurnHarness([], { config: { inactivityCompact: CFG } });
+  const h = await makeTurnHarness({ config: { inactivityCompact: CFG } });
   h.ctx.state.lastRealTurnCompletedAt = new Date(NOW - 31 * 60_000).toISOString();
   h.relay.failNextPostCommand = new SessionEndedError();
 

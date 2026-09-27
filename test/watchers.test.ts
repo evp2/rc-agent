@@ -7,7 +7,7 @@ import { SessionEndedError } from "../src/relay/client.ts";
 import { makeTurnHarness } from "./doubles.ts";
 
 test("checkForkRequest does nothing when there is no fork_request", async () => {
-  const h = makeTurnHarness([]);
+  const h = await makeTurnHarness();
   h.relay.getSession = async () => ({});
 
   await checkForkRequest(h.ctx);
@@ -17,7 +17,7 @@ test("checkForkRequest does nothing when there is no fork_request", async () => 
 
 test("checkForkRequest drives executeFork and posts the success shape", async () => {
   const calls: string[] = [];
-  const h = makeTurnHarness([], {
+  const h = await makeTurnHarness({
     executeFork: async (name) => {
       calls.push(name);
       return { controlUrl: "https://relay.test/c/abc123" };
@@ -41,7 +41,7 @@ test("checkForkRequest drives executeFork and posts the success shape", async ()
 });
 
 test("checkForkRequest posts the failure shape with git's own error text, unmodified", async () => {
-  const h = makeTurnHarness([], {
+  const h = await makeTurnHarness({
     executeFork: async () => {
       throw new Error("fatal: a branch named 'fix-login-bug' already exists");
     },
@@ -63,7 +63,7 @@ test("checkForkRequest posts the failure shape with git's own error text, unmodi
 });
 
 test("checkForkRequest carries a classified fork_error_code alongside the raw text", async () => {
-  const h = makeTurnHarness([], {
+  const h = await makeTurnHarness({
     executeFork: async () => {
       throw new ForkError("fatal: a branch named 'fix-login-bug' already exists", "name_taken");
     },
@@ -86,7 +86,7 @@ test("checkForkRequest carries a classified fork_error_code alongside the raw te
 });
 
 test("checkForkRequest omits fork_error_code when the failure could not be classified", async () => {
-  const h = makeTurnHarness([], {
+  const h = await makeTurnHarness({
     executeFork: async () => {
       throw new ForkError("fatal: something nobody anticipated", undefined);
     },
@@ -109,7 +109,7 @@ test("checkForkRequest omits fork_error_code when the failure could not be class
 
 test("checkForkRequest never acts on the same fork_request twice", async () => {
   let calls = 0;
-  const h = makeTurnHarness([], {
+  const h = await makeTurnHarness({
     executeFork: async () => {
       calls += 1;
       return { controlUrl: "https://relay.test/c/abc123" };
@@ -128,7 +128,7 @@ test("checkForkRequest never acts on the same fork_request twice", async () => {
 
 test("checkForkRequest acts again once a newer fork_request supersedes the last one it handled", async () => {
   const calls: string[] = [];
-  const h = makeTurnHarness([], {
+  const h = await makeTurnHarness({
     executeFork: async (name) => {
       calls.push(name);
       return { controlUrl: undefined };
@@ -148,7 +148,7 @@ test("checkForkRequest acts again once a newer fork_request supersedes the last 
 });
 
 test("checkForkRequest swallows a SessionEndedError from the session poll", async () => {
-  const h = makeTurnHarness([]);
+  const h = await makeTurnHarness();
   h.relay.getSession = async () => {
     throw new SessionEndedError();
   };

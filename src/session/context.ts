@@ -1,8 +1,7 @@
-import type { query as realQuery, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-
 import type { ConnectorConfig } from "../config";
-import type { createSdkMessageMapper } from "../sdk/bridge";
+import type { Engine, EngineEvent, EngineSession } from "../engine/types";
 import type { CommandRecord, EventInput, RelayClient } from "../relay/client";
+import type { createBannerDeduper } from "./engineEvents";
 import type { InFlight } from "./inFlight";
 import type { ConnectorState } from "../state";
 
@@ -12,32 +11,37 @@ export interface ForkOutcome {
 }
 
 /**
- * The Turn currently executing, if any -- shared between {@link runTurn} in
- * turn.ts and {@link watchForSteers} in watchers.ts.
+ * The Command Turn chain currently executing, if any -- a Command's own Turn
+ * plus any Turns Steered into it. Shared between {@link runTurn} in turn.ts,
+ * the event pump in pump.ts (which hands it the Turn boundaries it owns) and
+ * {@link watchForSteers} in watchers.ts.
  *
- * Carries only what is not a claim. Which Commands the Turn holds, and which
+ * Carries only what is not a claim. Which Commands the chain holds, and which
  * of them a Steer is waiting on, live on the handle {@link InFlight.current}
  * returns: they used to be duplicated here and in the held set, and the two
  * copies drifting is what left a Steer claimed forever.
  */
 export interface CurrentTurn {
   abortController: AbortController;
-  /** Whether this specific sub-turn has already taken its one allowed Steer. */
+  /** Whether the chain's Turn running right now has already taken its one allowed Steer. */
   steeredThisSubTurn: boolean;
+  /** True between one of this chain's `turn_started` and its `turn_ended` -- the only time a Steer is legal. */
+  readonly running: boolean;
+  /** Whether a Turn starting with `cause` is this chain's: its Command's own, or the Steer it is waiting on. */
+  owns(cause: TurnCause): boolean;
+  onTurnStarted(cause: TurnCause): Promise<void>;
+  onTurnEnded(event: TurnEndedEvent): Promise<void>;
   /**
-   * Delivers a Steer into the Turn's own still-open prompt queue -- the same
-   * iterable `query()` was called with, which the SDK drains via its own
-   * internal `streamInput()` call for the Turn's whole life. A *second*
-   * `streamInput()` call (a fresh queue per Steer, as this used to work) ends
-   * with the SDK closing the CLI subprocess's stdin the moment that queue's
-   * one message is delivered -- which kills the first, still-running
-   * `streamInput()` call along with it, and with it every future
-   * `AskUserQuestion` in the Turn (its only channel, `canUseTool`, throws
-   * "Stream closed" instead of ever reaching the phone). Pushing into the
-   * one queue that was never closed avoids ending stdin at all.
+   * Some other Turn started. If the chain was waiting on a Steer's own Turn,
+   * that Steer is not coming, so the chain ends here rather than wait forever.
    */
-  pushSteer: (message: SDKUserMessage) => void;
+  onOtherTurnStarted(): void;
+  /** Ends the chain without waiting on another Turn boundary -- the Engine's event stream is over. */
+  release(): void;
 }
+
+export type TurnCause = Extract<EngineEvent, { type: "turn_started" }>["cause"];
+export type TurnEndedEvent = Extract<EngineEvent, { type: "turn_ended" }>;
 
 /**
  * The mutable state shared by every module under `session/`, plus the
@@ -49,20 +53,14 @@ export interface CurrentTurn {
 export interface SessionContext {
   readonly client: RelayClient;
   readonly config: ConnectorConfig;
-  readonly providerEnv: NodeJS.ProcessEnv;
-  readonly mapMessage: ReturnType<typeof createSdkMessageMapper>;
+  /** What the session knows about the Engine it drives, beyond the open session itself. */
+  readonly engine: Pick<Engine, "kind" | "capabilities">;
+  /** The one Engine session this connector drives for its whole life. */
+  readonly engineSession: EngineSession;
+  /** Turns an Engine's `announce` into the session banner, deduplicated across Turns. */
+  readonly bannerFor: ReturnType<typeof createBannerDeduper>;
 
-  /**
-   * The connector's door into the SDK's `query()`, defaulted from sdk/client.ts
-   * so production and the e2e harness are unaffected. A field rather than a
-   * direct import because that module picks its adapter once, from a process
-   * environment variable -- a real seam, but one placed at process scope, which
-   * is why driving a Turn used to require a whole connector process. Passed
-   * here, a test can hand a Turn a scripted message sequence in-process.
-   */
-  readonly query: typeof realQuery;
-
-  /** How durable state reaches disk. A field for the same reason `query` is: the real one resolves a path under the user's home directory, which a test must not write to. */
+  /** How durable state reaches disk. A field rather than a direct import because the real one resolves a path under the user's home directory, which a test must not write to. */
   readonly writeState: (state: ConnectorState) => void;
 
   /** The authoritative record of every Command held but not finished, and the command-log cursor that moves with it. */
@@ -71,7 +69,8 @@ export interface SessionContext {
   state: ConnectorState;
   /** Last-published skill+local-command lists, as JSON, so a turn whose lists haven't changed since the last publish (the common case) doesn't PUT anything. */
   lastSkillsJson: string | undefined;
-  sdkSessionId: string | undefined;
+  /** The Engine's Conversation id, once it is resumable -- what a restart resumes and a Fork carries. */
+  conversationId: string | undefined;
   eventBuffer: EventInput[];
   running: boolean;
   /** Set once the relay reports the session gone; suppresses further posting. */
@@ -97,8 +96,8 @@ export interface SessionContext {
   /**
    * Carries out a Fork by name: `git worktree add`, a generated config, a
    * best-effort transcript copy, and a new connector process, returning that
-   * process's Control URL. A field rather than a direct import for the same
-   * reason `query` is -- the real implementation spawns a detached OS process
+   * process's Control URL. A field rather than a direct import because the
+   * real implementation spawns a detached OS process
    * and waits on its state file, which a test must not do; a test hands this
    * a stub instead.
    */
@@ -113,8 +112,8 @@ export interface SessionContext {
   readonly handBackBuffer: CommandRecord[];
 
   /**
-   * Set while a `canUseTool` call is holding a Turn open on a pending
-   * Question, so {@link watchForSteers} knows not to advance the cursor over
+   * Set while the Engine's Question callback is holding a Turn open on a
+   * pending Question, so {@link watchForSteers} knows not to advance the cursor over
    * a Command the stalled Turn cannot read yet.
    */
   questionPending: boolean;
@@ -131,19 +130,6 @@ export interface SessionContext {
    * a fresh process has no better guess than reading the next real percentage.
    */
   contextWarningActive: boolean;
-
-  /**
-   * The most recently created turn's Query, for as long as its own generator
-   * is still being drained. Live for the persistent kill-watcher to act
-   * against for as long as a turn's subprocess is -- which can outlast the
-   * turn's own `result` while one of its Background tasks is still running.
-   */
-  currentQuery:
-    | {
-        stopTask(taskId: string): Promise<void>;
-        getContextUsage(): Promise<{ percentage: number }>;
-      }
-    | undefined;
 
   /** Serialising flushes keeps event order stable when a flush outlives its interval tick, and lets shutdown await every queued flush. */
   flushChain: Promise<void>;

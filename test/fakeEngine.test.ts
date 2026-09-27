@@ -224,3 +224,79 @@ async function collect(
     if (predicate(result.value)) return collected;
   }
 }
+
+test("FakeEngine: a Turn whose Question is aborted by Stop ends as stopped, not as an error", async () => {
+  const engine = new FakeEngine({
+    handlerFor: () => askAndFinish({ toolUseId: "q1", questions: [] }),
+  });
+  const session = await engine.open({
+    projectDir: "/tmp/x",
+    onQuestion: (_q, signal) =>
+      new Promise<EngineAnswer>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("turn stopped")), { once: true });
+        session.stop();
+      }),
+  });
+  const events: EngineEvent[] = [];
+  session.send("ask");
+  for await (const e of session.events) {
+    events.push(e);
+    if (e.type === "turn_ended") break;
+  }
+  const ended = events.find((e) => e.type === "turn_ended") as Extract<EngineEvent, { type: "turn_ended" }>;
+  assert.equal(ended.outcome, "stopped");
+  await session.close();
+});
+
+test("FakeEngine: a handler can wait for its Turn to be cut short by a Steer, so it stops working", async () => {
+  const afterSteer: string[] = [];
+  const engine = new FakeEngine({
+    handlerFor: (cause) =>
+      cause === "steer"
+        ? sayAndFinish("corrected")
+        : async (ctx) => {
+            await ctx.waitForInterruption();
+            afterSteer.push(ctx.stopped ? "stopped" : "steered");
+            return { outcome: "success" };
+          },
+  });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await it.next(); // conversation
+  await it.next(); // turn_started
+  session.steer("a correction");
+  for (;;) {
+    const { value } = await it.next();
+    if (value?.type === "turn_ended" && afterSteer.length) break;
+  }
+  assert.deepEqual(afterSteer, ["steered"]);
+  await session.close();
+});
+
+test("FakeEngine: beforeSteerConfirm runs inside the truncated Turn, and a Stop there cancels the Steer's Turn", async () => {
+  const engine = new FakeEngine({
+    handlerFor: (cause) => (cause === "steer" ? sayAndFinish("corrected") : hangUntilStopped()),
+    beforeSteerConfirm: async (ctx) => {
+      ctx.emit({ type: "assistant_text", text: "holding" });
+      await ctx.waitForStop();
+    },
+  });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const events: EngineEvent[] = [];
+  session.send("first");
+  for await (const e of session.events) {
+    events.push(e);
+    if (e.type === "turn_started" && events.filter((x) => x.type === "turn_started").length === 1) {
+      session.steer("a correction");
+    }
+    if (e.type === "assistant_text" && e.text === "holding") session.stop();
+    if (e.type === "turn_ended") break;
+  }
+  assert.deepEqual(
+    events.filter((e) => e.type === "turn_started" || e.type === "turn_ended").map((e) => e.type),
+    ["turn_started", "turn_ended"],
+  );
+  assert.equal((events.at(-1) as Extract<EngineEvent, { type: "turn_ended" }>).outcome, "stopped");
+  await session.close();
+});

@@ -1,7 +1,7 @@
 import type { Options, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { AsyncQueue, takeOne } from "../src/sdk/asyncQueue.ts";
-import type { SessionContext } from "../src/session/context.ts";
+import type { ClaudeEngineDeps } from "../src/engine/claude/adapter.ts";
 
 export interface ReactiveScript {
   /**
@@ -20,13 +20,11 @@ export interface ReactiveScript {
 /**
  * Unlike test/doubles.ts's `scriptedQuery`, which ignores its `prompt`
  * argument entirely, this fake actually drains it for the query's whole
- * life -- the same behaviour turn.ts's `pushSteer` (and now the Claude
- * adapter's `send`/`steer`) depend on the real SDK for. It reacts the
- * instant something is pushed, with no artificial pause, since it exists for
- * fast adapter unit tests rather than the timing-realistic scenarios
- * src/sdk/fakeSdk.ts's personas are built for.
+ * life -- the same behaviour the Claude adapter's `send`/`steer` depend on
+ * the real SDK for. It reacts the instant something is pushed, with no
+ * artificial pause, since it exists for fast adapter unit tests.
  */
-export function reactiveQuery(script: ReactiveScript): SessionContext["query"] {
+export function reactiveQuery(script: ReactiveScript): ClaudeEngineDeps["query"] {
   return ({ prompt, options }: { prompt: string | AsyncIterable<SDKUserMessage>; options?: Options }): Query => {
     const signal = options?.abortController?.signal;
 

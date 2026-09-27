@@ -21,7 +21,7 @@ function initRepo(): string {
 
 test("publishSkills includes the computed Worktree list alongside skills and local commands", async () => {
   const repo = initRepo();
-  const { ctx, relay } = makeTurnHarness([], { projectDir: repo });
+  const { ctx, relay } = await makeTurnHarness({ projectDir: repo });
 
   await publishSkills(ctx, [], []);
 
@@ -33,7 +33,7 @@ test("publishSkills includes the computed Worktree list alongside skills and loc
 
 test("publishSkills skips the PUT when nothing -- including the Worktree list -- has changed", async () => {
   const repo = initRepo();
-  const { ctx, relay } = makeTurnHarness([], { projectDir: repo });
+  const { ctx, relay } = await makeTurnHarness({ projectDir: repo });
 
   await publishSkills(ctx, [], []);
   await publishSkills(ctx, [], []);
@@ -43,7 +43,7 @@ test("publishSkills skips the PUT when nothing -- including the Worktree list --
 
 test("publishSkills re-publishes when the Worktree list changes even though skills didn't", async () => {
   const repo = initRepo();
-  const { ctx, relay } = makeTurnHarness([], { projectDir: repo });
+  const { ctx, relay } = await makeTurnHarness({ projectDir: repo });
 
   await publishSkills(ctx, [], []);
   execFileSync("git", ["worktree", "add", `${repo}.sib`, "-b", "sib"], { cwd: repo });

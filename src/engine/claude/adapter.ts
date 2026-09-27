@@ -30,7 +30,7 @@ export interface ClaudeEngineDeps {
   env: NodeJS.ProcessEnv;
 }
 
-/** Builds a Claude adapter wired to the connector's real `query()` seam (fake-SDK-aware via `CRC_FAKE_SDK`, same as every other production caller). */
+/** Builds a Claude adapter wired to the real SDK's `query()`. */
 export function createClaudeEngine(env: NodeJS.ProcessEnv): Engine {
   return new ClaudeEngine({ query: defaultSdkQuery, env });
 }
@@ -79,8 +79,9 @@ class ClaudeEngineSession implements EngineSession {
    */
   private readonly pendingCauses: ("command" | "steer")[] = [];
   private readonly liveTaskIds = new Set<string>();
+  /** Seeded from `options.resume`, so the very first query resumes it; replaced by whatever each `system:init` reports. */
   private conversationId: string | undefined;
-  private conversationAnnounced = false;
+  private announcedConversationId: string | undefined;
   private activeInput: AsyncQueue<SDKUserMessage> | undefined;
   private activeAbort: AbortController | undefined;
   private activeQueryHandle: Query | undefined;
@@ -91,7 +92,9 @@ class ClaudeEngineSession implements EngineSession {
   constructor(
     private readonly deps: ClaudeEngineDeps,
     private readonly options: OpenOptions,
-  ) {}
+  ) {
+    this.conversationId = options.resume;
+  }
 
   get events(): AsyncIterable<EngineEvent> {
     return this.outbox;
@@ -194,8 +197,9 @@ class ClaudeEngineSession implements EngineSession {
 
   private async drain(activeQuery: Query, abortController: AbortController): Promise<void> {
     let turnStartedAt = Date.now();
-    let sawResultForCurrentSubturn = false;
     let turnStartedForCurrentSubturn = false;
+    /** Set when the query died between Turns, for whatever was sent and never got to run. */
+    let deathMessage: string | undefined;
 
     const ensureTurnStarted = (): void => {
       if (turnStartedForCurrentSubturn) return;
@@ -208,7 +212,6 @@ class ClaudeEngineSession implements EngineSession {
     const endSubturn = (outcome: "success" | "error" | "stopped", extra: TurnEndedExtra = {}): void => {
       this.turnRunning = false;
       turnStartedForCurrentSubturn = false;
-      sawResultForCurrentSubturn = false;
       this.outbox.push({ type: "turn_ended", outcome, durationMs: Date.now() - turnStartedAt, ...extra });
     };
 
@@ -242,6 +245,18 @@ class ClaudeEngineSession implements EngineSession {
         // instant the real init followed it.
         if (!this.isRecognizedNonInit(message)) continue;
 
+        // A Local command Steered in is answered by the CLI itself, inside
+        // whatever Turn is running, with no fresh `init` to confirm it. Its
+        // output is the first sign it was taken, so the Steer's Turn starts
+        // here -- otherwise whoever Steered it waits on that Turn forever.
+        if (
+          turnStartedForCurrentSubturn &&
+          this.pendingCauses[0] === "steer" &&
+          message.type === "system" &&
+          message.subtype === "local_command_output"
+        ) {
+          endSubturn("success");
+        }
         ensureTurnStarted();
         if (this.translateNonInit(message)) continue;
 
@@ -253,7 +268,6 @@ class ClaudeEngineSession implements EngineSession {
         }
 
         if (message.type === "result") {
-          sawResultForCurrentSubturn = true;
           const usage: EngineUsage = {
             inputTokens: message.usage.input_tokens,
             outputTokens: message.usage.output_tokens,
@@ -270,19 +284,20 @@ class ClaudeEngineSession implements EngineSession {
         }
       }
     } catch (e) {
-      if (abortController.signal.aborted) {
-        if (!sawResultForCurrentSubturn) endSubturn("stopped");
-      } else {
+      if (!abortController.signal.aborted) {
         const msg = (e as Error).message;
         console.error("Turn failed:", msg);
-        // A `result` message already reported this Turn's outcome -- avoid a
-        // redundant second error for the same failure when the generator
-        // also rejects after streaming it.
-        if (!sawResultForCurrentSubturn) {
-          ensureTurnStarted();
-          endSubturn(msg.startsWith(EDE_DIAGNOSTIC_PREFIX) ? "success" : "error", {
-            errors: msg.startsWith(EDE_DIAGNOSTIC_PREFIX) ? undefined : [msg],
-          });
+        // `[ede_diagnostic]` is the SDK's own internal consistency-check tag,
+        // never meant for a human -- the Turn it fires around went on to
+        // succeed.
+        const diagnostic = msg.startsWith(EDE_DIAGNOSTIC_PREFIX);
+        if (turnStartedForCurrentSubturn) {
+          endSubturn(diagnostic ? "success" : "error", { errors: diagnostic ? undefined : [msg] });
+        } else if (!diagnostic) {
+          // Between Turns: the previous one already reported its outcome, so
+          // this is only news to whatever was sent and never got to run --
+          // reported below, against each of those.
+          deathMessage = msg;
         }
       }
     } finally {
@@ -302,8 +317,27 @@ class ClaudeEngineSession implements EngineSession {
       if (turnStartedForCurrentSubturn) endSubturn(abortController.signal.aborted ? "stopped" : "success");
 
       // Anything still queued here was never delivered -- the subprocess
-      // this chain drove is gone, so it must not label a later chain's Turn.
-      this.pendingCauses.length = 0;
+      // this chain drove is gone. Each one still gets a Turn that starts and
+      // ends, so whoever sent it hears how it went instead of waiting for a
+      // Turn that is never coming; and none of them may label a later
+      // chain's Turn.
+      for (const cause of this.pendingCauses.splice(0)) {
+        this.outbox.push({ type: "turn_started", cause });
+        if (abortController.signal.aborted) {
+          this.outbox.push({ type: "turn_ended", outcome: "stopped", durationMs: 0 });
+        } else if (cause === "steer" && deathMessage === undefined) {
+          // The query ended cleanly with the Steer taken into the Turn it was
+          // aimed at: absorbed, not failed.
+          this.outbox.push({ type: "turn_ended", outcome: "success", durationMs: 0 });
+        } else {
+          this.outbox.push({
+            type: "turn_ended",
+            outcome: "error",
+            errors: [deathMessage ?? "the agent's process ended before this could run"],
+            durationMs: 0,
+          });
+        }
+      }
       this.activeInput = undefined;
       this.activeAbort = undefined;
       this.activeQueryHandle = undefined;
@@ -313,8 +347,7 @@ class ClaudeEngineSession implements EngineSession {
   /** Everything a fresh `system:init` triggers, once the caller has already sequenced the Turn boundary around it. */
   private handleInit(message: Extract<SDKMessage, { type: "system"; subtype: "init" }>, activeQuery: Query): void {
     this.conversationId = message.session_id;
-    if (!this.conversationAnnounced) {
-      this.conversationAnnounced = true;
+    if (this.announcedConversationId === undefined) {
       const requested = this.options.resume;
       const resumed = !!requested && requested === message.session_id;
       this.outbox.push({
@@ -323,7 +356,13 @@ class ClaudeEngineSession implements EngineSession {
         resumed,
         ...(requested && !resumed ? { lostPrevious: true as const } : {}),
       });
+    } else if (this.announcedConversationId !== message.session_id) {
+      // A later query reported a different id for the same conversation --
+      // whatever the connector persisted must follow it, or the next restart
+      // resumes a stale one.
+      this.outbox.push({ type: "conversation", id: message.session_id, resumed: true });
     }
+    this.announcedConversationId = message.session_id;
     this.outbox.push({ type: "announce", model: message.model, permissionMode: message.permissionMode });
 
     const initSkillNames = message.skills;

@@ -5,21 +5,33 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import type { HookInput, Options } from "@anthropic-ai/claude-agent-sdk";
-
+import { ClaudeEngine } from "../src/engine/claude/adapter.ts";
+import {
+  askAndFinish,
+  hangUntilStopped,
+  sayAndFinish,
+  startBackgroundTaskAndFinish,
+  type FakeTurnHandler,
+} from "../src/engine/fakeEngine.ts";
+import type { EngineUsage } from "../src/engine/types.ts";
+import type { CommandRecord } from "../src/relay/client.ts";
 import { contextWarningCrossing, runTurn } from "../src/session/turn.ts";
+import { checkForSteer } from "../src/session/watchers.ts";
 import {
   assistantText,
   cmd,
-  compactBoundary,
   init,
   makeTurnHarness,
   result,
+  scriptedQuery,
   taskStarted,
+  until,
   type TurnHarness,
 } from "./doubles.ts";
 
 const types = (h: TurnHarness) => h.ctx.eventBuffer.map((e) => e.type);
+const statuses = (h: TurnHarness) => h.ctx.eventBuffer.filter((e) => e.type === "status").map((e) => e.text);
+const completes = (h: TurnHarness) => h.ctx.eventBuffer.filter((e) => e.type === "turn_complete");
 
 /** A sentinel `race` resolves to when `promise` hasn't settled within `ms`. */
 const TIMED_OUT = Symbol("timed out");
@@ -28,229 +40,320 @@ async function raceWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T | 
   return Promise.race([promise, timeout]);
 }
 
+/** A Turn that says one line and ends, reporting `outcome` extras such as Usage or a context reading. */
+function sayAndReport(
+  text: string,
+  extra: { usage?: EngineUsage; contextPercentage?: number; outcome?: "success" | "error"; errors?: string[] } = {},
+): FakeTurnHandler {
+  return async (ctx) => {
+    ctx.emit({ type: "assistant_text", text });
+    return { outcome: "success", ...extra };
+  };
+}
+
+/** A Turn that works until something cuts it short -- a Steer or a Stop -- and then says nothing more, as a real truncated Turn doesn't. */
+const workUntilInterrupted: FakeTurnHandler = async (ctx) => {
+  ctx.emit({ type: "assistant_text", text: "working" });
+  await ctx.waitForInterruption();
+  return ctx.stopped ? { outcome: "stopped" } : { outcome: "success" };
+};
+
+/** The relay hands `commands` to the next Steer poll, and nothing after that. */
+function queueForSteerPoll(h: TurnHarness, commands: CommandRecord[]): void {
+  let served = false;
+  h.relay.pollCommands = async () => {
+    if (served) return [];
+    served = true;
+    return commands;
+  };
+}
+
+/**
+ * Starts `command`'s Turn and waits until it is genuinely running -- the only
+ * time a Steer can land. The Turn itself comes back wrapped: returned bare
+ * from an async function, it would be awaited right here.
+ */
+async function startTurn(h: TurnHarness, command: CommandRecord): Promise<{ turn: Promise<void> }> {
+  const turn = runTurn(h.ctx, command);
+  await until(() => !!h.ctx.currentTurn?.running);
+  return { turn };
+}
+
 test("an ordinary Turn holds nothing at the end", async () => {
-  const h = makeTurnHarness([init(), assistantText("hello"), result()]);
+  const h = await makeTurnHarness({ handlerFor: () => sayAndFinish("hello") });
 
   await runTurn(h.ctx, cmd("say hello"));
 
   assert.equal(h.ledger.snapshot(), undefined);
   assert.equal(h.ledger.current(), undefined);
   assert.equal(h.ctx.currentTurn, undefined);
-  assert.equal(h.ctx.currentQuery, undefined);
   assert.deepEqual(h.relay.reports, [true, false]);
   assert.ok(types(h).includes("assistant_text"));
   assert.ok(types(h).includes("turn_complete"));
+  await h.close();
 });
 
-// The probable stuck-Turn bug (see the "pin the stuck-Turn bug" ticket): a
-// real Claude query stays open for as long as its prompt input is open, and
-// that can outlast a Turn's own `result` while a Background task it started
-// keeps running. `runTurn` only closes that input in its `finally`, reached
-// only once the drain loop over the query itself ends -- so a query that
-// stays open until Stop leaves `runTurn` never resolving, and the main loop
-// never hands back to the next Command. Fixed by ticket 04's Engine seam
-// (the next Command starts at `turn_ended`, not once the query drains); this
-// is a known failure against today's code until then.
-test(
-  "a Turn that starts a Background task hands the main loop back once its own result lands, without needing a Stop",
-  { todo: "fixed by ticket 04 -- today's runTurn waits for the whole query, background task included" },
-  async () => {
-    const h = makeTurnHarness([init(), assistantText("starting a background task"), taskStarted(), result()], {
-      staysOpenAfterDrain: true,
-    });
-
-    const turnPromise = runTurn(h.ctx, cmd("kick off a background task"));
-    try {
-      const outcome = await raceWithTimeout(turnPromise, 200);
-      assert.notEqual(
-        outcome,
-        TIMED_OUT,
-        "the Turn's own result already landed; a still-running Background task must not hold the main loop hostage",
-      );
-    } finally {
-      // Todo or not, this Turn must not outlive the test: stopping it lets
-      // runTurn's own finally clear the interrupt-watcher interval it leaked
-      // while stuck, the same way a real Stop would.
-      h.ctx.currentTurn?.abortController.abort();
-      await turnPromise;
-    }
-  },
-);
-
-test("a Steer the SDK never confirms does not leak its claim", async () => {
-  // The originating bug. A Local command (`/compact`) streamed into a running
-  // Turn is answered by the CLI itself: it reports a compact_boundary and a
-  // result and then ends the query, never the fresh `init` that would confirm
-  // the Steer. Nothing else ever released it, so the phone's brake and
-  // Thinking placeholder stayed on against a session that had finished.
-  let h: TurnHarness;
-  h = makeTurnHarness([init(), assistantText("working"), compactBoundary(), result()], {
-    onYield: async (message) => {
-      if (message.type === "result") {
-        await h.ledger.current()!.steer(cmd("/compact"));
-      }
-    },
+// A regression pinned against the Claude adapter: a real Claude
+// query stays open for as long as its input is open, which outlasts a Turn's
+// own `result` while a Background task it started keeps running. Waiting for
+// the query to drain left the main loop stuck until someone tapped Stop.
+test("a Claude Turn that starts a Background task hands the main loop back once its own result lands, without needing a Stop", async () => {
+  const { query } = scriptedQuery([init(), assistantText("starting a background task"), taskStarted(), result()], {
+    staysOpenAfterDrain: true,
   });
+  const h = await makeTurnHarness({ engine: new ClaudeEngine({ query, env: {} }) });
 
-  await runTurn(h.ctx, cmd("first"));
+  const outcome = await raceWithTimeout(runTurn(h.ctx, cmd("kick off a background task")), 1000);
 
-  assert.equal(h.ledger.snapshot(), undefined, "nothing is still held");
-  assert.equal(h.relay.lastReport, false, "the phone is told the Turn is over");
-});
-
-test("the Turn that took an unconfirmed Steer is marked steered and skips the push", async () => {
-  let h: TurnHarness;
-  h = makeTurnHarness([init(), assistantText("working"), result()], {
-    onYield: async (message) => {
-      if (message.type === "result") await h.ledger.current()!.steer(cmd("a correction"));
-    },
-  });
-
-  await runTurn(h.ctx, cmd("first"));
-
-  const complete = h.ctx.eventBuffer.find((e) => e.type === "turn_complete");
-  assert.ok(complete, "the Turn still reports its own outcome");
-  assert.equal(complete.no_notify, true, "a buzz for a Turn the human cut short would be a lie");
-  const status = h.ctx.eventBuffer.filter((e) => e.type === "status").map((e) => e.text);
-  assert.ok(status.includes("steered"), "neutral wording, not 'interrupted'");
-});
-
-test("a confirmed Steer is promoted and both Turns settle", async () => {
-  // Two inits and two results in one query -- the shape a real Steer produces.
-  const steer = cmd("a correction");
-  let h: TurnHarness;
-  h = makeTurnHarness(
-    [init(), assistantText("working"), result(), init("sdk-2"), assistantText("corrected"), result()],
-    {
-      onYield: async (message) => {
-        if (message.type === "result" && !h.ledger.current()?.pendingSteerSeq) {
-          await h.ledger.current()!.steer(steer);
-        }
-      },
-    },
+  assert.notEqual(
+    outcome,
+    TIMED_OUT,
+    "the Turn's own result already landed; a still-running Background task must not hold the main loop hostage",
   );
+  assert.equal(h.ledger.snapshot(), undefined);
+  await h.close();
+});
 
-  await runTurn(h.ctx, cmd("first"));
+test("a Command sent while a Background task is still running starts once the previous Turn has ended", async () => {
+  const neverSettles = new Promise<void>(() => undefined);
+  const h = await makeTurnHarness({
+    handlerFor: (_cause, text) =>
+      text === "start a dev server"
+        ? startBackgroundTaskAndFinish("dev-server", neverSettles, { description: "npm run dev" })
+        : sayAndFinish("the second Command ran"),
+  });
+
+  await runTurn(h.ctx, cmd("start a dev server"));
+  const second = await raceWithTimeout(runTurn(h.ctx, cmd("now something else")), 1000);
+
+  assert.notEqual(second, TIMED_OUT);
+  assert.ok(h.ctx.eventBuffer.some((e) => e.text === "the second Command ran"));
+  assert.deepEqual(h.ctx.runningTasks.map((t) => t.task_id), ["dev-server"], "the Background task is still running");
+  await h.close();
+});
+
+test("a Steer ends the running Turn, marked steered and silent, and its own Turn becomes the active Command", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: (cause, text) => (cause === "steer" ? sayAndFinish(`steered: ${text}`) : workUntilInterrupted),
+  });
+  const steer = cmd("a correction");
+  queueForSteerPoll(h, [steer]);
+
+  const { turn } = await startTurn(h, cmd("first"));
+  await checkForSteer(h.ctx);
+  await turn;
+
+  assert.equal(h.ledger.snapshot(), undefined, "both Commands settled");
+  // Never flickers false between the truncated Turn and the steered one: the
+  // Steer was already held when the first Turn settled.
+  assert.deepEqual(h.relay.reports, [true, false]);
+  const [truncated, steered] = completes(h);
+  assert.equal(truncated.no_notify, true, "a buzz for a Turn the human cut short would be a lie");
+  assert.notEqual(steered.no_notify, true, "the steered Turn's own outcome still buzzes");
+  assert.ok(statuses(h).includes("steered"), "neutral wording, not 'interrupted'");
+  assert.ok(h.ctx.eventBuffer.some((e) => e.text === "steered: a correction"));
+  await h.close();
+});
+
+test("a steered Turn can be Steered again", async () => {
+  let steerTurns = 0;
+  const h = await makeTurnHarness({
+    handlerFor: (cause) => {
+      if (cause !== "steer") return workUntilInterrupted;
+      steerTurns += 1;
+      return steerTurns === 1 ? workUntilInterrupted : sayAndFinish("done");
+    },
+  });
+
+  const { turn } = await startTurn(h, cmd("first"));
+  queueForSteerPoll(h, [cmd("first correction")]);
+  await checkForSteer(h.ctx);
+  await until(() => h.ctx.currentTurn?.running === true && h.ctx.currentTurn.steeredThisSubTurn === false);
+  queueForSteerPoll(h, [cmd("second correction")]);
+  await checkForSteer(h.ctx);
+  await turn;
+
+  assert.equal(completes(h).length, 3);
+  assert.equal(h.ledger.snapshot(), undefined);
+  assert.deepEqual(h.relay.reports, [true, false]);
+  await h.close();
+});
+
+test("only one Steer per Turn: the rest of the poll is handed back to run afterwards, in order", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: (cause) => (cause === "steer" ? sayAndFinish("steered") : workUntilInterrupted),
+  });
+  const steer = cmd("steer A");
+  const later = cmd("later B");
+  queueForSteerPoll(h, [steer, later]);
+
+  const { turn } = await startTurn(h, cmd("first"));
+  await checkForSteer(h.ctx);
+  await turn;
+
+  assert.deepEqual(h.ctx.handBackBuffer, [later]);
+  assert.deepEqual(h.ledger.snapshot(), [{ seq: later.seq, text: later.text, status: "queued" }]);
+  await h.close();
+});
+
+test("a Steer the Engine refuses, because its Turn had just ended, runs next instead of being dropped", async () => {
+  const h = await makeTurnHarness({ handlerFor: () => workUntilInterrupted });
+  const late = cmd("arrived just as the Turn ended");
+  queueForSteerPoll(h, [late]);
+  const { turn } = await startTurn(h, cmd("first"));
+  const refusing = h.ctx.engineSession;
+  (h.ctx as { engineSession: typeof refusing }).engineSession = {
+    ...refusing,
+    events: refusing.events,
+    send: (text) => refusing.send(text),
+    stop: () => refusing.stop(),
+    killTask: (id) => refusing.killTask(id),
+    close: () => refusing.close(),
+    steer: () => {
+      throw new Error("no running Turn to Steer");
+    },
+  };
+
+  await checkForSteer(h.ctx);
+  h.ctx.currentTurn!.abortController.abort();
+  await turn;
+
+  assert.deepEqual(h.ctx.handBackBuffer, [late]);
+  assert.deepEqual(h.ledger.snapshot(), [{ seq: late.seq, text: late.text, status: "queued" }]);
+  assert.ok(!types(h).includes("command_discarded"), "nothing the human typed is dropped");
+  await h.close();
+});
+
+test("a Stop mid-Turn ends it, says so, and releases the claim", async () => {
+  const h = await makeTurnHarness({ handlerFor: () => hangUntilStopped() });
+
+  const { turn } = await startTurn(h, cmd("keep going"));
+  h.ctx.currentTurn!.abortController.abort();
+  await turn;
 
   assert.equal(h.ledger.snapshot(), undefined);
-  // Never flickers false between the truncated Turn and the steered one: the
-  // Steer was already held when the first result settled.
   assert.deepEqual(h.relay.reports, [true, false]);
-  assert.equal(h.ctx.sdkSessionId, "sdk-2", "the fresh init's session id was adopted");
-  assert.equal(h.ctx.eventBuffer.filter((e) => e.type === "turn_complete").length, 2);
+  assert.ok(statuses(h).includes("turn stopped"));
+  assert.equal(completes(h).length, 1, "the composer comes back");
+  assert.equal(h.ctx.state.lastRealTurnCompletedAt, undefined, "a stopped Turn gave the human no answer to idle after");
+  await h.close();
 });
 
-test("a Steer confirmed before the truncated sub-turn's result still releases it", async () => {
-  // The interrupt ordering: the fresh `init` opens the Steer's sub-turn
-  // before -- and instead of -- any `result` for the sub-turn it cut off, so
-  // settleActive() never runs for the original Command. Once the Steer
-  // becomes active nothing else names it, and it stays held for the life of
-  // the process with the phone's brake and Thinking indicator stuck on.
-  const steer = cmd("a correction");
-  let steered = false;
-  let h: TurnHarness;
-  h = makeTurnHarness(
-    [init(), assistantText("working"), init("sdk-2"), assistantText("corrected"), result()],
-    {
-      // Claimed while the first sub-turn is still working, so the `init`
-      // below is the first thing the connector hears after it -- there is no
-      // `result` for the sub-turn the Steer truncated.
-      onYield: async (message) => {
-        if (message.type === "assistant" && !steered) {
-          steered = true;
-          await h.ledger.current()!.steer(steer);
-        }
-      },
+test("a Stop before the Turn starts settles the claim and still completes the Turn", async () => {
+  let started = false;
+  const h = await makeTurnHarness({
+    handlerFor: () => {
+      started = true;
+      return sayAndFinish("should not run");
     },
-  );
-
-  await runTurn(h.ctx, cmd("first"));
-
-  assert.equal(h.ledger.snapshot(), undefined, "neither Command is left held");
-  // Still no flicker mid-Turn: the Steer was promoted before the Command it
-  // superseded was released.
-  assert.deepEqual(h.relay.reports, [true, false]);
-  assert.equal(h.ctx.sdkSessionId, "sdk-2");
-});
-
-test("the drain loop stops once the abort signal fires, even if the SDK generator keeps yielding after it", async () => {
-  // Observed in production: a Stop mid-turn can leave the SDK's generator
-  // yielding further messages against an already-torn-down transport (each
-  // one failing getContextUsage with "Query closed"/"ProcessTransport is not
-  // ready for writing") instead of ending cleanly. Nothing inside the drain
-  // loop checked the signal, so it kept consuming those messages forever --
-  // duringTurn's claim-settling finally block was never reached, leaving
-  // in_flight stuck true and the phone's composer stuck on Stop.
-  const h = makeTurnHarness(
-    [init(), assistantText("before"), result(), assistantText("should not appear"), result("error_during_execution")],
-    {
-      onYield: async (message) => {
-        if (message.type === "result") h.ctx.currentTurn?.abortController.abort();
-      },
-    },
-  );
-
-  await runTurn(h.ctx, cmd("first"));
-
-  assert.equal(h.ledger.snapshot(), undefined, "the claim must not be left held");
-  const texts = h.ctx.eventBuffer.filter((e) => e.type === "assistant_text").map((e) => e.text);
-  assert.ok(!texts.includes("should not appear"), "nothing yielded after the abort fired should be processed");
-});
-
-test("a Stop before the query starts settles the claim and still completes the Turn", async () => {
-  const h = makeTurnHarness([init(), result()]);
+  });
   // interrupt_at newer than the Command is what checkInterrupt acts on.
   h.relay.getSession = async () => ({ interrupt_at: new Date(Date.now() + 60_000).toISOString() });
 
   await runTurn(h.ctx, cmd("too late"));
 
+  assert.equal(started, false, "the Command never reached the Engine");
   assert.equal(h.ledger.snapshot(), undefined, "the claim is not left behind");
   assert.equal(h.relay.lastReport, false);
-  const status = h.ctx.eventBuffer.filter((e) => e.type === "status").map((e) => e.text);
-  assert.ok(status.includes("turn stopped"));
-  assert.ok(
-    types(h).includes("turn_complete"),
-    "the composer comes back even though no result arrived",
-  );
+  assert.ok(statuses(h).includes("turn stopped"));
+  assert.ok(types(h).includes("turn_complete"), "the composer comes back even though nothing ran");
+  await h.close();
+});
+
+test("a Stop landing after a Steer is claimed but before its Turn starts discards it, and says so", async () => {
+  let steerTurnRan = false;
+  const h = await makeTurnHarness({
+    handlerFor: (cause) => {
+      if (cause === "steer") steerTurnRan = true;
+      return cause === "steer" ? sayAndFinish("steered") : workUntilInterrupted;
+    },
+    script: {
+      beforeSteerConfirm: async (ctx) => {
+        h.ctx.currentTurn!.abortController.abort();
+        await ctx.waitForStop();
+      },
+    },
+  });
+  queueForSteerPoll(h, [cmd("a steer landing right before Stop")]);
+
+  const { turn } = await startTurn(h, cmd("first"));
+  await checkForSteer(h.ctx);
+  await turn;
+
+  assert.equal(steerTurnRan, false, "the brake starting fresh work is not a brake");
+  const discarded = h.ctx.eventBuffer.find((e) => e.type === "command_discarded");
+  assert.equal(discarded?.text, "a steer landing right before Stop");
+  assert.equal(h.ledger.snapshot(), undefined);
+  assert.equal(h.relay.lastReport, false);
+  await h.close();
+});
+
+test("a Question is put in front of the phone, and its Answer continues the Turn", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: () =>
+      askAndFinish({
+        toolUseId: "toolu_q1",
+        questions: [{ question: "Which approach?", options: [{ label: "A" }, { label: "B" }], multiSelect: false }],
+      }),
+  });
+  h.relay.getSession = async () => ({ answer: { tool_use_id: "toolu_q1", answers: { "Which approach?": "A" } } });
+
+  await runTurn(h.ctx, cmd("ask me something"));
+
+  const question = h.ctx.eventBuffer.find((e) => e.type === "question");
+  assert.equal(question?.tool_use_id, "toolu_q1");
+  assert.deepEqual((question?.tool_input as { questions: unknown[] }).questions.length, 1);
+  assert.ok(h.ctx.eventBuffer.some((e) => e.text === 'answered: {"Which approach?":"A"}'));
+  assert.equal(h.ctx.questionPending, false);
+  await h.close();
+});
+
+test("no Steer is taken while a Question is pending", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: () => askAndFinish({ toolUseId: "toolu_q1", questions: [] }),
+  });
+  let polled = false;
+  h.relay.pollCommands = async () => {
+    polled = true;
+    return [cmd("sent during the Question")];
+  };
+
+  const turn = runTurn(h.ctx, cmd("ask me something"));
+  await until(() => h.ctx.questionPending);
+  await checkForSteer(h.ctx);
+
+  assert.equal(polled, false, "the cursor is left alone over a Command the stalled Turn cannot read");
+  h.ctx.currentTurn!.abortController.abort();
+  await turn;
+  await h.close();
+});
+
+test("a Stop tapped while a Question is pending ends the Turn cleanly", async () => {
+  const h = await makeTurnHarness({ handlerFor: () => askAndFinish({ toolUseId: "toolu_q1", questions: [] }) });
+
+  const turn = runTurn(h.ctx, cmd("ask me something"));
+  await until(() => h.ctx.questionPending);
+  h.ctx.currentTurn!.abortController.abort();
+  await turn;
+
+  assert.equal(h.ctx.questionPending, false);
+  assert.ok(statuses(h).includes("turn stopped"));
+  assert.equal(h.ctx.eventBuffer.some((e) => e.is_error), false, "a Stop is not a failure");
+  assert.equal(h.ledger.snapshot(), undefined);
+  await h.close();
 });
 
 test("a real Command's Turn completing records lastRealTurnCompletedAt", async () => {
-  const h = makeTurnHarness([init(), assistantText("hello"), result()]);
+  const h = await makeTurnHarness();
 
   await runTurn(h.ctx, cmd("say hello"));
 
   assert.ok(h.ctx.state.lastRealTurnCompletedAt, "Auto-compact's idle clock needs this to be set");
-});
-
-test("the idle clock is armed when the result lands, not when the query finally drains", async () => {
-  // Observed in production: the SDK generator can stay open long after the
-  // Turn produced its `result` -- a Background task still running, a
-  // subprocess slow to let go. Arming the clock only once the drain finished
-  // left Auto-compact's countdown unstarted for as long as that took, so an
-  // idle session never compacted at all.
-  // The trailing message is only reached after a long pause, so the `result`
-  // has already been delivered and handled: this stalls the drain, not the
-  // reply the human is waiting on.
-  const h = makeTurnHarness([init(), assistantText("hello"), result(), assistantText("tail")], {
-    onYield: async (m) => {
-      if (m.type === "assistant" && JSON.stringify(m).includes("tail")) {
-        await new Promise((r) => setTimeout(r, 3000));
-      }
-    },
-  });
-
-  const turn = runTurn(h.ctx, cmd("say hello"));
-  await new Promise((r) => setTimeout(r, 500));
-
-  assert.ok(
-    h.ctx.state.lastRealTurnCompletedAt,
-    "the idle stretch starts when the human got their answer",
-  );
-  await turn;
+  await h.close();
 });
 
 test("an Auto-compact Command's Turn does not move lastRealTurnCompletedAt, and skips the push", async () => {
-  const h = makeTurnHarness([init(), assistantText("compacted"), result()]);
+  const h = await makeTurnHarness({ handlerFor: () => sayAndFinish("compacted") });
 
   await runTurn(h.ctx, cmd("/compact", undefined, "auto"));
 
@@ -259,8 +362,8 @@ test("an Auto-compact Command's Turn does not move lastRealTurnCompletedAt, and 
     undefined,
     "an Auto-compact firing must not re-arm itself, or it would repeat forever",
   );
-  const complete = h.ctx.eventBuffer.find((e) => e.type === "turn_complete");
-  assert.equal(complete?.no_notify, true, "a routine idle compact is not worth a phone buzz");
+  assert.equal(completes(h)[0]?.no_notify, true, "a routine idle compact is not worth a phone buzz");
+  await h.close();
 });
 
 test("a real Command steered into a running Auto-compact still counts as real activity", async () => {
@@ -269,57 +372,42 @@ test("a real Command steered into a running Auto-compact still counts as real ac
   // confirming one is exactly the "a human showed up" signal that should
   // re-arm Auto-compact's idle clock, even though the Turn it steered *into*
   // was itself the Auto-compact.
-  const steer = cmd("a real message");
-  let steered = false;
-  let h: TurnHarness;
-  h = makeTurnHarness(
-    [init(), assistantText("compacted"), result(), init("sdk-2"), assistantText("hi"), result()],
-    {
-      onYield: async (message) => {
-        if (message.type === "result" && !steered) {
-          steered = true;
-          await h.ledger.current()!.steer(steer);
-        }
-      },
-    },
-  );
+  const h = await makeTurnHarness({
+    handlerFor: (cause) => (cause === "steer" ? sayAndFinish("hi") : workUntilInterrupted),
+  });
+  queueForSteerPoll(h, [cmd("a real message")]);
 
-  await runTurn(h.ctx, cmd("/compact", undefined, "auto"));
+  const { turn } = await startTurn(h, cmd("/compact", undefined, "auto"));
+  await checkForSteer(h.ctx);
+  await turn;
 
   assert.ok(h.ctx.state.lastRealTurnCompletedAt, "the steered-in real Command should re-arm the idle clock");
-  const completes = h.ctx.eventBuffer.filter((e) => e.type === "turn_complete");
-  assert.equal(completes.length, 2);
-  assert.equal(completes[0].no_notify, true, "Auto-compact's own sub-turn stays silent");
-  assert.notEqual(
-    completes[1].no_notify,
-    true,
-    "the human's own steered-in reply must still buzz -- it is not the routine idle compact",
-  );
+  const [compact, reply] = completes(h);
+  assert.equal(compact.no_notify, true, "Auto-compact's own Turn stays silent");
+  assert.notEqual(reply.no_notify, true, "the human's own steered-in reply must still buzz");
+  await h.close();
 });
 
 test("a Context-window warning fires once when the percentage crosses the default threshold", async () => {
-  const h = makeTurnHarness([init(), assistantText("hello"), result()], {
-    contextPercentages: [75],
-  });
+  const h = await makeTurnHarness({ handlerFor: () => sayAndReport("hello", { contextPercentage: 75 }) });
 
   await runTurn(h.ctx, cmd("say hello"));
 
-  const complete = h.ctx.eventBuffer.find((e) => e.type === "turn_complete");
-  assert.equal(complete?.context_percentage, 75);
-  assert.equal(complete?.context_warning, true);
+  const [complete] = completes(h);
+  assert.equal(complete.context_percentage, 75);
+  assert.equal(complete.context_warning, true);
   assert.equal(h.ctx.contextWarningActive, true);
+  await h.close();
 });
 
-test("a Context-window warning stays below the default threshold silent", async () => {
-  const h = makeTurnHarness([init(), assistantText("hello"), result()], {
-    contextPercentages: [50],
-  });
+test("a Context-window reading below the default threshold stays silent", async () => {
+  const h = await makeTurnHarness({ handlerFor: () => sayAndReport("hello", { contextPercentage: 50 }) });
 
   await runTurn(h.ctx, cmd("say hello"));
 
-  const complete = h.ctx.eventBuffer.find((e) => e.type === "turn_complete");
-  assert.equal(complete?.context_warning, undefined);
+  assert.equal(completes(h)[0].context_warning, undefined);
   assert.equal(h.ctx.contextWarningActive, false);
+  await h.close();
 });
 
 test("contextWarningCrossing fires only on the Turn that first reaches the threshold", () => {
@@ -340,117 +428,122 @@ test("contextWarningCrossing re-arms once the percentage drops back below thresh
 });
 
 test("a configured Context-window warning threshold overrides the default", async () => {
-  const h = makeTurnHarness([init(), assistantText("hello"), result()], {
-    contextPercentages: [60],
+  const h = await makeTurnHarness({
+    handlerFor: () => sayAndReport("hello", { contextPercentage: 60 }),
     config: { contextWarningThresholdPercent: 55 },
   });
 
   await runTurn(h.ctx, cmd("say hello"));
 
-  const complete = h.ctx.eventBuffer.find((e) => e.type === "turn_complete");
-  assert.equal(complete?.context_warning, true, "60% crosses the configured 55% threshold");
+  assert.equal(completes(h)[0].context_warning, true, "60% crosses the configured 55% threshold");
+  await h.close();
 });
 
-test("a Context-window overflow fires when the SDK's PreCompact hook reports an auto trigger, independently of the warning tier", async () => {
-  let capturedOptions: Options | undefined;
-  const h = makeTurnHarness([init(), assistantText("working"), compactBoundary(), result()], {
-    contextPercentages: [80],
-    onOptions: (options) => {
-      capturedOptions = options;
-    },
-    onYield: async (message) => {
-      if (message.type === "system" && (message as { subtype?: string }).subtype === "compact_boundary") {
-        const hookInput = { hook_event_name: "PreCompact", trigger: "auto" } as unknown as HookInput;
-        await capturedOptions?.hooks?.PreCompact?.[0]?.hooks[0]?.(hookInput, undefined, {
-          signal: new AbortController().signal,
-        });
-      }
+test("a Context-window overflow fires when the Engine compacts on its own, independently of the warning tier", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: () => async (ctx) => {
+      ctx.emit({ type: "compacting", trigger: "auto" });
+      ctx.emit({ type: "compacted", preTokens: 1000, postTokens: 200, contextPercentage: 80 });
+      return { outcome: "success" };
     },
   });
 
   await runTurn(h.ctx, cmd("first"));
 
   const overflow = h.ctx.eventBuffer.find((e) => e.context_overflow === true);
-  assert.ok(overflow, "an unplanned compaction produces a context_overflow status event");
-  assert.equal(overflow?.type, "status");
-  const withWarning = h.ctx.eventBuffer.find((e) => e.context_warning === true);
-  assert.ok(withWarning, "the same reading still independently crosses the warning threshold");
-  assert.equal(
-    h.ctx.contextWarningActive,
-    true,
-    "overflow firing must not suppress the independently-computed warning tier",
-  );
+  assert.equal(overflow?.type, "status", "an unplanned compaction produces a context_overflow status event");
+  const compacted = h.ctx.eventBuffer.find((e) => e.text === "compacted (1000 → 200 tokens)");
+  assert.equal(compacted?.context_percentage, 80, "the compaction carries the reading taken after it");
+  assert.equal(compacted?.context_warning, true, "the same reading still independently crosses the warning threshold");
+  await h.close();
 });
 
-test("a Context-window overflow does not fire for a manual PreCompact trigger", async () => {
-  let capturedOptions: Options | undefined;
-  const h = makeTurnHarness([init(), assistantText("working"), compactBoundary(), result()], {
-    onOptions: (options) => {
-      capturedOptions = options;
-    },
-    onYield: async (message) => {
-      if (message.type === "system" && (message as { subtype?: string }).subtype === "compact_boundary") {
-        const hookInput = { hook_event_name: "PreCompact", trigger: "manual" } as unknown as HookInput;
-        await capturedOptions?.hooks?.PreCompact?.[0]?.hooks[0]?.(hookInput, undefined, {
-          signal: new AbortController().signal,
-        });
-      }
+test("a Context-window overflow does not fire for a manual compaction", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: () => async (ctx) => {
+      ctx.emit({ type: "compacting", trigger: "manual" });
+      return { outcome: "success" };
     },
   });
 
   await runTurn(h.ctx, cmd("/compact"));
 
-  const overflow = h.ctx.eventBuffer.find((e) => e.context_overflow === true);
-  assert.equal(overflow, undefined, "a connector- or human-issued /compact is not an overflow");
+  assert.equal(h.ctx.eventBuffer.find((e) => e.context_overflow === true), undefined);
+  await h.close();
 });
 
-test("a subprocess that dies mid-Turn leaves nothing held and says why", async () => {
-  const h = makeTurnHarness([init(), assistantText("working"), result()], {
-    throwAfter: { count: 2, error: new Error("subprocess exited") },
-  });
+test("a failed Turn leaves nothing held and says why", async () => {
+  const h = await makeTurnHarness({ handlerFor: () => async () => ({ outcome: "error", errors: ["subprocess exited"] }) });
 
   await runTurn(h.ctx, cmd("first"));
 
   assert.equal(h.ledger.snapshot(), undefined);
   assert.equal(h.relay.lastReport, false);
   const errors = h.ctx.eventBuffer.filter((e) => e.is_error).map((e) => e.text);
-  assert.ok(errors.some((t) => /subprocess exited/.test(t!)));
+  assert.deepEqual(errors, ["subprocess exited"]);
+  await h.close();
 });
 
-test("an [ede_diagnostic]-tagged throw is logged, not banner'd -- it's the SDK's own internal marker, not a real failure", async () => {
-  const h = makeTurnHarness([init(), assistantText("working"), result()], {
-    throwAfter: {
-      count: 2,
-      error: new Error("[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"),
-    },
+test("a successful Turn posts a usage event with its cost and token counts", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: () =>
+      sayAndReport("hello", {
+        usage: { inputTokens: 1000, outputTokens: 200, cacheWriteTokens: 30, cacheReadTokens: 15, costUsd: 0.042 },
+      }),
   });
 
-  await runTurn(h.ctx, cmd("first"));
+  await runTurn(h.ctx, cmd("say hello"));
 
-  assert.equal(h.ctx.eventBuffer.some((e) => e.is_error), false);
+  const usage = h.ctx.eventBuffer.filter((e) => e.type === "usage");
+  assert.deepEqual(usage, [
+    {
+      type: "usage",
+      cost_usd: 0.042,
+      input_tokens: 1000,
+      output_tokens: 200,
+      cache_creation_input_tokens: 30,
+      cache_read_input_tokens: 15,
+      repo: undefined,
+    },
+  ]);
+  assert.equal(completes(h)[0].cost_usd, 0.042);
+  await h.close();
 });
 
-test("context usage is stamped on the turn_complete and on a compaction", async () => {
-  const h = makeTurnHarness([init(), compactBoundary(), result()]);
+test("Usage with no dollar cost posts its tokens and leaves the cost out", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: () =>
+      sayAndReport("hello", { usage: { inputTokens: 10, outputTokens: 2, cacheWriteTokens: 0, cacheReadTokens: 0 } }),
+  });
 
-  await runTurn(h.ctx, cmd("/compact"));
+  await runTurn(h.ctx, cmd("say hello"));
 
-  const stamped = h.ctx.eventBuffer.filter((e) => e.context_percentage !== undefined);
-  assert.ok(stamped.length >= 1);
-  assert.ok(stamped.every((e) => e.context_percentage === 42));
+  const usage = h.ctx.eventBuffer.find((e) => e.type === "usage");
+  assert.ok(usage && !("cost_usd" in usage), "no dollar figure is made up");
+  assert.ok(!("cost_usd" in completes(h)[0]));
+  await h.close();
 });
 
-test("the SDK session id is persisted so the next Turn resumes the conversation", async () => {
-  const h = makeTurnHarness([init("sdk-abc"), result()]);
+test("an errored Turn still posts a usage event -- usage isn't lost just because the Turn failed", async () => {
+  const h = await makeTurnHarness({
+    handlerFor: () => async () => ({
+      outcome: "error",
+      errors: ["failed"],
+      usage: { inputTokens: 500, outputTokens: 1, cacheWriteTokens: 0, cacheReadTokens: 0, costUsd: 0.01 },
+    }),
+  });
 
-  await runTurn(h.ctx, cmd("first"));
+  await runTurn(h.ctx, cmd("do something risky"));
 
-  assert.equal(h.ctx.sdkSessionId, "sdk-abc");
-  assert.ok(h.written.some((s) => s.sdkSessionId === "sdk-abc"));
+  const usage = h.ctx.eventBuffer.filter((e) => e.type === "usage");
+  assert.equal(usage.length, 1);
+  assert.equal(usage[0].cost_usd, 0.01);
+  assert.equal(usage[0].input_tokens, 500);
+  await h.close();
 });
 
 test("a Turn claimed from the hand-back buffer is promoted, not re-claimed", async () => {
-  const h = makeTurnHarness([init(), result()]);
+  const h = await makeTurnHarness();
   const queued = cmd("queued work");
   await h.ledger.hold(queued, "queued");
 
@@ -459,13 +552,13 @@ test("a Turn claimed from the hand-back buffer is promoted, not re-claimed", asy
   assert.equal(h.ledger.snapshot(), undefined);
   assert.equal(h.ledger.cursor, queued.seq, "the cursor did not advance twice");
   assert.deepEqual(h.relay.reports, [true, false]);
+  await h.close();
 });
 
 /** A repository the Turn below can commit into, so the report is measured from real history. */
 function makeRepo(origin?: string): string {
   const dir = mkdtempSync(join(tmpdir(), "crc-turn-repo-"));
-  const run = (...args: string[]) =>
-    execFileSync("git", args, { cwd: dir, encoding: "utf-8" });
+  const run = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf-8" });
   run("init", "-q", "-b", "main");
   run("config", "user.email", "test@example.invalid");
   run("config", "user.name", "Test");
@@ -476,111 +569,35 @@ function makeRepo(origin?: string): string {
   return dir;
 }
 
+const USAGE: EngineUsage = { inputTokens: 1, outputTokens: 1, cacheWriteTokens: 0, cacheReadTokens: 0, costUsd: 0.001 };
+
 test("a Turn that committed reports it once, attributed to the repo", async () => {
   const dir = makeRepo("git@github.com:acme/widgets.git");
-  const h = makeTurnHarness([init(), assistantText("committing"), result()], {
+  const h = await makeTurnHarness({
     projectDir: dir,
-    onYield: async (message) => {
-      if (message.type !== "result") return;
+    handlerFor: () => async (ctx) => {
       writeFileSync(join(dir, "feature.ts"), "one\ntwo\n");
       execFileSync("git", ["add", "-A"], { cwd: dir });
       execFileSync("git", ["commit", "-q", "-m", "feature"], { cwd: dir });
+      ctx.emit({ type: "assistant_text", text: "committed" });
+      return { outcome: "success" };
     },
   });
 
   await runTurn(h.ctx, cmd("build the feature"));
 
-  assert.deepEqual(h.relay.contributions, [
-    { host: "github.com", repo: "acme/widgets", added: 2, deleted: 0 },
-  ]);
+  assert.deepEqual(h.relay.contributions, [{ host: "github.com", repo: "acme/widgets", added: 2, deleted: 0 }]);
+  await h.close();
 });
 
-test("a Turn that committed nothing reports nothing", async () => {
-  const h = makeTurnHarness([init(), assistantText("just talking"), result()], {
-    projectDir: makeRepo(),
-  });
-
-  await runTurn(h.ctx, cmd("what does this do?"));
-
-  assert.deepEqual(h.relay.contributions, []);
-});
-
-test("a successful Turn posts a usage event with its cost and token counts", async () => {
-  const h = makeTurnHarness([
-    init(),
-    assistantText("hello"),
-    result("success", {
-      total_cost_usd: 0.042,
-      input_tokens: 1000,
-      output_tokens: 200,
-      cache_creation_input_tokens: 30,
-      cache_read_input_tokens: 15,
-    }),
-  ]);
-
-  await runTurn(h.ctx, cmd("say hello"));
-
-  const usage = h.ctx.eventBuffer.filter((e) => e.type === "usage");
-  assert.equal(usage.length, 1);
-  assert.deepEqual(usage[0], {
-    type: "usage",
-    cost_usd: 0.042,
-    input_tokens: 1000,
-    output_tokens: 200,
-    cache_creation_input_tokens: 30,
-    cache_read_input_tokens: 15,
-    repo: undefined,
-  });
-});
-
-test("an errored Turn still posts a usage event -- usage isn't lost just because the Turn failed", async () => {
-  const h = makeTurnHarness([
-    init(),
-    assistantText("working"),
-    result("error_during_execution", { total_cost_usd: 0.01, input_tokens: 500 }),
-  ]);
-
-  await runTurn(h.ctx, cmd("do something risky"));
-
-  const usage = h.ctx.eventBuffer.filter((e) => e.type === "usage");
-  assert.equal(usage.length, 1);
-  assert.equal(usage[0].cost_usd, 0.01);
-  assert.equal(usage[0].input_tokens, 500);
-});
-
-test("a Turn that committed nothing still posts usage, attributed to the repo", async () => {
+test("a Turn that committed nothing reports nothing, but still posts usage attributed to the repo", async () => {
   const dir = makeRepo("git@github.com:acme/widgets.git");
-  const h = makeTurnHarness([init(), assistantText("just talking"), result()], {
-    projectDir: dir,
-  });
+  const h = await makeTurnHarness({ projectDir: dir, handlerFor: () => sayAndReport("just talking", { usage: USAGE }) });
 
   await runTurn(h.ctx, cmd("what does this do?"));
 
   assert.deepEqual(h.relay.contributions, [], "nothing was committed");
   const usage = h.ctx.eventBuffer.find((e) => e.type === "usage");
-  assert.ok(usage, "usage is reported regardless of whether anything was committed");
-  assert.equal(usage!.repo, "github.com#acme/widgets", "same attribution Contributions uses");
-});
-
-test("a Steer produces a usage event per sub-turn, each carrying the same repo attribution", async () => {
-  const dir = makeRepo("git@github.com:acme/widgets.git");
-  const steer = cmd("a correction");
-  let h: TurnHarness;
-  h = makeTurnHarness(
-    [init(), assistantText("working"), result(), init("sdk-2"), assistantText("corrected"), result()],
-    {
-      projectDir: dir,
-      onYield: async (message) => {
-        if (message.type === "result" && !h.ledger.current()?.pendingSteerSeq) {
-          await h.ledger.current()!.steer(steer);
-        }
-      },
-    },
-  );
-
-  await runTurn(h.ctx, cmd("first"));
-
-  const usage = h.ctx.eventBuffer.filter((e) => e.type === "usage");
-  assert.equal(usage.length, 2);
-  assert.ok(usage.every((e) => e.repo === "github.com#acme/widgets"));
+  assert.equal(usage?.repo, "github.com#acme/widgets", "same attribution Contributions uses");
+  await h.close();
 });

@@ -36,6 +36,13 @@ export interface FakeTurnContext {
   readonly stopped: boolean;
   /** Resolves the moment `stop()` is called for this Turn. Already-resolved if it already has been. */
   waitForStop(): Promise<void>;
+  /**
+   * Resolves the moment this Turn is cut short, by a Steer or by `stop()`,
+   * without taking the Steer itself (the session does that). What a
+   * steerable handler races its pauses against, so it stops producing
+   * events for a Turn that has already ended.
+   */
+  waitForInterruption(): Promise<void>;
 }
 
 export interface FakeTurnOutcome {
@@ -62,11 +69,18 @@ export interface FakeEngineScript {
   menu?: { skills: SkillInfo[]; localCommands: SkillInfo[] };
   /** Chosen once per Turn, by its cause and (for a Command or a Steer) its text. */
   handlerFor(cause: "command" | "steer" | "engine", text: string | undefined): FakeTurnHandler;
+  /**
+   * Runs inside the Turn a Steer is truncating, after the Steer lands and
+   * before that Turn ends -- widening the window between the Engine taking a
+   * Steer and confirming it with the Steer's own `turn_started`, so a test
+   * can land a Stop inside it. A Stop there cancels the Steer's Turn.
+   */
+  beforeSteerConfirm?: (ctx: FakeTurnContext, steeredText: string) => Promise<void>;
   /** What `forkConversation` resolves to. Defaults to echoing the same id back (a successful carry). */
   forkConversation?: Engine["forkConversation"];
 }
 
-type QueueEntry = { kind: "command"; text: string } | { kind: "engine" };
+type QueueEntry = { kind: "command"; text: string; stopped?: boolean } | { kind: "engine" };
 
 /**
  * A live FakeEngine session, with the ordinary {@link EngineSession} surface
@@ -85,9 +99,13 @@ export interface FakeEngineSession extends EngineSession {
  * exposing those methods to the handler.
  */
 class TurnController implements FakeTurnContext {
-  private readonly steerQueue = new AsyncQueue<string>();
+  /** The Steer this Turn took, if any -- at most one: the Steer's own Turn replaces this one. */
+  steeredText: string | undefined;
+  private readonly steerWaiters: ((text: string) => void)[] = [];
   stopped = false;
   private readonly stopWaiters: (() => void)[] = [];
+  private readonly interruptionWaiters: (() => void)[] = [];
+  private interrupted = false;
 
   constructor(
     readonly cause: "command" | "steer" | "engine",
@@ -103,13 +121,12 @@ class TurnController implements FakeTurnContext {
     return this.session.askQuestion(question, this);
   }
 
-  async waitForSteer(): Promise<string> {
-    const { value, done } = await this.steerQueue[Symbol.asyncIterator]().next();
-    // The Turn ended (or was stopped) without ever being Steered -- hang
-    // rather than reject, since nothing is left that will ever consume this:
-    // runTurn() has already moved on by the time this could settle.
-    if (done) return new Promise<string>(() => undefined);
-    return value;
+  waitForSteer(): Promise<string> {
+    // A Turn that ends (or is stopped) without ever being Steered leaves this
+    // hanging rather than rejecting, since nothing is left that will ever
+    // consume it: runTurn() has already moved on by the time it could settle.
+    if (this.steeredText !== undefined) return Promise.resolve(this.steeredText);
+    return new Promise((resolve) => this.steerWaiters.push(resolve));
   }
 
   waitForStop(): Promise<void> {
@@ -117,17 +134,30 @@ class TurnController implements FakeTurnContext {
     return new Promise((resolve) => this.stopWaiters.push(resolve));
   }
 
-  /** A Steer landed for this Turn -- pushed onto the queue `waitForSteer()` reads. */
+  waitForInterruption(): Promise<void> {
+    if (this.interrupted) return Promise.resolve();
+    return new Promise((resolve) => this.interruptionWaiters.push(resolve));
+  }
+
+  /** A Steer landed for this Turn. Throws if it already took one: the Steer's own Turn is about to replace it. */
   receiveSteer(text: string): void {
-    this.steerQueue.push(text);
+    if (this.steeredText !== undefined) throw new Error("this Turn has already been Steered");
+    this.steeredText = text;
+    for (const resolve of this.steerWaiters.splice(0)) resolve(text);
+    this.markInterrupted();
+  }
+
+  private markInterrupted(): void {
+    this.interrupted = true;
+    for (const resolve of this.interruptionWaiters.splice(0)) resolve();
   }
 
   /** Called by the session when `stop()` targets this Turn. Idempotent. */
   markStopped(): void {
     if (this.stopped) return;
     this.stopped = true;
-    this.steerQueue.close();
     for (const resolve of this.stopWaiters.splice(0)) resolve();
+    this.markInterrupted();
   }
 }
 
@@ -192,6 +222,14 @@ class FakeEngineSessionImpl implements FakeEngineSession {
   stop(): void {
     this.currentTurn?.markStopped();
     this.pendingQuestion?.abortController.abort();
+    // A Stop ends queued Commands too, each reported as a Turn that started
+    // and was stopped, so whoever sent one hears how it ended. A queued
+    // Engine-started Turn nobody asked for is simply dropped.
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      const entry = this.queue[i];
+      if (entry.kind === "command") entry.stopped = true;
+      else this.queue.splice(i, 1);
+    }
   }
 
   async killTask(): Promise<void> {
@@ -272,6 +310,10 @@ class FakeEngineSessionImpl implements FakeEngineSession {
     const cause = entry.kind === "command" ? "command" : "engine";
     const text = entry.kind === "command" ? entry.text : undefined;
     this.pushEvent({ type: "turn_started", cause });
+    if (entry.kind === "command" && entry.stopped) {
+      this.pushEvent({ type: "turn_ended", outcome: "stopped", durationMs: 0 });
+      return;
+    }
     const startedAt = Date.now();
     let turn = new TurnController(cause, text, this);
     this.currentTurn = turn;
@@ -285,13 +327,27 @@ class FakeEngineSessionImpl implements FakeEngineSession {
           handler(turn).then((result) => ({ kind: "finished" as const, result })),
           turn.waitForSteer().then((text_) => ({ kind: "steered" as const, text: text_ })),
         ]);
-        if (raced.kind === "steered") steeredText = raced.text;
-        else finalOutcome = raced.result ?? {};
+        if (raced.kind === "finished") finalOutcome = raced.result ?? {};
       } catch (e) {
-        finalOutcome = { outcome: "error", errors: [(e as Error).message] };
+        // A handler whose Question (or anything else) was cut off by a Stop
+        // rejects -- that is the Stop landing, not a failure.
+        finalOutcome = turn.stopped ? { outcome: "stopped" } : { outcome: "error", errors: [(e as Error).message] };
       }
+      // Read off the Turn rather than the race: a handler watching
+      // waitForInterruption() can finish in the same tick the Steer lands,
+      // and win the race, without the Steer being any less delivered. A Stop
+      // outranks a Steer, which it discards.
+      if (!turn.stopped) steeredText = turn.steeredText;
 
       if (steeredText === undefined) break;
+
+      if (this.script.beforeSteerConfirm) {
+        await this.script.beforeSteerConfirm(turn, steeredText);
+        if (turn.stopped) {
+          finalOutcome = { outcome: "stopped" };
+          break;
+        }
+      }
 
       // A delivered Steer: this sub-turn ends, and the Steer's own Turn
       // begins in its place -- turn_ended then turn_started { cause: "steer"
