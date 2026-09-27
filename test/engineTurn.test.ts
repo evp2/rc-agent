@@ -7,17 +7,8 @@ import { ClaudeEngine } from "../src/engine/claude/adapter.ts";
 import { sayAndFinish, startBackgroundTaskAndFinish, type FakeTurnHandler } from "../src/engine/fakeEngine.ts";
 import { maybeSubmitAutoCompact } from "../src/session/loop.ts";
 import { runTurn } from "../src/session/turn.ts";
-import {
-  assistantText,
-  cmd,
-  init,
-  makeTurnHarness,
-  result,
-  scriptedQuery,
-  taskStarted,
-  until,
-  type TurnHarness,
-} from "./doubles.ts";
+import { assistantText, init, result, scriptedQuery, taskStarted } from "./claudeDoubles.ts";
+import { cmd, makeTurnHarness, until, type TurnHarness } from "./doubles.ts";
 
 const completes = (h: TurnHarness) => h.ctx.eventBuffer.filter((e) => e.type === "turn_complete");
 const indexOfText = (h: TurnHarness, text: string) => h.ctx.eventBuffer.findIndex((e) => e.text === text);
