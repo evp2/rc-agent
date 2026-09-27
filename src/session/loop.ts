@@ -164,7 +164,7 @@ async function acquireSession(config: ConnectorConfig, engine: EngineKind): Prom
     {
       permissionMode: PERMISSION_MODE,
       providerType: config.provider.type,
-      providerModel: config.provider.type === "bedrock" ? config.provider.model : undefined,
+      providerModel: config.provider.type === "anthropic" ? undefined : config.provider.model,
       providerRegion: config.provider.type === "bedrock" ? config.provider.region : undefined,
       projectDir: config.projectDir,
     },
@@ -183,6 +183,9 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   // agent process.
   const forkedConversation = takeForkedConversation();
   const engine = selectEngine(config);
+  // Before a relay session exists: an Engine that can never run should fail
+  // here, with its own message, rather than after a phone has paired.
+  await engine.verify();
   const { client, phoneUrl, staticUrl, controlUrl, resumed } = await acquireSession(config, engine.kind);
   // A state file's Conversation wins; failing that, the one a Fork carried
   // into this brand-new worktree.

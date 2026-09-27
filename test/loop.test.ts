@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { isAutoCompactDue, maybeSubmitAutoCompact } from "../src/session/loop.ts";
+import { createServer } from "node:http";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { isAutoCompactDue, maybeSubmitAutoCompact, runConnector } from "../src/session/loop.ts";
 import { SessionEndedError } from "../src/relay/client.ts";
 import { makeTurnHarness } from "./doubles.ts";
 
@@ -66,4 +71,29 @@ test("maybeSubmitAutoCompact swallows a SessionEndedError like every other best-
   h.relay.failNextPostCommand = new SessionEndedError();
 
   await assert.doesNotReject(maybeSubmitAutoCompact(h.ctx));
+});
+
+test("an Engine that can't run fails startup before any relay session is made, with the Engine's message", async (t) => {
+  const requests: string[] = [];
+  const relay = createServer((req, res) => {
+    requests.push(`${req.method} ${req.url}`);
+    res.writeHead(500).end();
+  });
+  await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  t.after(() => relay.close());
+  const { port } = relay.address() as { port: number };
+
+  process.env.CRC_FAKE_ENGINE = "signed-out";
+  t.after(() => delete process.env.CRC_FAKE_ENGINE);
+
+  await assert.rejects(
+    runConnector({
+      relayBaseUrl: `http://127.0.0.1:${port}`,
+      connectorCredential: "c",
+      projectDir: mkdtempSync(join(tmpdir(), "crc-loop-")),
+      provider: { type: "copilot", model: "auto" },
+    }),
+    /Not logged in/,
+  );
+  assert.deepEqual(requests, []);
 });

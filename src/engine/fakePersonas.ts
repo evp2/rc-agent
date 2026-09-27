@@ -303,6 +303,11 @@ export function fakeEnginePersona(name: string, projectDir: string): FakeEngine 
       return new FakeEngine(script(steeringWithQuestion));
     case "steering-slow-confirm":
       return new FakeEngine(script(steering, { beforeSteerConfirm: holdBeforeConfirm }));
+    case "signed-out":
+      // An Engine nobody is signed in to: startup must fail before a phone URL.
+      return new FakeEngine(
+        script(smoke(projectDir), { failVerify: new Error("Not logged in. Run `copilot login`.") }),
+      );
     default:
       throw new Error(`Unknown CRC_FAKE_ENGINE persona: '${name}'`);
   }

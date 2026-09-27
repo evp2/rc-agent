@@ -13,7 +13,7 @@ import type {
 
 import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
-import type { ProviderConfig } from "../../provider";
+import type { ClaudeProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
 import type {
   Engine,
@@ -43,7 +43,7 @@ export interface ClaudeEngineDeps {
 }
 
 /** Builds a Claude adapter wired to the real SDK's `query()`, in the provider's environment. */
-export function createClaudeEngine(provider: ProviderConfig): Engine {
+export function createClaudeEngine(provider: ClaudeProviderConfig): Engine {
   const env = buildProviderEnv(provider);
   return new ClaudeEngine({
     query: defaultSdkQuery,
@@ -548,6 +548,9 @@ export class ClaudeEngine implements Engine {
   readonly capabilities = { steer: true };
 
   constructor(private readonly deps: ClaudeEngineDeps) {}
+
+  /** Claude reports a missing login on the first Turn, as the Turn's error; there is nothing cheap to check before then. */
+  async verify(): Promise<void> {}
 
   async open(options: OpenOptions): Promise<EngineSession> {
     return new ClaudeEngineSession(this.deps, options);

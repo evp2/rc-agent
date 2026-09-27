@@ -11,4 +11,15 @@ export interface BedrockProviderConfig {
   model?: string;
 }
 
-export type ProviderConfig = AnthropicProviderConfig | BedrockProviderConfig;
+export interface CopilotProviderConfig {
+  type: "copilot";
+  /** A Copilot model id. `auto` lets Copilot choose per Turn. */
+  model: string;
+  /** The `copilot` executable to run. Absent means the one on the PATH. */
+  cliPath?: string;
+}
+
+/** The providers the Claude Engine runs on. */
+export type ClaudeProviderConfig = AnthropicProviderConfig | BedrockProviderConfig;
+
+export type ProviderConfig = ClaudeProviderConfig | CopilotProviderConfig;

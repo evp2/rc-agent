@@ -1,13 +1,15 @@
-import { engineKindFor, type ConnectorConfig } from "../config";
+import type { ConnectorConfig } from "../config";
 import { createClaudeEngine } from "./claude/adapter";
+import { createCopilotEngine } from "./copilot/adapter";
 import type { Engine } from "./types";
 
 /** The Engine a connector drives, which its provider decides. */
 export function createEngine(config: ConnectorConfig): Engine {
-  switch (engineKindFor(config.provider)) {
-    case "claude":
+  switch (config.provider.type) {
+    case "anthropic":
+    case "bedrock":
       return createClaudeEngine(config.provider);
     case "copilot":
-      throw new Error("The Copilot Engine is not available yet.");
+      return createCopilotEngine(config.provider);
   }
 }

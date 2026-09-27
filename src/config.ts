@@ -58,6 +58,8 @@ export function engineKindFor(provider: ProviderConfig): EngineKind {
     case "anthropic":
     case "bedrock":
       return "claude";
+    case "copilot":
+      return "copilot";
   }
 }
 
@@ -109,8 +111,14 @@ export function loadConfig(path: string): ConnectorConfig {
       region: optionalString(p, "region"),
       model: optionalString(p, "model"),
     };
+  } else if (providerType === "copilot") {
+    provider = {
+      type: "copilot",
+      model: optionalString(p, "model") ?? "auto",
+      cliPath: optionalString(p, "cliPath"),
+    };
   } else {
-    throw new Error("'provider.type' must be 'anthropic' or 'bedrock'");
+    throw new Error("'provider.type' must be 'anthropic', 'bedrock' or 'copilot'");
   }
 
   let inactivityCompact: InactivityCompactConfig | undefined;

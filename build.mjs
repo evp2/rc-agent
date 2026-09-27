@@ -25,7 +25,7 @@ await esbuild.build({
   outfile: "dist/index.js",
   // Keep native/platform-specific packages external -- they must be installed
   // alongside the connector via npm install.
-  external: ["@anthropic-ai/claude-agent-sdk", "qrcode-terminal"],
+  external: ["@anthropic-ai/claude-agent-sdk", "@github/copilot-sdk", "qrcode-terminal"],
   banner: { js: "#!/usr/bin/env node" },
   define: { __CONNECTOR_VERSION__: JSON.stringify(connectorVersion) },
 });

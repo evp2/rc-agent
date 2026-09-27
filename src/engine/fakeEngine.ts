@@ -63,6 +63,8 @@ export interface FakeEngineScript {
   freshConversationId?: string;
   /** Thrown from `open()` itself -- the auth/licence/managed-settings failure case. */
   failOpen?: Error;
+  /** Thrown from `verify()` -- the signed-out case, caught at startup. */
+  failVerify?: Error;
   /** Announced right after the Conversation, if given. */
   announce?: { model: string; permissionMode: string };
   /** Published right after the announcement, if given. */
@@ -391,6 +393,10 @@ export class FakeEngine implements Engine {
   constructor(private readonly script: FakeEngineScript) {
     this.kind = script.kind ?? "claude";
     this.capabilities = { steer: script.capabilities?.steer ?? true };
+  }
+
+  async verify(): Promise<void> {
+    if (this.script.failVerify) throw this.script.failVerify;
   }
 
   async open(options: OpenOptions): Promise<FakeEngineSession> {

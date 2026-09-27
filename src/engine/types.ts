@@ -15,6 +15,14 @@ export interface Engine {
     /** Whether `steer()` truncates the running Turn at its next tool-call boundary rather than merely queueing behind it. */
     steer: boolean;
   };
+  /**
+   * Checks the Engine can run at all -- at least that someone is signed in --
+   * and throws with the Engine's own message if not. Called at startup before
+   * a relay session is made, so a connector that could never answer a
+   * Command fails before it prints a phone URL. A licence or policy refusal
+   * may only surface later, from `open()`.
+   */
+  verify(): Promise<void>;
   open(options: OpenOptions): Promise<EngineSession>;
   /**
    * Makes `conversationId`'s conversation available to a new connector in

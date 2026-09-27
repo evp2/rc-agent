@@ -28,7 +28,8 @@ claude setup-token            # API key (paste your key when prompted)
 ```
 
 For **Bedrock**, skip `claude login` and configure AWS credentials instead
-(see [Bedrock provider](#bedrock) below).
+(see [Bedrock provider](#bedrock) below). For **GitHub Copilot**, install and
+sign in to the Copilot CLI instead (see [Copilot provider](#copilot) below).
 
 **3. A running relay**
 
@@ -108,6 +109,37 @@ aws configure           # static keys
 # or
 aws sso login           # SSO / IAM Identity Center
 ```
+
+### Copilot provider <a name="copilot"></a>
+
+```json
+"provider": { "type": "copilot" }
+```
+
+Drives a GitHub Copilot agent instead of Claude. Both fields are optional:
+
+- `model` — a Copilot model id. Defaults to `auto`, which lets Copilot pick
+  one per Turn.
+- `cliPath` — the `copilot` executable to run. Defaults to the one on the
+  `PATH`.
+
+By default the connector runs the installed Copilot CLI, and uses your own
+login:
+
+```bash
+npm install -g @github/copilot
+copilot login
+```
+
+On a machine where nobody can log in interactively, set `COPILOT_GITHUB_TOKEN`
+instead. The connector then uses the Copilot SDK's bundled runtime with that
+token, and ignores `cliPath`. A classic `ghp_` token is refused by Copilot.
+
+If Copilot isn't signed in, or policy forbids a session, `rc-agent run` stops
+before printing a phone URL, with Copilot's own message.
+
+Not yet on Copilot: Steering (a Command sent mid-Turn waits for the Turn to
+end), Questions, the Skills menu, and Fork.
 
 ## Run
 

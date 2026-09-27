@@ -1,4 +1,4 @@
-import type { ProviderConfig } from "../../provider";
+import type { ClaudeProviderConfig } from "../../provider";
 
 /**
  * Builds the env object passed to each `query()` call. The Agent SDK
@@ -7,7 +7,7 @@ import type { ProviderConfig } from "../../provider";
  * must start from a full copy of the current environment.
  */
 export function buildProviderEnv(
-  config: ProviderConfig,
+  config: ClaudeProviderConfig,
 ): Record<string, string | undefined> {
   const env = { ...process.env };
 

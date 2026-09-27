@@ -1,4 +1,5 @@
 import type { ForkErrorCode } from "../fork";
+import type { ProviderConfig } from "../provider";
 import { CONNECTOR_VERSION } from "../version";
 import type { WorktreeEntry } from "../worktrees";
 
@@ -113,7 +114,7 @@ export interface EventInput {
 
 export interface CreateSessionInput {
   permissionMode: string;
-  providerType: "anthropic" | "bedrock";
+  providerType: ProviderConfig["type"];
   providerModel?: string;
   providerRegion?: string;
   projectDir: string;

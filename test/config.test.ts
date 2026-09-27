@@ -94,3 +94,16 @@ test("a bedrock provider means the Claude Engine", () => {
   const config = loadConfig(writeConfig({ ...base, provider: { type: "bedrock", region: "us-east-1" } }));
   assert.equal(engineKindFor(config.provider), "claude");
 });
+
+test("a copilot provider defaults its model to auto and its CLI to the one on the PATH, and runs on Copilot", () => {
+  const config = loadConfig(writeConfig({ ...base, provider: { type: "copilot" } }));
+  assert.deepEqual(config.provider, { type: "copilot", model: "auto", cliPath: undefined });
+  assert.equal(engineKindFor(config.provider), "copilot");
+});
+
+test("a copilot provider keeps a configured model and CLI path", () => {
+  const config = loadConfig(
+    writeConfig({ ...base, provider: { type: "copilot", model: "gpt-5.6-luna", cliPath: "/opt/copilot/bin/copilot" } }),
+  );
+  assert.deepEqual(config.provider, { type: "copilot", model: "gpt-5.6-luna", cliPath: "/opt/copilot/bin/copilot" });
+});
