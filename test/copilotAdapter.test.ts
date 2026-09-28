@@ -1052,7 +1052,7 @@ class MenuRuntime extends FakeCopilotRuntime {
   }
 }
 
-test("CopilotEngine: the menu lists the project's Skills and Copilot's Local commands, split by where they come from", async () => {
+test("CopilotEngine: the menu lists the project's and personal Copilot Skills and Copilot's Local commands, split by where they come from", async () => {
   const session = await engineOn(new MenuRuntime()).open(openOptions());
   const [menu] = only(await collect(session.events[Symbol.asyncIterator](), (e) => e.type === "menu"), "menu");
   assert.deepEqual(menu.skills, [
