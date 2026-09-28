@@ -85,6 +85,29 @@ test("checkForkRequest carries a classified fork_error_code alongside the raw te
   ]);
 });
 
+test("checkForkRequest posts an Engine's refusal to fork as engine_unsupported", async () => {
+  const h = await makeTurnHarness({
+    executeFork: async () => {
+      throw new ForkError("Forking isn't available for copilot sessions yet.", "engine_unsupported");
+    },
+  });
+  h.relay.getSession = async () => ({
+    fork_request: { name: "fix-login-bug", requested_at: "2026-01-01T00:00:00.000Z" },
+  });
+
+  await checkForkRequest(h.ctx);
+
+  assert.deepEqual(h.relay.posted, [
+    {
+      type: "status",
+      fork_requested_at: "2026-01-01T00:00:00.000Z",
+      fork_name: "fix-login-bug",
+      fork_error: "Forking isn't available for copilot sessions yet.",
+      fork_error_code: "engine_unsupported",
+    },
+  ]);
+});
+
 test("checkForkRequest omits fork_error_code when the failure could not be classified", async () => {
   const h = await makeTurnHarness({
     executeFork: async () => {

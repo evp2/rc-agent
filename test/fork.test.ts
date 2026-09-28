@@ -287,6 +287,43 @@ test("runFork reports an Engine that fails to carry the Conversation as a ForkEr
   assert.deepEqual(calls, []);
 });
 
+test("runFork on an Engine that can't fork refuses as engine_unsupported, before any git command or process", async () => {
+  const repo = initRepo();
+  const branchesBefore = execFileSync("git", ["branch", "--list"], { cwd: repo, encoding: "utf-8" });
+  const { spawn, calls } = recordingSpawn();
+  let asked = false;
+  const engine = new FakeEngine({
+    kind: "copilot",
+    capabilities: { steer: false, fork: false },
+    handlerFor: () => sayAndFinish("ok"),
+    forkConversation: async () => {
+      asked = true;
+      return "unexpected";
+    },
+  });
+  // With git unreachable, any git command would fail with its own error
+  // rather than the Engine's refusal.
+  const path = process.env.PATH;
+  process.env.PATH = "";
+  let error: unknown;
+  try {
+    error = await runFork({ ...baseConfig, projectDir: repo }, engine, "conv-1", "nope", undefined, spawn).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  } finally {
+    process.env.PATH = path;
+  }
+
+  assert.ok(error instanceof ForkError);
+  assert.equal(error.code, "engine_unsupported");
+  assert.match(error.message, /isn't available for copilot sessions/);
+  assert.equal(asked, false);
+  assert.deepEqual(calls, []);
+  assert.equal(existsSync(`${repo}.nope`), false);
+  assert.equal(execFileSync("git", ["branch", "--list"], { cwd: repo, encoding: "utf-8" }), branchesBefore);
+});
+
 test("a Fork's carried Conversation reaches the spawned connector once, and goes no further", () => {
   process.env.CRC_FORKED_CONVERSATION = "conv-carried";
 

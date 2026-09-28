@@ -14,6 +14,8 @@ export interface Engine {
   readonly capabilities: {
     /** Whether `steer()` truncates the running Turn at its next tool-call boundary rather than merely queueing behind it. */
     steer: boolean;
+    /** Whether `forkConversation` can carry a Conversation at all. A Fork on an Engine that can't is refused before git is touched. */
+    fork: boolean;
   };
   /**
    * Checks the Engine can run at all -- at least that someone is signed in --

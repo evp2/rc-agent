@@ -545,7 +545,7 @@ class ClaudeEngineSession implements EngineSession {
  */
 export class ClaudeEngine implements Engine {
   readonly kind = "claude" as const;
-  readonly capabilities = { steer: true };
+  readonly capabilities = { steer: true, fork: true };
 
   constructor(private readonly deps: ClaudeEngineDeps) {}
 

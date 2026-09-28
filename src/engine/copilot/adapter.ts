@@ -463,7 +463,7 @@ function addUsage(
  */
 export class CopilotEngine implements Engine {
   readonly kind = "copilot" as const;
-  readonly capabilities = { steer: false };
+  readonly capabilities = { steer: false, fork: false };
   private runtime: Promise<CopilotRuntime> | undefined;
 
   constructor(private readonly deps: CopilotEngineDeps) {}

@@ -412,6 +412,10 @@ test("CopilotEngine: Fork is refused, since Copilot can't carry a Conversation i
   );
 });
 
+test("CopilotEngine: reports it can't Fork, so a Fork is refused before any worktree is made", () => {
+  assert.equal(engineOn(new FakeCopilotRuntime()).capabilities.fork, false);
+});
+
 test("CopilotEngine: reports it can't Steer", () => {
   assert.equal(engineOn(new FakeCopilotRuntime()).capabilities.steer, false);
 });

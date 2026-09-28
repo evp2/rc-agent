@@ -56,7 +56,7 @@ export type FakeTurnHandler = (ctx: FakeTurnContext) => Promise<FakeTurnOutcome 
 
 export interface FakeEngineScript {
   kind?: EngineKind;
-  capabilities?: { steer: boolean };
+  capabilities?: { steer?: boolean; fork?: boolean };
   /** The conversation id this session already has, if any -- what `resume` must match for `open()` to report a resumed (not lost) Conversation. */
   conversationId?: string;
   /** The id a fresh Conversation gets, when there was nothing (matching or otherwise) to resume. Random when omitted. */
@@ -388,11 +388,11 @@ class FakeEngineSessionImpl implements FakeEngineSession {
  */
 export class FakeEngine implements Engine {
   readonly kind: EngineKind;
-  readonly capabilities: { steer: boolean };
+  readonly capabilities: { steer: boolean; fork: boolean };
 
   constructor(private readonly script: FakeEngineScript) {
     this.kind = script.kind ?? "claude";
-    this.capabilities = { steer: script.capabilities?.steer ?? true };
+    this.capabilities = { steer: script.capabilities?.steer ?? true, fork: script.capabilities?.fork ?? true };
   }
 
   async verify(): Promise<void> {

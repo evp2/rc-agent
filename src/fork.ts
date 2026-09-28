@@ -13,8 +13,10 @@ import type { ConnectorState } from "./state";
  * branch exists, or the sibling worktree directory does -- because the remedy
  * for either is the same and the phone knows nothing about git. Anything
  * unrecognised stays uncoded and reaches the phone as git's own text.
+ * `engine_unsupported` is the one code git plays no part in: the session's
+ * Engine can't carry a Conversation into a new worktree, so nothing is tried.
  */
-export type ForkErrorCode = "name_taken" | "invalid_name";
+export type ForkErrorCode = "name_taken" | "invalid_name" | "engine_unsupported";
 
 /**
  * A failed Fork. Carries git's own error text unmodified as its message, plus
@@ -169,6 +171,9 @@ export type SpawnConnector = typeof spawnDetached;
  * a terminal) and the poll loop's own handling of a `fork_request`
  * (session/watchers.ts), which reports the outcome as a transcript event
  * instead.
+ *
+ * An Engine that can't fork is refused first, before any git command, so a
+ * refused Fork leaves no branch or worktree behind to clean up.
  */
 export async function runFork(
   config: ConnectorConfig,
@@ -178,6 +183,10 @@ export async function runFork(
   fromRef: string | undefined,
   spawn: SpawnConnector = spawnDetached,
 ): Promise<ConnectorState> {
+  if (!engine.capabilities.fork) {
+    throw new ForkError(`Forking isn't available for ${engine.kind} sessions yet.`, "engine_unsupported");
+  }
+
   const plan = planFork({
     sourceWorktreePath: config.projectDir,
     sourceConfig: config,
