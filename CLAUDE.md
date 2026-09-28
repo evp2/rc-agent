@@ -17,19 +17,28 @@ node --version
 now, before any later step talks to the relay. Without it, cluster's proxy
 setup makes those requests come back `HTTP 403`.
 
-## Step 2 — Claude CLI installed and on PATH
-
-```bash
-which claude && claude --version
-```
-
-**Pass:** both commands succeed and print output.
-**Fail:** install the Claude CLI with `npm install -g @anthropic-ai/claude-code`, then re-check.
-
-## Step 3 — Claude CLI authenticated
+## Step 2 — Provider CLI installed and on PATH
 
 Determine the provider type from `connector.config.json` (or ask the user if the
-file doesn't exist yet):
+file doesn't exist yet). Steps 2 and 3 depend on it.
+
+- **`anthropic`** — the Agent SDK runs its own bundled copy of Claude Code, but
+  that copy uses the login the `claude` CLI stores, so the CLI is needed to log in:
+  ```bash
+  which claude && claude --version
+  ```
+  **Fail:** install it with `npm install -g @anthropic-ai/claude-code`, then re-check.
+- **`bedrock`** — no CLI needed; skip to Step 3.
+- **`copilot`** — the connector runs the installed Copilot CLI by default:
+  ```bash
+  which copilot && copilot --version
+  ```
+  **Fail:** install it with `npm install -g @github/copilot`, then re-check. (Not
+  needed if the machine will use `COPILOT_GITHUB_TOKEN` — see Step 3.)
+
+**Pass:** the commands for this provider succeed and print output.
+
+## Step 3 — Provider authenticated
 
 - **`provider.type: "anthropic"`** — run:
   ```bash
@@ -54,6 +63,15 @@ file doesn't exist yet):
   **Pass:** returns a JSON object with `Account`, `UserId`, `Arn`.
   **Fail:** ask the user to configure AWS credentials (`aws configure`, `aws sso login`,
   or set `AWS_PROFILE`) before continuing.
+
+- **`provider.type: "copilot"`** — the Copilot CLI has no status command; the
+  connector checks the login itself at startup, and `rc-agent start` (Step 11)
+  fails before printing a phone URL, with Copilot's own message, if nobody is
+  signed in. Make sure one of these is true:
+  - **Desktop / machine with a browser:** the user has run `copilot login`.
+  - **Headless VM:** `COPILOT_GITHUB_TOKEN` is set in the connector's
+    environment. The connector then uses the Copilot SDK's bundled runtime and
+    ignores `cliPath`. A classic `ghp_` token is refused by Copilot.
 
 ## Step 4 — npm install
 
@@ -119,9 +137,11 @@ an operator — the placeholder above is a stand-in, and the relay rejects it.
 Then confirm or adjust:
 - `projectDir` — defaults to `""` which means the connector uses whatever directory
   it is launched from. Set an absolute path here to override. **The connector
-  always runs with permissions bypassed (ADR 0004), so point it only at a
-  checkout the user is willing to let an agent modify without being asked.**
-- `provider` — already set to `{"type":"anthropic"}`; change to the Bedrock shape if needed (see README.md)
+  always runs with permissions bypassed, because nobody is at the machine to
+  answer a permission prompt and the phone has no way to approve one, so a
+  prompted Turn would hang. Point it only at a checkout the user is willing to
+  let an agent modify without being asked.**
+- `provider` — already set to `{"type":"anthropic"}`; change to the Bedrock or Copilot shape if needed (see README.md)
 - `inactivityCompact` — already set to `{"afterMinutes":30}`, so the connector submits its own
   `/compact` after 30 minutes with no real Command completing. Remove the field entirely to turn
   this off, or change `afterMinutes` (5 minutes minimum).
@@ -160,6 +180,7 @@ Extract config values with node (works cross-platform, no jq required):
 RELAY=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).relayBaseUrl")
 CREDENTIAL=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).connectorCredential")
 PROJECT=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).projectDir")
+PROVIDER=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).provider.type")
 ```
 
 Create a session and capture the full response (use `-s`, not `-sf`, so failures print the error body):
@@ -168,7 +189,7 @@ Create a session and capture the full response (use `-s`, not `-sf`, so failures
 SESSION=$(curl -s -X POST "${RELAY}/sessions" \
   -H "content-type: application/json" \
   -H "X-Connector-Credential: ${CREDENTIAL}" \
-  -d "{\"permission_mode\":\"default\",\"provider_type\":\"anthropic\",\"project_dir\":\"${PROJECT}\"}")
+  -d "{\"permission_mode\":\"default\",\"provider_type\":\"${PROVIDER}\",\"project_dir\":\"${PROJECT}\"}")
 echo "${SESSION}"
 ```
 
@@ -236,19 +257,13 @@ way. Use `rc-agent stop --end` only to deliberately discard the conversation.
 
 ---
 
-Once running, `/connector` (`.claude/skills/connector`) is the runtime companion
-to this document: it routes `rc-agent` subcommands and diagnoses an unhealthy
-connector.
-
----
-
 ## Summary of pass criteria
 
 All of the following must be true before reporting success:
 
 - [ ] Node.js >= 22
-- [ ] `claude` binary on PATH
-- [ ] Claude CLI authenticated (anthropic) **or** AWS credentials valid (bedrock)
+- [ ] The provider's CLI on PATH: `claude` (anthropic) or `copilot` (copilot, unless using `COPILOT_GITHUB_TOKEN`)
+- [ ] Claude CLI authenticated (anthropic), AWS credentials valid (bedrock), **or** Copilot signed in or `COPILOT_GITHUB_TOKEN` set (copilot)
 - [ ] `npm install` succeeded
 - [ ] `npm run typecheck` clean
 - [ ] `npm run build` succeeded; `dist/index.js` is executable with shebang

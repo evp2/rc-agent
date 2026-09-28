@@ -31,4 +31,4 @@ Used by `/wayfinder`. The **map** is a file with one **child** file per ticket.
 
 ## Note on the GitHub remote
 
-This repo also has a `github.com/evp2/cc-rc.cli` remote, but by choice its issue tracker is this local-markdown convention under `.scratch/`, not GitHub Issues.
+This repo also has a `github.com/evp2/rc-agent` remote, but by choice its issue tracker is this local-markdown convention under `.scratch/`, not GitHub Issues.

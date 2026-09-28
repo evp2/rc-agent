@@ -1,9 +1,10 @@
 # claude-remote-control connector
 
-Drive a headless [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript)
-coding session from your phone. The connector runs locally next to a real project
-directory, picks up instructions from the relay, executes them via the Claude
-Agent SDK, and streams output back to your phone.
+Drive a headless coding agent from your phone. The connector runs locally
+next to a real project directory, picks up Commands from the relay, hands them
+to an agent SDK, and streams the output back to your phone. The agent is either
+Claude, through the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript),
+or GitHub Copilot, through the [Copilot SDK](https://github.com/github/copilot-sdk).
 
 ## Prerequisites
 
@@ -15,8 +16,9 @@ node --version   # must be >= 22
 
 **2. Claude CLI installed and authenticated**
 
-The Agent SDK shell-spawns the `claude` binary — it must be on your `PATH` and
-logged in before you start the connector.
+The Agent SDK runs its own bundled copy of Claude Code, but that copy uses the
+login the `claude` CLI stores, so log in with the CLI before you start the
+connector.
 
 ```bash
 # Install
@@ -151,7 +153,9 @@ again: *<shell>* finished" and offers the brake, without a push. Stop, and
 stopping the connector, end any detached shells still running, since Copilot
 would otherwise leave them behind.
 
-Not yet on Copilot: Fork.
+Not yet on Copilot: Fork. Tapping Fork on a Copilot session fails straight
+away, with "Forking isn't available for Copilot sessions yet" on the phone, and
+no worktree or branch is made.
 
 ## Run
 
@@ -162,6 +166,8 @@ rc-agent qr               # print the pairing QR (--share for the share link)
 rc-agent stop             # stop it, leaving the session resumable
 rc-agent stop --end       # stop it and end the session (destroys the conversation)
 
+rc-agent fork <name>      # new session in a sibling git worktree, seeded with this conversation
+
 rc-agent run              # foreground, Ctrl-C to stop
 ```
 
@@ -169,15 +175,21 @@ rc-agent run              # foreground, Ctrl-C to stop
 
 1. Registers a session with the relay (`POST /sessions`), which returns a
    session ID and bearer secret — both are embedded in the phone URL.
-2. Polls `GET /sessions/{id}/commands` for new instructions from the phone,
-   processing them strictly one at a time.
-3. Each instruction runs one `query()` call against the Claude Agent SDK
-   (`resume`d from the previous call's session ID after the first turn), so
-   the conversation keeps full context across turns.
-4. Streamed SDK messages are mapped to a compact JSON event schema and
+2. Polls `GET /sessions/{id}/commands` for new Commands from the phone and runs
+   them one at a time. A Command that arrives while a Turn is running Steers
+   it: the Turn is cut at its next tool-call boundary and the new Command runs
+   next.
+3. Commands go to an Engine, the connector's one interface over the agent SDK
+   (Claude or Copilot). The Engine keeps one Conversation for the session and
+   resumes it by id after a restart, so the agent keeps full context across
+   Turns.
+4. The Engine's output is mapped to a compact JSON event schema and
    batch-flushed to `POST /sessions/{id}/events` every ~750 ms for the phone
-   to poll and render.
-5. A turn that committed code reports its line counts to
+   to poll and render. Each Turn's token usage is sent the same way.
+5. Background tasks the agent starts (background shells, subagents) show as
+   cards and in the tray. When one finishes and wakes the agent into a Turn
+   nobody asked for, the phone says why and offers the brake, without a push.
+6. A turn that committed code reports its line counts to
    `POST /sessions/{id}/contributions`, attributed to `origin`. Measured by
    diffing the commit the turn started on against the one it ended on, and
    skipped entirely when the branch moved sideways or the directory is not a
