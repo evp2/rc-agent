@@ -3,13 +3,15 @@ import type { PermissionHandler, SessionEvent } from "@github/copilot-sdk";
 import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
 import type { CopilotProviderConfig } from "../../provider";
-import type { Engine, EngineEvent, EngineSession, EngineUsage, OpenOptions } from "../types";
+import type { Engine, EngineEvent, EngineQuestion, EngineSession, EngineUsage, OpenOptions } from "../types";
 import {
   startCopilotRuntime,
   type CopilotRuntime,
   type CopilotSessionHandle,
   type CopilotSessionOptions,
   type CopilotTask,
+  type CopilotUserInputRequest,
+  type CopilotUserInputResponse,
 } from "./runtime";
 
 export interface CopilotEngineDeps {
@@ -47,6 +49,9 @@ interface RunningTurn {
 
 /** Said against every Command the connector can no longer hand to Copilot. */
 const RUNTIME_GONE = "the Copilot runtime exited";
+
+/** Copilot's own question tool. Its questions reach the human through `onQuestion`, never as a tool call. */
+const QUESTION_TOOL = "ask_user";
 
 /**
  * One long-lived Copilot session, translated into neutral Engine events.
@@ -86,6 +91,10 @@ class CopilotEngineSession implements EngineSession {
   private quelling = false;
   private refreshingTasks: Promise<void> | undefined;
   private tasksStale = false;
+  /** Calls of the question tool, whose start and result are kept off the phone. */
+  private readonly questionCalls = new Set<string>();
+  /** One per Question waiting on the human; a Stop or close withdraws them all. */
+  private readonly pendingQuestions = new Set<AbortController>();
   private dead = false;
   private closed = false;
   private readonly unsubscribe: () => void;
@@ -93,6 +102,7 @@ class CopilotEngineSession implements EngineSession {
   constructor(
     private readonly runtime: CopilotRuntime,
     private readonly session: CopilotSessionHandle,
+    private readonly options: OpenOptions,
     conversation: Extract<EngineEvent, { type: "conversation" }>,
   ) {
     this.outbox.push(conversation);
@@ -118,7 +128,33 @@ class CopilotEngineSession implements EngineSession {
     throw new Error("Steering isn't available on Copilot sessions yet");
   }
 
+  /**
+   * Copilot's question tool, put to the human. Its single question with
+   * choices becomes a one-question Question, keyed by the tool call that
+   * asked it. Rejects once the Question is withdrawn, which fails the tool;
+   * by then the Turn it held has been stopped.
+   */
+  async ask(request: CopilotUserInputRequest): Promise<CopilotUserInputResponse> {
+    if (this.closed || !this.turn) throw new Error("there is no Turn to ask a question in");
+    const choices = request.choices ?? [];
+    const question: EngineQuestion = {
+      toolUseId: [...this.questionCalls].at(-1) ?? `${QUESTION_TOOL}-${this.questionCalls.size}`,
+      questions: [{ question: request.question, options: choices.map((label) => ({ label })), multiSelect: false }],
+    };
+    const withdraw = new AbortController();
+    this.pendingQuestions.add(withdraw);
+    try {
+      const answer = await this.options.onQuestion(question, withdraw.signal);
+      // A typed answer stands in for a pick, as it does in the phone's picker.
+      const text = answer.response?.trim() || answer.answers[request.question] || "";
+      return { answer: text, wasFreeform: !choices.includes(text) };
+    } finally {
+      this.pendingQuestions.delete(withdraw);
+    }
+  }
+
   stop(): void {
+    this.withdrawQuestions();
     const dropped = this.waiting.splice(0);
     // Reported before the stopped Turn ends, so everything a Stop did is
     // visible before the phone hears that Turn is over.
@@ -150,10 +186,16 @@ class CopilotEngineSession implements EngineSession {
     if (this.closed) return;
     this.closed = true;
     this.unsubscribe();
+    this.withdrawQuestions();
     if (this.turn) this.endTurn("stopped");
     await this.session.disconnect().catch(() => undefined);
     await this.runtime.stop().catch(() => undefined);
     this.outbox.close();
+  }
+
+  private withdrawQuestions(): void {
+    for (const withdraw of this.pendingQuestions) withdraw.abort();
+    this.pendingQuestions.clear();
   }
 
   private deliverNext(): void {
@@ -242,6 +284,10 @@ class CopilotEngineSession implements EngineSession {
       case "tool.execution_start":
         this.ensureTurn();
         if (this.quelling) return;
+        if (event.data.toolName === QUESTION_TOOL) {
+          this.questionCalls.add(event.data.toolCallId);
+          return;
+        }
         this.outbox.push({
           type: "tool_use",
           toolUseId: event.data.toolCallId,
@@ -251,7 +297,7 @@ class CopilotEngineSession implements EngineSession {
         return;
       case "tool.execution_complete":
         // A result straggling in after its Turn ended belongs to no Turn.
-        if (!this.turn) return;
+        if (!this.turn || this.questionCalls.has(event.data.toolCallId)) return;
         this.outbox.push({
           type: "tool_result",
           toolUseId: event.data.toolCallId,
@@ -503,32 +549,35 @@ export class CopilotEngine implements Engine {
   }
 
   private async openOn(runtime: CopilotRuntime, options: OpenOptions): Promise<EngineSession> {
+    // Copilot takes the question handler when the session is made, before
+    // there is an Engine session to answer it; it only asks inside a Turn,
+    // by which time there is.
+    let engineSession: CopilotEngineSession | undefined;
     const sessionOptions: CopilotSessionOptions = {
       model: this.deps.model,
       workingDirectory: options.projectDir,
       onPermissionRequest: approveEverything,
+      onUserInputRequest: (request) =>
+        engineSession ? engineSession.ask(request) : Promise.reject(new Error("the session isn't open yet")),
     };
+    const wrap = (session: CopilotSessionHandle, conversation: Extract<EngineEvent, { type: "conversation" }>) =>
+      (engineSession = new CopilotEngineSession(runtime, session, options, conversation));
 
     if (options.resume) {
       try {
         const session = await runtime.resumeSession(options.resume, sessionOptions);
-        return new CopilotEngineSession(runtime, session, { type: "conversation", id: session.sessionId, resumed: true });
+        return wrap(session, { type: "conversation", id: session.sessionId, resumed: true });
       } catch (e) {
         // A Conversation that can't be reopened is never a reason to fail:
         // start fresh and say so. Anything that stops a fresh session too --
         // auth, licence, policy -- fails below, with Copilot's own message.
         console.log(`Couldn't resume Copilot conversation ${options.resume}: ${(e as Error).message}`);
         const session = await runtime.createSession(sessionOptions);
-        return new CopilotEngineSession(runtime, session, {
-          type: "conversation",
-          id: session.sessionId,
-          resumed: false,
-          lostPrevious: true,
-        });
+        return wrap(session, { type: "conversation", id: session.sessionId, resumed: false, lostPrevious: true });
       }
     }
     const session = await runtime.createSession(sessionOptions);
-    return new CopilotEngineSession(runtime, session, { type: "conversation", id: session.sessionId, resumed: false });
+    return wrap(session, { type: "conversation", id: session.sessionId, resumed: false });
   }
 
   async forkConversation(_input: { conversationId: string; fromDir: string; toDir: string }): Promise<string | undefined> {

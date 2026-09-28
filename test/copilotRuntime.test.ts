@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { chooseRuntime } from "../src/engine/copilot/runtime.ts";
+import { chooseRuntime, sdkSessionConfig } from "../src/engine/copilot/runtime.ts";
 
 function binDirWithCopilot(): string {
   const dir = mkdtempSync(join(tmpdir(), "crc-copilot-bin-"));
@@ -41,4 +41,17 @@ test("with no token and no copilot on the PATH, startup says how to fix it", () 
     () => chooseRuntime({ type: "copilot", model: "auto" }, { PATH: "/nowhere" }),
     /Can't find the 'copilot' executable.*provider\.cliPath/s,
   );
+});
+
+test("a session asks its questions as a single question with choices, and declines JSON-schema forms", async () => {
+  const config = sdkSessionConfig({
+    model: "auto",
+    workingDirectory: "/p",
+    onPermissionRequest: () => ({ kind: "approve-once" }),
+    onUserInputRequest: async () => ({ answer: "x", wasFreeform: false }),
+  });
+  assert.equal(config.askUserVariant, "legacy");
+  assert.equal(typeof config.onUserInputRequest, "function");
+  assert.deepEqual(await config.onElicitationRequest(), { action: "decline" });
+  assert.equal(config.enableConfigDiscovery, true, "the project's Skills load");
 });
