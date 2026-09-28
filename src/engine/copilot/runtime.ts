@@ -18,6 +18,8 @@ export interface CopilotTask {
   type: "shell" | "agent" | string;
   status: "running" | "idle" | "completed" | "failed" | "cancelled";
   description?: string;
+  /** Shells only: the command line, as the tool call that started the shell gave it. */
+  command?: string;
   /** Shells only: `detached` survives the Turn that started it, `attached` does not. */
   attachmentMode?: "attached" | "detached";
   /** Agents only: the tool call that started it. */

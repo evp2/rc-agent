@@ -55,6 +55,14 @@ interface Unrun {
   errors?: string[];
 }
 
+/** A Background task reported started and not yet settled. */
+interface LiveTask {
+  taskType: string;
+  description?: string;
+  /** The tool call that started it, when it can be told. */
+  toolUseId?: string;
+}
+
 interface RunningTurn {
   startedAt: number;
   usage: EngineUsage | undefined;
@@ -120,11 +128,17 @@ class CopilotEngineSession implements EngineSession {
   private turn: RunningTurn | undefined;
   private contextPercentage: number | undefined;
   /** Background tasks reported started and not yet settled. */
-  private readonly liveTasks = new Map<string, CopilotTask>();
+  private readonly liveTasks = new Map<string, LiveTask>();
   /** Every task id ever reported, so none is reported twice. */
   private readonly seenTasks = new Set<string>();
-  /** Detached shells a Stop killed, whose completion Copilot has yet to report. */
-  private readonly shellsKilledByStop = new Set<string>();
+  /**
+   * Tool calls that started a detached shell, with the command each ran.
+   * Copilot lists a shell without the call that started it, so a listed
+   * shell is matched back to its call by that command.
+   */
+  private readonly detachedShellCalls = new Map<string, string>();
+  /** Detached shells a Stop or Kill ended, whose completion Copilot has yet to report. */
+  private readonly shellsKilled = new Set<string>();
   /** Set when one of those completions arrives: the Turn it wakes the agent into is aborted unseen. */
   private quellNextWake = false;
   /** True from the first sign of a quelled wake-up until Copilot confirms it stopped. */
@@ -261,10 +275,10 @@ class CopilotEngineSession implements EngineSession {
     const dropped = this.waiting.splice(0);
     // Reported before the stopped Turn ends, so everything a Stop did is
     // visible before the phone hears that Turn is over.
-    for (const [taskId] of this.liveTasks) {
-      this.outbox.push({ type: "task_settled", taskId, status: "stopped", ambient: false });
+    if (this.liveTasks.size) {
+      for (const taskId of [...this.liveTasks.keys()]) this.settleTask(taskId, "stopped");
+      this.reportLiveTasks();
     }
-    this.liveTasks.clear();
 
     const droppedUnrun = dropped.map((): Unrun => ({ cause: "command", outcome: "stopped" }));
     if (this.turn?.localCommand) {
@@ -294,17 +308,31 @@ class CopilotEngineSession implements EngineSession {
     void this.cancelBackgroundTasks();
   }
 
+  /**
+   * Ends one Background task. The Turn, if one is running, carries on. The
+   * task is settled here as stopped, whatever Copilot goes on to list it as:
+   * a detached shell Copilot can't cancel is signalled instead, and Copilot
+   * then reports it completed.
+   */
   async killTask(taskId: string): Promise<void> {
+    if (this.liveTasks.get(taskId)?.taskType === "shell") this.shellsKilled.add(taskId);
     await this.session.cancelTask(taskId).catch(() => undefined);
-    this.refreshTasks();
+    if (this.settleTask(taskId, "stopped")) this.reportLiveTasks();
   }
 
+  /**
+   * Ends the Background tasks still running too, since they would outlive the
+   * connector -- Copilot's runtime going away leaves a detached shell running,
+   * and a resumed session doesn't list it. None is reported settled: the
+   * next start reports each as interrupted by the restart.
+   */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     this.unsubscribe();
     this.withdrawQuestions();
     if (this.turn) this.endTurn("stopped");
+    if (!this.dead) await this.cancelBackgroundTasks();
     await this.session.disconnect().catch(() => undefined);
     await this.runtime.stop().catch(() => undefined);
     this.outbox.close();
@@ -426,7 +454,7 @@ class CopilotEngineSession implements EngineSession {
       return;
     }
     for (const task of tasks.filter((t) => isBackgroundTask(t) && isRunning(t))) {
-      if (task.type === "shell") this.shellsKilledByStop.add(task.id);
+      if (task.type === "shell") this.shellsKilled.add(task.id);
       await this.session.cancelTask(task.id).catch(() => undefined);
     }
   }
@@ -448,11 +476,17 @@ class CopilotEngineSession implements EngineSession {
 
     switch (event.type) {
       case "system.notification": {
-        const kind = event.data.kind as { type?: string; shellId?: string };
-        // Arriving mid-Turn, the news just joins that Turn; only between
-        // Turns does it wake the agent.
-        if (kind.type === "shell_detached_completed" && kind.shellId && this.shellsKilledByStop.delete(kind.shellId)) {
-          this.quellNextWake = !this.turn;
+        const kind = event.data.kind as { type?: string; shellId?: string; agentId?: string; status?: string };
+        if (kind.type === "shell_detached_completed" && kind.shellId) {
+          // Arriving mid-Turn, the news just joins that Turn; only between
+          // Turns does it wake the agent.
+          if (this.shellsKilled.delete(kind.shellId)) this.quellNextWake = !this.turn;
+          // Settled now, however far Copilot's list lags, so the Turn this
+          // wakes the agent into can say what woke it. Copilot calls a
+          // finished shell completed whatever its exit code (measured).
+          else if (this.settleTask(kind.shellId, "completed")) this.reportLiveTasks();
+        } else if (kind.type === "agent_completed" && kind.agentId) {
+          if (this.settleTask(kind.agentId, kind.status === "failed" ? "failed" : "completed")) this.reportLiveTasks();
         }
         return;
       }
@@ -502,6 +536,10 @@ class CopilotEngineSession implements EngineSession {
           name: event.data.toolName,
           input: event.data.arguments,
         });
+        const args = event.data.arguments as { command?: unknown; detach?: unknown } | undefined;
+        if (args?.detach === true && typeof args.command === "string") {
+          this.detachedShellCalls.set(event.data.toolCallId, args.command);
+        }
         return;
       case "tool.execution_complete":
         this.runningTools.delete(event.data.toolCallId);
@@ -689,37 +727,67 @@ class CopilotEngineSession implements EngineSession {
   private applyTasks(tasks: CopilotTask[]): void {
     if (this.closed) return;
     let changed = false;
+    const listed = new Set(tasks.map((t) => t.id));
     for (const task of tasks.filter(isBackgroundTask)) {
       if (isRunning(task) && !this.seenTasks.has(task.id)) {
         this.seenTasks.add(task.id);
-        this.liveTasks.set(task.id, task);
+        const live: LiveTask = { taskType: task.type, description: task.description, toolUseId: this.startedBy(task) };
+        this.liveTasks.set(task.id, live);
         this.outbox.push({
           type: "task_started",
           taskId: task.id,
-          toolUseId: task.toolCallId,
+          ...(live.toolUseId ? { toolUseId: live.toolUseId } : {}),
           description: task.description,
           taskType: task.type,
           ambient: false,
         });
         changed = true;
-      } else if (!isRunning(task) && this.liveTasks.has(task.id)) {
-        this.liveTasks.delete(task.id);
-        this.outbox.push({
-          type: "task_settled",
-          taskId: task.id,
-          toolUseId: task.toolCallId,
-          status: task.status === "cancelled" ? "stopped" : task.status === "failed" ? "failed" : "completed",
-          ambient: false,
-        });
-        changed = true;
+      } else if (!isRunning(task)) {
+        const status = task.status === "cancelled" ? "stopped" : task.status === "failed" ? "failed" : "completed";
+        changed = this.settleTask(task.id, status) || changed;
       }
     }
-    if (changed) {
-      this.outbox.push({
-        type: "tasks_changed",
-        tasks: [...this.liveTasks.values()].map((t) => ({ taskId: t.id, taskType: t.type, description: t.description })),
-      });
+    // Copilot keeps a finished Background task listed; one that has gone
+    // from the list altogether is over all the same.
+    for (const taskId of [...this.liveTasks.keys()]) {
+      if (!listed.has(taskId)) changed = this.settleTask(taskId, "completed") || changed;
     }
+    if (changed) this.reportLiveTasks();
+  }
+
+  /** The tool call that started `task`: an agent names it; a shell is matched to the call that ran its command. */
+  private startedBy(task: CopilotTask): string | undefined {
+    if (task.toolCallId) return task.toolCallId;
+    if (task.type !== "shell" || task.command === undefined) return undefined;
+    for (const [toolCallId, command] of this.detachedShellCalls) {
+      if (command !== task.command) continue;
+      this.detachedShellCalls.delete(toolCallId);
+      return toolCallId;
+    }
+    return undefined;
+  }
+
+  /** Reports a live Background task settled. Returns false, reporting nothing, if it wasn't live. */
+  private settleTask(taskId: string, status: "completed" | "failed" | "stopped"): boolean {
+    const task = this.liveTasks.get(taskId);
+    if (!task) return false;
+    this.liveTasks.delete(taskId);
+    this.outbox.push({
+      type: "task_settled",
+      taskId,
+      ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
+      status,
+      ambient: false,
+    });
+    return true;
+  }
+
+  /** Reports the whole live set, which replaces whatever the tray showed. */
+  private reportLiveTasks(): void {
+    this.outbox.push({
+      type: "tasks_changed",
+      tasks: [...this.liveTasks].map(([taskId, t]) => ({ taskId, taskType: t.taskType, description: t.description })),
+    });
   }
 }
 

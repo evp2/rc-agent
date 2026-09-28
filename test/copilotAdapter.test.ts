@@ -304,6 +304,213 @@ test("CopilotEngine: a Turn the agent starts with no message of ours is an Engin
   await session.close();
 });
 
+// --- Background tasks --------------------------------------------------------
+
+const DETACHED_CALL = "call_NdeTKQ2OBEAmaem5iVTHMfmR";
+const DETACHED_COMMAND = "sleep 8 && echo finished > done.txt";
+
+/** What Copilot listed while the recorded Turn ran: the detached shell, and the foreground echo beside it. */
+function recordedTasks() {
+  return [
+    { id: "0", type: "shell", status: "running" as const, attachmentMode: "detached" as const, executionMode: "background" as const, description: "Start detached delayed marker", command: DETACHED_COMMAND, pid: 1 },
+    { id: "1", type: "shell", status: "running" as const, attachmentMode: "attached" as const, executionMode: "sync" as const, description: "Run foreground echo", command: "echo fg", pid: 2 },
+  ];
+}
+
+/**
+ * A recorded Turn that starts a detached shell and a foreground one, and the
+ * wake-up the shell's completion caused once that Turn had ended.
+ */
+function backgroundComplete() {
+  const recording = loadFixture("background-complete");
+  const firstIdle = recording.findIndex((e) => e.type === "session.idle");
+  const turn = recording.slice(0, firstIdle + 1);
+  const wakeUp = recording.slice(firstIdle + 1).filter((e) => e.type !== "session.background_tasks_changed");
+  return { turn, wakeUp };
+}
+
+test("CopilotEngine: a recorded detached shell is a Background task anchored to the tool call that started it", async () => {
+  const { turn } = backgroundComplete();
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s) => {
+      s.tasks = recordedTasks();
+      s.emit(turn);
+    },
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("start a detached shell and a foreground one");
+  // The list is read once the recorded events have all been delivered.
+  const events = await collect(it, (e) => e.type === "tasks_changed");
+
+  assert.deepEqual(only(events, "task_started"), [
+    {
+      type: "task_started",
+      taskId: "0",
+      toolUseId: DETACHED_CALL,
+      description: "Start detached delayed marker",
+      taskType: "shell",
+      ambient: false,
+    },
+  ]);
+  assert.deepEqual(only(events, "tasks_changed").at(-1)!.tasks.map((t) => t.taskId), ["0"], "the foreground shell never reaches the tray");
+  await session.close();
+});
+
+test("CopilotEngine: a detached shell finishing on its own settles as completed, then wakes the agent into an Engine-started Turn", async () => {
+  const { turn, wakeUp } = backgroundComplete();
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s) => {
+      s.tasks = recordedTasks();
+      s.emit(turn);
+    },
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("start a detached shell and a foreground one");
+  await collect(it, (e) => e.type === "turn_ended");
+
+  // Copilot's list can lag its notification; the notification alone settles the shell.
+  runtime.session.emit(wakeUp);
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  const kinds = events.map((e) => e.type).filter((t) => t === "task_settled" || t === "turn_started" || t === "turn_ended");
+  assert.deepEqual(kinds, ["task_settled", "turn_started", "turn_ended"], "settled before the Turn it causes starts");
+  assert.deepEqual(only(events, "task_settled"), [
+    { type: "task_settled", taskId: "0", toolUseId: DETACHED_CALL, status: "completed", ambient: false },
+  ]);
+  assert.deepEqual(only(events, "tasks_changed").at(-1), { type: "tasks_changed", tasks: [] });
+  assert.deepEqual(only(events, "turn_started"), [{ type: "turn_started", cause: "engine" }]);
+  assert.deepEqual(only(events, "assistant_text").map((e) => e.text), ["Done."]);
+  assert.equal(only(events, "turn_ended")[0].outcome, "success");
+  assert.equal(runtime.session.aborts, 0, "a shell that finished on its own wakes the agent for real");
+  await session.close();
+});
+
+test("CopilotEngine: Kill ends one detached shell mid-Turn; its card shows stopped and the Turn keeps running", async () => {
+  const runtime = new FakeCopilotRuntime({
+    ...hangsUntilAborted,
+    onSend: (s, p, i) => {
+      s.tasks = [
+        { id: "bg-1", type: "shell", status: "running", attachmentMode: "detached", description: "dev server" },
+        { id: "bg-2", type: "shell", status: "running", attachmentMode: "detached", description: "watcher" },
+      ];
+      hangsUntilAborted.onSend!(s, p, i);
+      s.emit([event("session.background_tasks_changed", {})]);
+    },
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("start two background shells");
+  await collect(it, (e) => e.type === "tasks_changed");
+
+  await session.killTask("bg-1");
+  const events = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(events, "task_settled").map((e) => [e.taskId, e.status]), [["bg-1", "stopped"]]);
+  assert.deepEqual(only(events, "tasks_changed")[0].tasks.map((t) => t.taskId), ["bg-2"]);
+  assert.equal(only(events, "turn_ended").length, 0, "the Turn keeps running");
+  assert.deepEqual(runtime.session.cancelled, ["bg-1"]);
+  assert.equal(runtime.session.aborts, 0);
+
+  await session.killTask("bg-1");
+  await session.killTask("no-such-task");
+  session.stop();
+  const rest = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(
+    only(rest, "task_settled").map((e) => [e.taskId, e.status]),
+    [["bg-2", "stopped"]],
+    "a second Kill, or one for an unknown task, reports nothing",
+  );
+  await session.close();
+});
+
+test("CopilotEngine: a detached shell Kill ended between Turns doesn't wake the agent back up", async () => {
+  // The runtime ends a detached shell it can't cancel by signalling it, and
+  // then reports it completed, which would wake the agent.
+  const { turn, wakeUp } = backgroundComplete();
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s, _p, i) => {
+      if (i > 0) return s.emit(simpleTurn("after the kill"));
+      s.tasks = recordedTasks();
+      s.emit(turn);
+    },
+    onAbort: (s) => s.emit([event("abort", { reason: "user_initiated" }), event("assistant.idle", { aborted: true })]),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("start a detached shell and a foreground one");
+  await collect(it, (e) => e.type === "turn_ended");
+
+  await session.killTask("0");
+  await collect(it, (e) => e.type === "task_settled");
+  runtime.session.emit(wakeUp);
+  await until(() => runtime.session.aborts === 1);
+  session.send("next");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(
+    events.filter((e) => e.type === "turn_started" || e.type === "tool_use" || e.type === "task_settled"),
+    [{ type: "turn_started", cause: "command" }],
+    "the wake-up is aborted unseen, and the shell isn't settled twice",
+  );
+  assert.deepEqual(only(events, "assistant_text").map((e) => e.text), ["after the kill"]);
+  await session.close();
+});
+
+test("CopilotEngine: a Background task that drops out of Copilot's list settles rather than spinning forever", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  runtime.session.tasks = [{ id: "bg-1", type: "shell", status: "running", attachmentMode: "detached", description: "dev server" }];
+  runtime.session.emit([event("session.background_tasks_changed", {})]);
+  await collect(it, (e) => e.type === "tasks_changed");
+
+  runtime.session.tasks = [];
+  runtime.session.emit([event("session.background_tasks_changed", {})]);
+  const events = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(events, "task_settled").map((e) => [e.taskId, e.status]), [["bg-1", "completed"]]);
+  assert.deepEqual(only(events, "tasks_changed")[0].tasks, []);
+  await session.close();
+});
+
+test("CopilotEngine: a background agent settles with the status Copilot's completion notice gives it", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  runtime.session.tasks = [
+    { id: "agent-1", type: "agent", status: "running", executionMode: "background", toolCallId: "call-agent", description: "explore the repo" },
+    { id: "agent-2", type: "agent", status: "running", executionMode: "sync", toolCallId: "call-sync", description: "the Turn's own" },
+  ];
+  runtime.session.emit([event("session.background_tasks_changed", {})]);
+  const started = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(started, "task_started").map((e) => [e.taskId, e.toolUseId]), [["agent-1", "call-agent"]]);
+
+  runtime.session.emit([
+    event("system.notification", { content: "", kind: { type: "agent_completed", agentId: "agent-1", agentType: "explore", status: "failed" } }),
+  ]);
+  const settled = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(settled, "task_settled").map((e) => [e.taskId, e.toolUseId, e.status]), [["agent-1", "call-agent", "failed"]]);
+  await session.close();
+});
+
+test("CopilotEngine: closing ends the Background tasks still running, and reports none of them settled", async () => {
+  // They would outlive the connector; left unsettled, the next start reports
+  // them interrupted by the restart.
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  runtime.session.tasks = [
+    { id: "bg-1", type: "shell", status: "running", attachmentMode: "detached", description: "dev server" },
+    { id: "fg-1", type: "shell", status: "running", attachmentMode: "attached", description: "foreground" },
+  ];
+  runtime.session.emit([event("session.background_tasks_changed", {})]);
+  await collect(it, (e) => e.type === "tasks_changed");
+
+  await session.close();
+  assert.deepEqual(runtime.session.cancelled, ["bg-1"]);
+  const rest: EngineEvent[] = [];
+  for (let next = await it.next(); !next.done; next = await it.next()) rest.push(next.value);
+  assert.deepEqual(only(rest, "task_settled"), []);
+});
+
 test("CopilotEngine: a Command sent mid-Turn waits in the adapter and goes to Copilot once the Turn ends", async () => {
   let finishFirst: (() => void) | undefined;
   const runtime = new FakeCopilotRuntime({

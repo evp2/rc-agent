@@ -4,10 +4,12 @@ import { test } from "node:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { ClaudeEngine } from "../src/engine/claude/adapter.ts";
+import { CopilotEngine } from "../src/engine/copilot/adapter.ts";
 import { sayAndFinish, startBackgroundTaskAndFinish, type FakeTurnHandler } from "../src/engine/fakeEngine.ts";
 import { maybeSubmitAutoCompact } from "../src/session/loop.ts";
 import { runTurn } from "../src/session/turn.ts";
 import { assistantText, init, result, scriptedQuery, taskStarted } from "./claudeDoubles.ts";
+import { FakeCopilotRuntime, loadFixture } from "./copilotDoubles.ts";
 import { cmd, makeTurnHarness, until, type TurnHarness } from "./doubles.ts";
 
 const completes = (h: TurnHarness) => h.ctx.eventBuffer.filter((e) => e.type === "turn_complete");
@@ -261,6 +263,33 @@ test("on Claude, the Turn the agent starts when a Background task finishes names
     ["working again: a long-running background task finished"],
   );
   assert.ok(indexOfText(h, workingAgain[0].text!) < indexOfText(h, "the background task is done"));
+  assert.equal(completes(h)[1].no_notify, true);
+  assert.deepEqual(h.relay.reports, [true, false, true, false]);
+  await h.close();
+});
+
+test("on Copilot, the recorded wake-up after a detached shell finishes names that shell, is In flight, and sends no push", async () => {
+  const recording = loadFixture("background-complete");
+  const firstIdle = recording.findIndex((e) => e.type === "session.idle");
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s) => {
+      s.tasks = [
+        { id: "0", type: "shell", status: "running", attachmentMode: "detached", description: "Start detached delayed marker", command: "sleep 8 && echo finished > done.txt" },
+      ];
+      s.emit(recording.slice(0, firstIdle + 1));
+    },
+  });
+  const h = await makeTurnHarness({ engine: new CopilotEngine({ startRuntime: async () => runtime, model: "auto" }) });
+
+  await runTurn(h.ctx, cmd("start a detached shell and a foreground one"));
+  await until(() => h.ctx.eventBuffer.some((e) => e.type === "background_task_started"));
+  runtime.session.emit(recording.slice(firstIdle + 1));
+  await until(() => completes(h).length === 2);
+  await until(() => h.relay.lastReport === false);
+
+  const line = indexOfText(h, "working again: Start detached delayed marker finished");
+  assert.notEqual(line, -1);
+  assert.ok(line < indexOfText(h, "Done."), "the line comes before the Turn's own output");
   assert.equal(completes(h)[1].no_notify, true);
   assert.deepEqual(h.relay.reports, [true, false, true, false]);
   await h.close();
