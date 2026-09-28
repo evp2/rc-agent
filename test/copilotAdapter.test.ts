@@ -61,8 +61,21 @@ const harness: EngineGuaranteeHarness = {
   makeQueueingEngine: () =>
     engineOn(new FakeCopilotRuntime({ onSend: (s, _p, i) => s.emit(simpleTurn(i === 0 ? "first" : "second")) })),
 
-  // Copilot doesn't Steer yet, so the suite skips its Steer-ordering check.
-  makeSteerableEngine: () => engineOn(new FakeCopilotRuntime({ onSend: (s) => s.emit(simpleTurn()) })),
+  // The first Command's Turn runs until interrupted; the Steer waits in
+  // Copilot's queue, and the interrupt runs it in the Turn's place.
+  makeSteerableEngine: () =>
+    engineOn(
+      new FakeCopilotRuntime({
+        onSend: (s, p, i) => i === 0 && hangsUntilAborted.onSend!(s, p, i),
+        onInterrupt: (s) => {
+          s.emit([
+            event("abort", { reason: "user_abort" }),
+            event("user.message", { content: "a correction", delivery: "queued" }),
+            ...simpleTurn("corrected").slice(1),
+          ]);
+        },
+      }),
+    ),
 
   makeBackgroundTaskEngine: () =>
     engineOn(
@@ -102,6 +115,12 @@ async function collect(
     collected.push(raced.value);
     if (predicate(raced.value)) return collected;
   }
+}
+
+/** Reads until `count` Turns have ended: a Steered Turn and the Steer's own, say. */
+function collectTurns(iterator: AsyncIterator<EngineEvent>, count: number): Promise<EngineEvent[]> {
+  let ended = 0;
+  return collect(iterator, (e) => e.type === "turn_ended" && ++ended === count);
 }
 
 /** Waits for `condition` to hold, failing the test rather than hanging it if it never does. */
@@ -360,6 +379,125 @@ test("CopilotEngine: a send Copilot refuses is reported against that Command", a
   await session.close();
 });
 
+// --- Steer -------------------------------------------------------------------
+
+const STEP_2 = "call_GVmyNhd7L2AP4PNlcB5uTADb";
+const STEER = "Stop the remaining steps. Reply with just the word PINEAPPLE.";
+
+test("CopilotEngine: a recorded Steer lets the running tool call finish, then cuts the Turn there and runs the Steer next", async () => {
+  // Five steps, one tool call each; the Steer lands while step 2 runs.
+  const recording = loadFixture("steer-D-start");
+  const step2Starts = recording.findIndex((e) => e.type === "tool.execution_start" && (e.data as { toolCallId: string }).toolCallId === STEP_2);
+  const step2Done = recording.findIndex((e) => e.type === "tool.execution_complete" && (e.data as { toolCallId: string }).toolCallId === STEP_2);
+  const runtime = new FakeCopilotRuntime({
+    // The Steer itself goes into Copilot's queue, and shows nothing yet.
+    onSend: (s, _p, i) => i === 0 && s.emit(recording.slice(0, step2Starts + 1)),
+    onInterrupt: (s) => s.emit(recording.slice(step2Done + 1)),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("Run five steps.");
+  await collect(it, (e) => e.type === "tool_use" && e.toolUseId === STEP_2);
+
+  session.steer(STEER);
+  await until(() => runtime.session.sent.length === 2);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(runtime.session.sent, ["Run five steps.", STEER], "the Steer is queued with Copilot straight away");
+  assert.equal(runtime.session.interrupts, 0, "step 2 is still running, so the Turn isn't cut yet");
+
+  runtime.session.emit(recording.slice(step2Starts + 1, step2Done + 1));
+  const events = await collectTurns(it, 2);
+  assert.equal(runtime.session.interrupts, 1);
+  assert.deepEqual(
+    events
+      .filter((e) => ["tool_result", "turn_ended", "turn_started", "assistant_text", "tool_use"].includes(e.type))
+      .map((e) => (e.type === "turn_ended" ? `${e.type}:${e.outcome}` : e.type === "turn_started" ? `${e.type}:${e.cause}` : e.type === "assistant_text" ? e.text : e.type)),
+    ["tool_result", "turn_ended:success", "turn_started:steer", "PINEAPPLE", "turn_ended:success"],
+    "step 2 finished, no step 3 ran, and the Steer's Turn followed the cut one directly",
+  );
+  await session.close();
+});
+
+test("CopilotEngine: a Steer with no tool call running cuts the Turn at once", async () => {
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s, p, i) => i === 0 && hangsUntilAborted.onSend!(s, p, i),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("go");
+  await collect(it, (e) => e.type === "assistant_text");
+  session.steer("change of plan");
+  await until(() => runtime.session.interrupts === 1);
+  await session.close();
+});
+
+test("CopilotEngine: a Steer that lands as the Turn finishes on its own still runs next, as the Steer's Turn", async () => {
+  let finish: (() => void) | undefined;
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s, _p, i) => {
+      if (i > 0) return;
+      const [start, rest] = splitAt(simpleTurn("first"), (e) => e.type === "assistant.idle");
+      s.emit(start);
+      finish = () => s.emit([...rest, event("user.message", { content: "late", delivery: "queued" }), ...simpleTurn("second").slice(1)]);
+    },
+    // Too late: the Turn had already finished.
+    onInterrupt: () => false,
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("go");
+  await collect(it, (e) => e.type === "assistant_text");
+  finish!();
+  session.steer("late");
+  const events = await collectTurns(it, 2);
+  assert.deepEqual(
+    events.filter((e) => e.type === "turn_started" || e.type === "turn_ended").map((e) => (e.type === "turn_started" ? e.cause : e.outcome)),
+    ["success", "steer", "success"],
+  );
+  assert.deepEqual(only(events, "assistant_text").map((e) => e.text), ["second"]);
+  await session.close();
+});
+
+test("CopilotEngine: Stop while a Steer waits for the running tool call ends the Turn, and the Steer with it", async () => {
+  const recording = loadFixture("steer-D-start");
+  const step2Starts = recording.findIndex((e) => e.type === "tool.execution_start" && (e.data as { toolCallId: string }).toolCallId === STEP_2);
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s, _p, i) => i === 0 && s.emit(recording.slice(0, step2Starts + 1)),
+    onAbort: (s) =>
+      s.emit([event("abort", { reason: "user_initiated" }), event("assistant.idle", { aborted: true })]),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("Run five steps.");
+  await collect(it, (e) => e.type === "tool_use" && e.toolUseId === STEP_2);
+  session.steer(STEER);
+  await until(() => runtime.session.sent.length === 2);
+  session.stop();
+  const events = await collectTurns(it, 2);
+  assert.deepEqual(
+    events.filter((e) => e.type === "turn_started" || e.type === "turn_ended").map((e) => (e.type === "turn_started" ? e.cause : e.outcome)),
+    ["stopped", "steer", "stopped"],
+    "the Steer is reported as stopped, so whoever sent it hears how it ended",
+  );
+  // Copilot drops its queue on an abort (measured), so the Steer never runs.
+  runtime.session.emit([event("tool.execution_complete", { toolCallId: STEP_2, success: true, result: { content: "step2" } })]);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(runtime.session.interrupts, 0, "the finished tool call no longer triggers the cut");
+  await session.close();
+});
+
+test("CopilotEngine: a Steer is refused with no Turn running, or with one already on its way", async () => {
+  const runtime = new FakeCopilotRuntime({ onSend: (s, p, i) => i === 0 && hangsUntilAborted.onSend!(s, p, i) });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  assert.throws(() => session.steer("too early"));
+  session.send("go");
+  await collect(it, (e) => e.type === "assistant_text");
+  session.steer("first");
+  assert.throws(() => session.steer("second"));
+  await session.close();
+});
+
 // --- Questions ---------------------------------------------------------------
 
 const QUESTION = "Which color do you prefer?";
@@ -562,8 +700,8 @@ test("CopilotEngine: Fork is refused, since Copilot can't carry a Conversation i
   );
 });
 
-test("CopilotEngine: reports it can't Steer", () => {
-  assert.equal(engineOn(new FakeCopilotRuntime()).capabilities.steer, false);
+test("CopilotEngine: reports it can Steer", () => {
+  assert.equal(engineOn(new FakeCopilotRuntime()).capabilities.steer, true);
 });
 
 // --- Permissions ------------------------------------------------------------
