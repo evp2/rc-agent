@@ -1059,6 +1059,24 @@ test("CopilotEngine: /compact runs through Copilot's command call, as an ordinar
   await session.close();
 });
 
+test("CopilotEngine: /compact still runs as a Local command when the command list couldn't be read at open", async () => {
+  class FailingReadRuntime extends MenuRuntime {
+    override async createSession(options: Parameters<FakeCopilotRuntime["createSession"]>[0]) {
+      const s = await super.createSession(options);
+      s.failCommandReads = 1;
+      return s;
+    }
+  }
+  const runtime = new FailingReadRuntime({ onInvoke: async () => ({ kind: "text", text: "Compacted." }) });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/compact");
+  await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(runtime.session.invoked, [{ name: "compact" }]);
+  assert.deepEqual(runtime.session.sent, [], "never sent to the model as a prompt");
+  await session.close();
+});
+
 test("CopilotEngine: a Local command's text output becomes a status line", async () => {
   const usage = "Session Usage\n\nChanges: +0 -0\nRequests: 1 AI Units (6s)\nTokens: input 9.2k, output 5, cached 1.2k";
   const runtime = commandRuntime({ onInvoke: async () => ({ kind: "text", text: usage }) });

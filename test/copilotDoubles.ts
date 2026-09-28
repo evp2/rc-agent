@@ -92,6 +92,8 @@ export class FakeCopilotSession implements CopilotSessionHandle {
   tasks: CopilotTask[] = [];
   commands: CopilotCommand[] = [];
   skills: CopilotSkill[] = [];
+  /** How many of the next command-list reads fail. */
+  failCommandReads = 0;
   private readonly handlers = new Set<(event: SessionEvent) => void>();
   private disconnectHandler: (() => void) | undefined;
 
@@ -146,6 +148,10 @@ export class FakeCopilotSession implements CopilotSessionHandle {
   }
 
   async listCommands(): Promise<CopilotCommand[]> {
+    if (this.failCommandReads > 0) {
+      this.failCommandReads -= 1;
+      throw new Error("commands.list timed out");
+    }
     return this.commands;
   }
 

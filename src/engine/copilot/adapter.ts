@@ -151,6 +151,10 @@ class CopilotEngineSession implements EngineSession {
   private tasksStale = false;
   /** Every slash command Copilot can run, by lower-cased name and alias. */
   private commands = new Map<string, CopilotCommand>();
+  /** Set once Copilot's command list has been read at all. */
+  private commandsRead = false;
+  /** Set while the command list is re-read for the Command next in line. */
+  private rereadingCommands = false;
   private refreshingMenu: Promise<void> | undefined;
   private menuStale = false;
   /** Calls of the question tool, whose start and result are kept off the phone. */
@@ -193,6 +197,7 @@ class CopilotEngineSession implements EngineSession {
           this.commands = new Map(
             commands.flatMap((c) => [c.name, ...(c.aliases ?? [])].map((name) => [name.toLowerCase(), c] as const)),
           );
+          this.commandsRead = true;
           this.outbox.push({
             type: "menu",
             skills: skills.filter(isMenuSkill).map(skillInfo),
@@ -388,10 +393,24 @@ class CopilotEngineSession implements EngineSession {
     this.pendingQuestions.clear();
   }
 
-  private deliverNext(): void {
+  private deliverNext(commandsReread = false): void {
     if (this.turn || this.quelling || this.delivering || this.steerText !== undefined || this.dead || this.closed) return;
-    const text = this.waiting.shift();
+    if (this.rereadingCommands) return;
+    const text = this.waiting[0];
     if (text === undefined) return;
+    if (!this.commandsRead && !commandsReread && text.trim().startsWith("/")) {
+      // With no command list, a Local command -- `/compact`, Auto-compact's
+      // included -- would go to the model as plain text, which Copilot never
+      // runs as a command. The list is read again first; should that fail
+      // too, the Command goes on as it stands.
+      this.rereadingCommands = true;
+      void this.refreshMenu().then(() => {
+        this.rereadingCommands = false;
+        this.deliverNext(true);
+      });
+      return;
+    }
+    this.waiting.shift();
     const local = this.asLocalCommand(text);
     if (local) {
       this.runLocalCommand(local.name, local.input);
