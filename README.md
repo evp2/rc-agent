@@ -138,8 +138,12 @@ token, and ignores `cliPath`. A classic `ghp_` token is refused by Copilot.
 If Copilot isn't signed in, or policy forbids a session, `rc-agent run` stops
 before printing a phone URL, with Copilot's own message.
 
-Not yet on Copilot: Steering (a Command sent mid-Turn waits for the Turn to
-end), Questions, the Skills menu, and Fork.
+The "/" menu lists the project's Skills (from `.claude/skills` and
+`.github/skills`, plus your own `~/.copilot/skills`) and Copilot's own Local
+commands. There is no `/clear`, and your personal `~/.claude/skills`, written
+for Claude, are not handed to Copilot.
+
+Not yet on Copilot: Fork.
 
 ## Run
 
