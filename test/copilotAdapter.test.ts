@@ -1069,6 +1069,18 @@ test("CopilotEngine: the menu lists the project's Skills and Copilot's Local com
   await session.close();
 });
 
+test("CopilotEngine: the menu leaves out /clear even should Copilot list one", async () => {
+  const runtime = new MenuRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  await collect(it, (e) => e.type === "menu");
+  runtime.session.commands.push({ name: "clear", aliases: ["new"], description: "Clear the conversation", kind: "builtin" });
+  runtime.session.emit([event("commands.changed", {})]);
+  const [menu] = only(await collect(it, (e) => e.type === "menu"), "menu");
+  assert.deepEqual(menu.localCommands.map((c) => c.name), ["compact", "usage", "context"]);
+  await session.close();
+});
+
 test("CopilotEngine: the menu refreshes when Copilot's Skills or commands change", async () => {
   const runtime = new MenuRuntime();
   const session = await engineOn(runtime).open(openOptions());

@@ -210,7 +210,7 @@ class CopilotEngineSession implements EngineSession {
           this.outbox.push({
             type: "menu",
             skills: skills.filter(isMenuSkill).map(skillInfo),
-            localCommands: commands.filter((c) => c.kind === "builtin").map(commandInfo),
+            localCommands: commands.filter(isMenuCommand).map(commandInfo),
           });
         } catch (e) {
           console.error("Failed to list Copilot's Skills and commands:", (e as Error).message);
@@ -900,6 +900,17 @@ function isMenuSkill(skill: CopilotSkill): boolean {
 
 function skillInfo(skill: CopilotSkill): SkillInfo {
   return { name: skill.commandName ?? skill.name, description: skill.description, argumentHint: skill.argumentHint ?? "" };
+}
+
+/**
+ * A built-in command, other than `/clear`. On the phone, `/clear` means what
+ * Claude's does -- start the Conversation afresh -- and Copilot has nothing
+ * the connector can run to the same effect. Copilot lists no `/clear` to SDK
+ * clients today (measured on CLI 1.0.88); this keeps one off the menu should
+ * a later version start to.
+ */
+function isMenuCommand(command: CopilotCommand): boolean {
+  return command.kind === "builtin" && command.name.toLowerCase() !== "clear";
 }
 
 function commandInfo(command: CopilotCommand): SkillInfo {
