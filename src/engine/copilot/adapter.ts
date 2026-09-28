@@ -159,6 +159,15 @@ class CopilotEngineSession implements EngineSession {
   private menuStale = false;
   /** Calls of the question tool, whose start and result are kept off the phone. */
   private readonly questionCalls = new Set<string>();
+  /**
+   * Question-tool calls started whose question hasn't been put to the human
+   * yet, with the question each asks. Copilot's question handler isn't told
+   * which call it serves, and several can be asking at once, so a question
+   * is matched to its call by what it asks.
+   */
+  private readonly unaskedQuestionCalls = new Map<string, string | undefined>();
+  /** Questions matched to no call, each keyed apart all the same. */
+  private unmatchedQuestions = 0;
   /** One per Question waiting on the human; a Stop or close withdraws them all. */
   private readonly pendingQuestions = new Set<AbortController>();
   private dead = false;
@@ -298,14 +307,15 @@ class CopilotEngineSession implements EngineSession {
   /**
    * Copilot's question tool, put to the human. Its single question with
    * choices becomes a one-question Question, keyed by the tool call that
-   * asked it. Rejects once the Question is withdrawn, which fails the tool;
+   * asked it -- or, matched to none, by a key of its own rather than another
+   * call's. Rejects once the Question is withdrawn, which fails the tool;
    * by then the Turn it held has been stopped.
    */
   async ask(request: CopilotUserInputRequest): Promise<CopilotUserInputResponse> {
     if (this.closed || !this.turn) throw new Error("there is no Turn to ask a question in");
     const choices = request.choices ?? [];
     const question: EngineQuestion = {
-      toolUseId: [...this.questionCalls].at(-1) ?? `${QUESTION_TOOL}-${this.questionCalls.size}`,
+      toolUseId: this.questionCallAsking(request.question) ?? `${QUESTION_TOOL}-unmatched-${++this.unmatchedQuestions}`,
       questions: [{ question: request.question, options: choices.map((label) => ({ label })), multiSelect: false }],
     };
     const withdraw = new AbortController();
@@ -318,6 +328,16 @@ class CopilotEngineSession implements EngineSession {
     } finally {
       this.pendingQuestions.delete(withdraw);
     }
+  }
+
+  /** The earliest question-tool call still waiting to ask `question`, now spent. */
+  private questionCallAsking(question: string): string | undefined {
+    for (const [toolCallId, asks] of this.unaskedQuestionCalls) {
+      if (asks !== question) continue;
+      this.unaskedQuestionCalls.delete(toolCallId);
+      return toolCallId;
+    }
+    return undefined;
   }
 
   stop(): void {
@@ -593,6 +613,8 @@ class CopilotEngineSession implements EngineSession {
         this.runningTools.add(event.data.toolCallId);
         if (event.data.toolName === QUESTION_TOOL) {
           this.questionCalls.add(event.data.toolCallId);
+          const asks = (event.data.arguments as { question?: unknown } | undefined)?.question;
+          this.unaskedQuestionCalls.set(event.data.toolCallId, typeof asks === "string" ? asks : undefined);
           return;
         }
         this.outbox.push({
@@ -608,6 +630,7 @@ class CopilotEngineSession implements EngineSession {
         return;
       case "tool.execution_complete":
         this.runningTools.delete(event.data.toolCallId);
+        this.unaskedQuestionCalls.delete(event.data.toolCallId);
         if (this.cutAtToolBoundary && !this.runningTools.size) this.cut();
         // A result straggling in after its Turn ended belongs to no Turn.
         if (!this.turn || this.questionCalls.has(event.data.toolCallId)) return;
@@ -725,6 +748,7 @@ class CopilotEngineSession implements EngineSession {
     if (!turn) return;
     this.turn = undefined;
     this.runningTools.clear();
+    this.unaskedQuestionCalls.clear();
     // With no Turn left to cut, a queued Steer simply runs next.
     this.cutAtToolBoundary = false;
     this.outbox.push({

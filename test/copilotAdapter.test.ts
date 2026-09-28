@@ -874,6 +874,76 @@ test("CopilotEngine: a recorded question is put to the human as a one-question Q
   await session.close();
 });
 
+function askUserStarts(calls: [id: string, question: string][]): SessionEvent[] {
+  return calls.map(([toolCallId, question]) =>
+    event("tool.execution_start", { toolCallId, toolName: "ask_user", arguments: { question, choices: ["A", "B"] } }),
+  );
+}
+
+test("CopilotEngine: questions asked in parallel are each keyed to their own call", async () => {
+  // Measured: both calls start before Copilot asks either question, and the
+  // question handler is told nothing of which call it serves.
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s) => {
+      s.emit([
+        event("user.message", { content: "go", delivery: "idle" }),
+        event("assistant.turn_start", { turnId: "0" }),
+        ...askUserStarts([["call-fruit", "Pick a fruit"], ["call-color", "Pick a color"]]),
+      ]);
+      setImmediate(() => {
+        void s.ask({ question: "Pick a fruit", choices: ["A", "B"] });
+        void s.ask({ question: "Pick a color", choices: ["A", "B"] });
+      });
+    },
+  });
+  const asked: EngineQuestion[] = [];
+  const session = await engineOn(runtime).open({
+    projectDir: "/tmp/copilot-project",
+    onQuestion: (question) => (asked.push(question), new Promise<EngineAnswer>(() => undefined)),
+  });
+  session.send("ask me two things");
+  await until(() => asked.length === 2);
+  assert.deepEqual(
+    asked.map((q) => [q.toolUseId, q.questions[0].question]),
+    [["call-fruit", "Pick a fruit"], ["call-color", "Pick a color"]],
+  );
+  await session.close();
+});
+
+test("CopilotEngine: a question with no call of its own isn't keyed to an earlier question's call", async () => {
+  let turn = 0;
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s) => {
+      turn += 1;
+      s.emit([
+        event("user.message", { content: "go", delivery: "idle" }),
+        event("assistant.turn_start", { turnId: "0" }),
+        ...(turn === 1 ? askUserStarts([["call-first", "First?"]]) : []),
+      ]);
+      setImmediate(async () => {
+        await s.ask({ question: turn === 1 ? "First?" : "Second?", choices: ["A", "B"] });
+        s.emit([
+          ...(turn === 1 ? [event("tool.execution_complete", { toolCallId: "call-first", success: true, result: { content: "A" } })] : []),
+          event("assistant.idle", {}),
+        ]);
+      });
+    },
+  });
+  const asked: EngineQuestion[] = [];
+  const session = await engineOn(runtime).open({
+    projectDir: "/tmp/copilot-project",
+    onQuestion: async (question) => (asked.push(question), { answers: { [question.questions[0].question]: "A" } }),
+  });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await collect(it, (e) => e.type === "turn_ended");
+  session.send("second");
+  await collect(it, (e) => e.type === "turn_ended");
+  assert.equal(asked[0].toolUseId, "call-first");
+  assert.notEqual(asked[1].toolUseId, "call-first", "the first question's call is spent");
+  await session.close();
+});
+
 test("CopilotEngine: an answer typed instead of picked goes back to Copilot as freeform", async () => {
   const recording = loadFixture("question-hold-600s");
   const [asking] = splitAt(recording, (e) => e.type === "user_input.completed");
