@@ -171,6 +171,20 @@ rc-agent fork <name>      # new session in a sibling git worktree, seeded with t
 rc-agent run              # foreground, Ctrl-C to stop
 ```
 
+### Claude and Copilot in the same directory
+
+A directory can have one running connector per Engine: a Claude one and a
+Copilot one, each with its own session and phone URL. Give the second one its
+own config file and pass it to every command:
+
+```bash
+rc-agent start                                   # Claude, from ./connector.config.json
+rc-agent start --config ./connector.copilot.json # Copilot, same projectDir
+rc-agent stop --config ./connector.copilot.json  # stops only the Copilot one
+```
+
+Both agents edit the same files, so don't point them at the same work.
+
 ## How it works
 
 1. Registers a session with the relay (`POST /sessions`), which returns a

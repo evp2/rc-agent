@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 
-import { liveConnector } from "./state";
+import { ENGINE_KINDS, type EngineKind } from "./engine/types";
+import { isProcessAlive, readState } from "./state";
 
 /**
  * One entry in the Worktree list: a git worktree sharing the attached
@@ -12,6 +13,8 @@ import { liveConnector } from "./state";
  */
 export interface WorktreeEntry {
   path: string;
+  /** The Engine of the session this entry stands for; absent for a worktree with no session state at all. */
+  engine?: EngineKind;
   self: boolean;
   live: boolean;
   controlUrl?: string;
@@ -49,30 +52,42 @@ export function listWorktreePaths(sourceWorktreePath: string): string[] {
 }
 
 /**
- * The Worktree list for the connector's periodic report: every sibling
- * sharing `sourceWorktreePath`'s repository, live or not -- not limited to
- * direct Fork lineage. Liveness is decided exactly the way {@link
- * liveConnector} already decides it for the attached connector on itself: a
- * local pid check against that sibling's own state file, never corroborated
- * against the relay's view of the session. Every sibling is on this same
- * machine, so holding siblings to a stricter check than the connector applies
- * to itself buys nothing: a session the relay Ended while its connector is
- * still up shows as live and fails softly when tapped.
+ * The Worktree list for the connector's periodic report: every session in
+ * every sibling sharing `sourceWorktreePath`'s repository, live or not -- not
+ * limited to direct Fork lineage. A worktree gets one entry per Engine that
+ * has state there, or a single Engine-less entry when none has.
  *
- * The self entry is looked up by `sourceWorktreePath` itself, not by git's
- * (possibly realpath-canonicalized) rendering of it, since that is the exact
- * path this connector's own state file is keyed on.
+ * Liveness is a local pid check against each session's own state file, never
+ * corroborated against the relay's view of the session. Every sibling is on
+ * this same machine, so holding siblings to a stricter check than the
+ * connector applies to itself buys nothing: a session the relay Ended while
+ * its connector is still up shows as live and fails softly when tapped.
+ *
+ * The self entry is this connector's own Engine in `sourceWorktreePath`,
+ * looked up by that path itself rather than git's (possibly
+ * realpath-canonicalized) rendering of it, since that is the exact path this
+ * connector's own state file is keyed on.
  */
-export function computeWorktreeList(sourceWorktreePath: string): WorktreeEntry[] {
+export function computeWorktreeList(sourceWorktreePath: string, selfEngine: EngineKind): WorktreeEntry[] {
   const selfCanonical = canonical(sourceWorktreePath);
-  return listWorktreePaths(sourceWorktreePath).map((path) => {
-    const self = canonical(path) === selfCanonical;
-    const state = self ? liveConnector(sourceWorktreePath) : liveConnector(path);
-    return {
-      path,
-      self,
-      live: state !== undefined,
-      ...(!self && state?.controlUrl ? { controlUrl: state.controlUrl } : {}),
-    };
+  return listWorktreePaths(sourceWorktreePath).flatMap((path): WorktreeEntry[] => {
+    const isSelfPath = canonical(path) === selfCanonical;
+    const dir = isSelfPath ? sourceWorktreePath : path;
+    const sessions = ENGINE_KINDS.flatMap((engine) => {
+      const state = readState(dir, engine);
+      return state ? [{ engine, state }] : [];
+    });
+    if (sessions.length === 0) return [{ path, self: isSelfPath, live: false }];
+    return sessions.map(({ engine, state }) => {
+      const self = isSelfPath && engine === selfEngine;
+      const live = isProcessAlive(state.pid);
+      return {
+        path,
+        engine,
+        self,
+        live,
+        ...(!self && live && state.controlUrl ? { controlUrl: state.controlUrl } : {}),
+      };
+    });
   });
 }

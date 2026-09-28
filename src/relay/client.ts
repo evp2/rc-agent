@@ -386,6 +386,7 @@ export class RelayClient {
           : {}),
         worktrees: worktrees.map((w) => ({
           path: w.path,
+          ...(w.engine ? { engine: w.engine } : {}),
           self: w.self,
           live: w.live,
           ...(w.controlUrl ? { control_url: w.controlUrl } : {}),

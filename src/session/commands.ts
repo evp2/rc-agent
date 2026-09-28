@@ -26,7 +26,7 @@ export async function publishSkills(
   localCommands: SkillInfo[],
 ): Promise<void> {
   try {
-    const worktrees = computeWorktreeList(ctx.config.projectDir);
+    const worktrees = computeWorktreeList(ctx.config.projectDir, ctx.engine.kind);
     const asJson = JSON.stringify([skills, localCommands, worktrees]);
     if (asJson === ctx.lastSkillsJson) return;
     await ctx.client.putSkills(

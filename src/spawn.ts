@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 
-import type { ConnectorConfig } from "./config";
+import { engineKindFor, type ConnectorConfig } from "./config";
 import { ensureStateDir, isProcessAlive, logPath, readState, type ConnectorState } from "./state";
 
 // How long a spawned detached process is given to publish its own session to
@@ -52,8 +52,9 @@ export async function spawnDetached(
     );
   }
 
+  const engine = engineKindFor(config.provider);
   ensureStateDir();
-  const log = logPath(config.projectDir);
+  const log = logPath(config.projectDir, engine);
   const logFd = openSync(log, "a");
   const startedAt = Date.now();
 
@@ -71,7 +72,7 @@ export async function spawnDetached(
 
   const deadline = Date.now() + SPAWN_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const state = readState(config.projectDir);
+    const state = readState(config.projectDir, engine);
     if (state && state.pid === child.pid && Date.parse(state.startedAt) >= startedAt - 1000) {
       return state;
     }

@@ -131,7 +131,7 @@ async function acquireSession(config: ConnectorConfig, engine: EngineKind): Prom
   controlUrl: string | undefined;
   resumed: ConnectorState | undefined;
 }> {
-  const previous = readState(config.projectDir);
+  const previous = readState(config.projectDir, engine);
 
   if (isReusableState(previous, config, engine)) {
     try {

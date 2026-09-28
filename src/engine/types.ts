@@ -1,7 +1,8 @@
 import type { SkillInfo } from "../relay/client";
 
 /** Which agent SDK is behind an {@link Engine}. */
-export type EngineKind = "claude" | "copilot";
+export const ENGINE_KINDS = ["claude", "copilot"] as const;
+export type EngineKind = (typeof ENGINE_KINDS)[number];
 
 /**
  * The SDK-neutral seam the session code drives. Everything the connector

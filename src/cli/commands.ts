@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 
-import type { ConnectorConfig } from "../config";
+import { engineKindFor, type ConnectorConfig } from "../config";
 import { createEngine } from "../engine/create";
+import { ENGINE_KINDS, type EngineKind } from "../engine/types";
 import { runFork } from "../fork";
 import { printPairingQrCode } from "../qr";
 import { RelayClient, SessionEndedError } from "../relay/client";
@@ -40,15 +41,30 @@ function printConnectionReport(state: {
   printShareUrl(state.staticUrl);
 }
 
+const ENGINE_LABEL: Record<EngineKind, string> = { claude: "Claude", copilot: "Copilot" };
+
+/** Mentions a connector on the other Engine working in the same worktree, which the human has to keep off this one's files. */
+function noteOtherEngine(config: ConnectorConfig): void {
+  const own = engineKindFor(config.provider);
+  for (const other of ENGINE_KINDS.filter((kind) => kind !== own)) {
+    const live = liveConnector(config.projectDir, other);
+    if (live) {
+      console.log(`Note: a ${ENGINE_LABEL[other]} connector is also running in ${config.projectDir} (pid ${live.pid}).\n`);
+    }
+  }
+}
+
 export async function runForeground(config: ConnectorConfig): Promise<void> {
-  const existing = liveConnector(config.projectDir);
+  const engine = engineKindFor(config.provider);
+  const existing = liveConnector(config.projectDir, engine);
   if (existing && existing.pid !== process.pid) {
     throw new Error(
-      `A connector is already running for ${config.projectDir} (pid ${existing.pid}).\n` +
+      `A ${ENGINE_LABEL[engine]} connector is already running for ${config.projectDir} (pid ${existing.pid}).\n` +
         `Stop it with 'rc-agent stop' first, or check it with 'rc-agent status'.`,
     );
   }
 
+  noteOtherEngine(config);
   const handle = await runConnector(config);
   console.log(
     `Session ${handle.sessionId} ${handle.resumed ? "resumed" : "created"} for ${config.projectDir}`,
@@ -69,22 +85,24 @@ export async function runForeground(config: ConnectorConfig): Promise<void> {
  * parent cannot scrape it for the phone URL the way a foreground run prints it.
  */
 export async function start(config: ConnectorConfig, configPath: string): Promise<void> {
-  const existing = liveConnector(config.projectDir);
+  const engine = engineKindFor(config.provider);
+  const existing = liveConnector(config.projectDir, engine);
   if (existing) {
-    console.log(`Already running for ${config.projectDir} (pid ${existing.pid}).`);
+    console.log(`${ENGINE_LABEL[engine]} is already running for ${config.projectDir} (pid ${existing.pid}).`);
     printConnectionReport(existing);
     return;
   }
 
+  noteOtherEngine(config);
   let state;
   try {
     state = await spawnDetached(config, configPath);
   } catch (e) {
-    const log = logPath(config.projectDir);
+    const log = logPath(config.projectDir, engine);
     throw new Error(`${(e as Error).message}\n\n${tailLog(log, 20)}`);
   }
   console.log(`Connector started for ${config.projectDir} (pid ${state.pid}).`);
-  console.log(`Logging to ${logPath(config.projectDir)}`);
+  console.log(`Logging to ${logPath(config.projectDir, engine)}`);
   printConnectionReport(state);
 }
 
@@ -97,18 +115,17 @@ export async function fork(
   name: string,
   fromRef: string | undefined,
 ): Promise<void> {
-  const sourceState = readState(config.projectDir);
   const engine = createEngine(config);
-  // Only a state file this Engine wrote names a Conversation it can carry.
-  const conversationId = sourceState?.engine === engine.kind ? sourceState.conversationId : undefined;
+  const conversationId = readState(config.projectDir, engine.kind)?.conversationId;
   const state = await runFork(config, engine, conversationId, name, fromRef);
   console.log(`Connector started for ${state.projectDir} (pid ${state.pid}).`);
-  console.log(`Logging to ${logPath(state.projectDir)}`);
+  console.log(`Logging to ${logPath(state.projectDir, state.engine)}`);
   printConnectionReport(state);
 }
 
 export async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
-  const state = readState(config.projectDir);
+  const engine = engineKindFor(config.provider);
+  const state = readState(config.projectDir, engine);
   if (!state) {
     console.log(`No connector state for ${config.projectDir}. Nothing to stop.`);
     return;
@@ -159,11 +176,13 @@ export async function stop(config: ConnectorConfig, end: boolean): Promise<void>
  * may be perfectly valid with no process running at all.
  */
 export async function status(config: ConnectorConfig): Promise<void> {
-  const state = readState(config.projectDir);
+  const engine = engineKindFor(config.provider);
+  const state = readState(config.projectDir, engine);
   console.log(`version       ${CONNECTOR_VERSION}`);
   console.log(`project dir   ${config.projectDir}`);
-  console.log(`state file    ${statePath(config.projectDir)}`);
-  console.log(`log file      ${logPath(config.projectDir)}`);
+  console.log(`engine        ${ENGINE_LABEL[engine]}`);
+  console.log(`state file    ${statePath(config.projectDir, engine)}`);
+  console.log(`log file      ${logPath(config.projectDir, engine)}`);
 
   if (!state) {
     console.log(`process       not running (no state)`);
@@ -219,7 +238,7 @@ export async function status(config: ConnectorConfig): Promise<void> {
 
   if (!alive) {
     console.log(`\nStart it with 'rc-agent start'.`);
-    const tail = tailLog(logPath(config.projectDir), 15);
+    const tail = tailLog(logPath(config.projectDir, engine), 15);
     if (tail) console.log(`\nLast log lines:\n${tail}`);
   }
 }
@@ -237,7 +256,8 @@ export async function status(config: ConnectorConfig): Promise<void> {
  * to someone else to watch and weigh in on.
  */
 export async function qr(config: ConnectorConfig, showShare: boolean): Promise<void> {
-  const state = readState(config.projectDir);
+  const engine = engineKindFor(config.provider);
+  const state = readState(config.projectDir, engine);
   if (!state) {
     throw new Error(
       `No session for ${config.projectDir}. Start one with 'rc-agent start'.`,

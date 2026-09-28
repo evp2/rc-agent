@@ -40,7 +40,7 @@ const baseState: Omit<ConnectorState, "projectDir" | "pid"> = {
 test("a worktree with no siblings reports a list containing only its own self entry", () => {
   const repo = initRepo();
 
-  const list = computeWorktreeList(repo);
+  const list = computeWorktreeList(repo, "claude");
 
   assert.equal(list.length, 1);
   assert.equal(list[0].self, true);
@@ -57,7 +57,7 @@ test("a sibling with a live connector process is reported live and carries its c
     controlUrl: "https://example.test/p/1234567890",
   });
 
-  const list = computeWorktreeList(repo);
+  const list = computeWorktreeList(repo, "claude");
 
   const entry = list.find((e) => !e.self);
   assert.ok(entry);
@@ -69,12 +69,13 @@ test("a sibling with no state file is reported not live and carries no controlUr
   const repo = initRepo();
   addSibling(repo, "feature-b");
 
-  const list = computeWorktreeList(repo);
+  const list = computeWorktreeList(repo, "claude");
 
   const entry = list.find((e) => !e.self);
   assert.ok(entry);
   assert.equal(entry!.live, false);
   assert.equal(entry!.controlUrl, undefined);
+  assert.equal(entry!.engine, undefined);
 });
 
 test("a sibling with a dead pid is reported not live and carries no controlUrl", () => {
@@ -89,7 +90,7 @@ test("a sibling with a dead pid is reported not live and carries no controlUrl",
     controlUrl: "https://example.test/p/0000000000",
   });
 
-  const list = computeWorktreeList(repo);
+  const list = computeWorktreeList(repo, "claude");
 
   const entry = list.find((e) => !e.self);
   assert.ok(entry);
@@ -107,7 +108,7 @@ test("the currently attached worktree's own entry is marked self and carries no 
     controlUrl: "https://example.test/p/1111111111",
   });
 
-  const list = computeWorktreeList(repo);
+  const list = computeWorktreeList(repo, "claude");
 
   const self = list.find((e) => e.self);
   assert.ok(self);
@@ -123,8 +124,44 @@ test("computeWorktreeList reports every sibling, not just direct Fork lineage", 
   // feature-b's sibling list (queried from a different worktree of the same
   // repository) still includes feature-a, even though neither forked the
   // other directly.
-  const list = computeWorktreeList(a);
+  const list = computeWorktreeList(a, "claude");
 
   assert.equal(list.length, 3);
   assert.ok(list.some((e) => e.path.endsWith(".feature-b")));
+});
+
+test("a worktree holding a Claude and a Copilot session reports one entry per session, each with its Engine", () => {
+  const repo = initRepo();
+  const sibling = addSibling(repo, "both");
+  writeState({ ...baseState, projectDir: sibling, pid: process.pid, engine: "claude" });
+  writeState({ ...baseState, projectDir: sibling, pid: 0, engine: "copilot" });
+
+  const entries = computeWorktreeList(repo, "claude").filter((e) => e.path === sibling);
+
+  assert.deepEqual(
+    entries.map((e) => [e.engine, e.live]),
+    [["claude", true], ["copilot", false]],
+  );
+});
+
+test("the other Engine's live session in the attached worktree is a switchable entry, not self", () => {
+  const repo = initRepo();
+  writeState({ ...baseState, projectDir: repo, pid: process.pid, engine: "claude" });
+  writeState({
+    ...baseState,
+    projectDir: repo,
+    pid: process.pid,
+    engine: "copilot",
+    controlUrl: "https://example.test/p/2222222222",
+  });
+
+  const list = computeWorktreeList(repo, "claude");
+
+  assert.equal(list.length, 2);
+  const self = list.find((e) => e.self);
+  assert.equal(self?.engine, "claude");
+  const other = list.find((e) => !e.self);
+  assert.equal(other?.engine, "copilot");
+  assert.equal(other?.live, true);
+  assert.equal(other?.controlUrl, "https://example.test/p/2222222222");
 });

@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -108,20 +109,29 @@ export interface ConnectorState {
 }
 
 /**
- * State files are keyed by project directory rather than by pid so that a
- * restarted connector finds its own predecessor's session. The hash keeps the
- * name short and filesystem-safe while staying stable across restarts.
+ * Keyed by project directory and Engine rather than by pid, so a restarted
+ * connector finds its predecessor's session and two Engines sharing a
+ * worktree never collide.
  */
-export function stateKey(projectDir: string): string {
-  return createHash("sha256").update(projectDir).digest("hex").slice(0, 12);
+export function stateKey(projectDir: string, engine: EngineKind): string {
+  return shortHash(`${projectDir}\0${engine}`);
 }
 
-export function statePath(projectDir: string): string {
-  return join(STATE_DIR, `${stateKey(projectDir)}.json`);
+function shortHash(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 12);
 }
 
-export function logPath(projectDir: string): string {
-  return join(STATE_DIR, `${stateKey(projectDir)}.log`);
+export function statePath(projectDir: string, engine: EngineKind): string {
+  return join(STATE_DIR, `${stateKey(projectDir, engine)}.json`);
+}
+
+export function logPath(projectDir: string, engine: EngineKind): string {
+  return join(STATE_DIR, `${stateKey(projectDir, engine)}.log`);
+}
+
+/** Where a connector from before per-Engine state kept a worktree's state. */
+function worktreeOnlyStatePath(projectDir: string): string {
+  return join(STATE_DIR, `${shortHash(projectDir)}.json`);
 }
 
 export function ensureStateDir(): void {
@@ -134,9 +144,10 @@ export function ensureStateDir(): void {
  * is never fatal: the connector treats it as "no previous session" and rotates,
  * which costs a re-pair but always starts.
  */
-export function readState(projectDir: string): ConnectorState | undefined {
-  const path = statePath(projectDir);
-  if (!existsSync(path)) return undefined;
+export function readState(projectDir: string, engine: EngineKind): ConnectorState | undefined {
+  const perEngine = statePath(projectDir, engine);
+  const path = existsSync(perEngine) ? perEngine : worktreeOnlyStateFor(projectDir, engine);
+  if (!path) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(path, "utf-8")) as LegacyConnectorState;
     if (parsed.version !== STATE_VERSION) return undefined;
@@ -150,6 +161,18 @@ export function readState(projectDir: string): ConnectorState | undefined {
       conversationId: rest.conversationId ?? sdkSessionId,
       engine: rest.engine ?? "claude",
     };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read in place, never moved, so listing siblings can't pull a file out from under an old-version connector. */
+function worktreeOnlyStateFor(projectDir: string, engine: EngineKind): string | undefined {
+  const path = worktreeOnlyStatePath(projectDir);
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as LegacyConnectorState;
+    return (parsed.engine ?? "claude") === engine ? path : undefined;
   } catch {
     return undefined;
   }
@@ -187,16 +210,18 @@ export function isReusableState(
  */
 export function writeState(state: ConnectorState): void {
   ensureStateDir();
-  const path = statePath(state.projectDir);
+  const path = statePath(state.projectDir, state.engine);
   const tmp = `${path}.${process.pid}.tmp`;
   const body = JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2);
   writeFileSync(tmp, `${body}\n`, { mode: 0o600 });
   chmodSync(tmp, 0o600);
   renameSync(tmp, path);
+  const worktreeOnly = worktreeOnlyStateFor(state.projectDir, state.engine);
+  if (worktreeOnly) rmSync(worktreeOnly, { force: true });
 }
 
-export function clearState(projectDir: string): void {
-  const path = statePath(projectDir);
+export function clearState(projectDir: string, engine: EngineKind): void {
+  const path = statePath(projectDir, engine);
   if (existsSync(path)) unlinkSync(path);
 }
 
@@ -216,15 +241,15 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 /**
- * The live connector for a project directory, if there is one.
+ * The live connector on one Engine for a project directory, if there is one.
  *
  * A pid alone can be reused by an unrelated process after a hard reboot, so
  * callers that act on this (`rc-agent stop`) should treat it as advisory. `rc-agent
  * status` corroborates it against the relay's own view of when it last heard
  * from the connector, which no stale pid can fake.
  */
-export function liveConnector(projectDir: string): ConnectorState | undefined {
-  const state = readState(projectDir);
+export function liveConnector(projectDir: string, engine: EngineKind): ConnectorState | undefined {
+  const state = readState(projectDir, engine);
   if (!state) return undefined;
   return isProcessAlive(state.pid) ? state : undefined;
 }
