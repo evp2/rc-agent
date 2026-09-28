@@ -143,6 +143,14 @@ The "/" menu lists the project's Skills (from `.claude/skills` and
 commands. There is no `/clear`, and your personal `~/.claude/skills`, written
 for Claude, are not handed to Copilot.
 
+Detached shells and background agents are Background tasks: each gets a card
+and a place in the tray, and Kill ends one. Foreground shells, which Copilot
+also lists, never show. When a detached shell finishes after the Turn that
+started it, Copilot goes back to work on its own; the phone says "working
+again: *<shell>* finished" and offers the brake, without a push. Stop, and
+stopping the connector, end any detached shells still running, since Copilot
+would otherwise leave them behind.
+
 Not yet on Copilot: Fork.
 
 ## Run
