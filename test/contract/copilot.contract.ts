@@ -343,3 +343,114 @@ test("CopilotEngine: the menu lists the project's Skills and Local commands, and
   assert.match(status[0], /Usage/);
   rmSync(dir, { recursive: true, force: true });
 });
+
+type TaskStarted = Extract<EngineEvent, { type: "task_started" }>;
+type TaskSettled = Extract<EngineEvent, { type: "task_settled" }>;
+
+function detachedShell(command: string): string {
+  return `Use the bash tool with mode "async" and detach true to start \`${command}\` as a detached shell, and do not wait for it.`;
+}
+
+/** Reads everything the session emits into `into` until the stream ends. */
+function drain(it: AsyncIterator<EngineEvent>, into: EngineEvent[]): Promise<void> {
+  return (async () => {
+    for (;;) {
+      const next = await it.next();
+      if (next.done) return;
+      into.push(next.value);
+    }
+  })();
+}
+
+test("CopilotEngine: a detached shell is a Background task anchored to its tool call, and finishing wakes the agent into an Engine-started Turn", async (t) => {
+  if (!(await signedIn())) return t.skip(SKIP);
+  const dir = workDir();
+  const session = await openOn(loginEngine(), dir);
+  const it = session.events[Symbol.asyncIterator]();
+  session.send(
+    `${detachedShell(`sleep 10 && echo finished > ${join(dir, "done.txt")}`)} ` +
+      `Also, with mode "sync", run \`echo foreground\`. Then reply with just STARTED.`,
+  );
+  const first = await collect(it, (e) => e.type === "turn_ended");
+  const second = await collect(it, (e) => e.type === "turn_ended", 90_000);
+  await session.close();
+  const events = [...first, ...second];
+
+  const detachedCall = events.find(
+    (e) => e.type === "tool_use" && (e.input as { detach?: boolean }).detach === true,
+  ) as Extract<EngineEvent, { type: "tool_use" }> | undefined;
+  assert.ok(detachedCall, "the model started a Copilot detached shell, which is what this test is about");
+  const started = events.filter((e) => e.type === "task_started") as TaskStarted[];
+  assert.equal(started.length, 1, `one Background task; the foreground shell isn't one: ${JSON.stringify(started)}`);
+  assert.equal(started[0].toolUseId, detachedCall.toolUseId, "anchored to the tool call that started it");
+  assert.equal(started[0].taskType, "shell");
+
+  const settledAt = events.findIndex((e) => e.type === "task_settled");
+  const settled = events[settledAt] as TaskSettled;
+  assert.equal(settled.taskId, started[0].taskId);
+  assert.equal(settled.status, "completed");
+  const wakeAt = events.findIndex((e) => e.type === "turn_started" && e.cause === "engine");
+  assert.ok(wakeAt > settledAt, "settled before the Turn it woke the agent into started");
+  assert.deepEqual(
+    second.filter((e) => e.type === "turn_started"),
+    [{ type: "turn_started", cause: "engine" }],
+  );
+  assert.equal((second.at(-1) as Extract<EngineEvent, { type: "turn_ended" }>).outcome, "success");
+  const lastSet = events.filter((e) => e.type === "tasks_changed").at(-1) as Extract<EngineEvent, { type: "tasks_changed" }>;
+  assert.deepEqual(lastSet.tasks, [], "the tray is empty again");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("CopilotEngine: Kill ends a detached shell while the Turn keeps running, and wakes nothing", async (t) => {
+  if (!(await signedIn())) return t.skip(SKIP);
+  const dir = workDir();
+  const marker = join(dir, "killed-finished.txt");
+  const session = await openOn(loginEngine(), dir);
+  const it = session.events[Symbol.asyncIterator]();
+  session.send(
+    `${detachedShell(`sleep 20 && echo finished > ${marker}`)} ` +
+      `Then, with mode "sync", run \`sleep 15\` and wait for it. Then reply with just DONE.`,
+  );
+  const before = await collect(it, (e) => e.type === "task_started");
+  const task = before.at(-1) as TaskStarted;
+  await session.killTask(task.taskId);
+  const events = await collect(it, (e) => e.type === "turn_ended", 60_000);
+  const settled = events.filter((e) => e.type === "task_settled") as TaskSettled[];
+  assert.deepEqual(
+    settled.map((e) => [e.taskId, e.status]),
+    [[task.taskId, "stopped"]],
+  );
+  assert.ok(
+    events.findIndex((e) => e.type === "task_settled") < events.findIndex((e) => e.type === "turn_ended"),
+    "settled while the Turn was still running",
+  );
+  assert.equal((events.at(-1) as Extract<EngineEvent, { type: "turn_ended" }>).outcome, "success", "the Turn kept running");
+
+  const after: EngineEvent[] = [];
+  const reading = drain(it, after);
+  await new Promise((r) => setTimeout(r, 25_000));
+  await session.close();
+  await reading;
+  assert.equal(existsSync(marker), false, "the killed shell never finished");
+  assert.deepEqual(after.filter((e) => e.type === "turn_started"), [], "and it woke nothing");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("CopilotEngine: closing ends a detached shell that would outlive the runtime, without reporting it settled", async (t) => {
+  if (!(await signedIn())) return t.skip(SKIP);
+  const dir = workDir();
+  const marker = join(dir, "outlived.txt");
+  const session = await openOn(loginEngine(), dir);
+  const it = session.events[Symbol.asyncIterator]();
+  session.send(`${detachedShell(`sleep 15 && echo finished > ${marker}`)} Then reply with just STARTED.`);
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  if (!events.some((e) => e.type === "task_started")) events.push(...(await collect(it, (e) => e.type === "task_started")));
+  const rest: EngineEvent[] = [];
+  const reading = drain(it, rest);
+  await session.close();
+  await reading;
+  assert.deepEqual(rest.filter((e) => e.type === "task_settled"), [], "left for the next start to report interrupted");
+  await new Promise((r) => setTimeout(r, 20_000));
+  assert.equal(existsSync(marker), false, "the detached shell did not outlive the connector");
+  rmSync(dir, { recursive: true, force: true });
+});
