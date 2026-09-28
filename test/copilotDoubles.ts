@@ -5,10 +5,15 @@ import { fileURLToPath } from "node:url";
 import type { SessionEvent } from "@github/copilot-sdk";
 
 import type {
+  CopilotCommand,
+  CopilotCommandResult,
   CopilotRuntime,
   CopilotSessionHandle,
   CopilotSessionOptions,
+  CopilotSkill,
   CopilotTask,
+  CopilotUserInputRequest,
+  CopilotUserInputResponse,
 } from "../src/engine/copilot/runtime.ts";
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "copilot");
@@ -66,6 +71,10 @@ export interface FakeSessionScript {
   /** Called on each `send()`, with how many sends came before it. */
   onSend?: (session: FakeCopilotSession, prompt: string, index: number) => void;
   onAbort?: (session: FakeCopilotSession) => void;
+  /** Called on each `interruptMainTurn()`; its return is whether a Turn was interrupted (default true). */
+  onInterrupt?: (session: FakeCopilotSession) => boolean | void;
+  /** Answers `invokeCommand()`. Absent means every command is refused. */
+  onInvoke?: (session: FakeCopilotSession, name: string, input: string | undefined) => Promise<CopilotCommandResult>;
   /** Rejects `send()` when set. */
   sendError?: Error;
 }
@@ -73,9 +82,13 @@ export interface FakeSessionScript {
 export class FakeCopilotSession implements CopilotSessionHandle {
   readonly sent: string[] = [];
   readonly cancelled: string[] = [];
+  readonly invoked: { name: string; input?: string }[] = [];
   aborts = 0;
+  interrupts = 0;
   disconnected = false;
   tasks: CopilotTask[] = [];
+  commands: CopilotCommand[] = [];
+  skills: CopilotSkill[] = [];
   private readonly handlers = new Set<(event: SessionEvent) => void>();
   private disconnectHandler: (() => void) | undefined;
 
@@ -116,6 +129,30 @@ export class FakeCopilotSession implements CopilotSessionHandle {
   async abort(): Promise<void> {
     this.aborts += 1;
     this.script.onAbort?.(this);
+  }
+
+  /** Asks the question the way Copilot's `ask_user` tool does: through the handler the adapter gave at open. */
+  ask(request: CopilotUserInputRequest): Promise<CopilotUserInputResponse> {
+    return this.options.onUserInputRequest(request);
+  }
+
+  async interruptMainTurn(): Promise<boolean> {
+    this.interrupts += 1;
+    return this.script.onInterrupt?.(this) ?? true;
+  }
+
+  async listCommands(): Promise<CopilotCommand[]> {
+    return this.commands;
+  }
+
+  async listSkills(): Promise<CopilotSkill[]> {
+    return this.skills;
+  }
+
+  async invokeCommand(name: string, input?: string): Promise<CopilotCommandResult> {
+    this.invoked.push({ name, ...(input !== undefined ? { input } : {}) });
+    if (!this.script.onInvoke) throw new Error(`Unknown command: /${name}`);
+    return this.script.onInvoke(this, name, input);
   }
 
   async listTasks(): Promise<CopilotTask[]> {

@@ -28,11 +28,63 @@ export interface CopilotTask {
   pid?: number;
 }
 
+/** One Local command or Skill command as Copilot lists it. */
+export interface CopilotCommand {
+  /** Without the leading slash. */
+  name: string;
+  aliases?: string[];
+  description: string;
+  /** `builtin` runs inside Copilot; `skill` is backed by a Skill; `client` is registered by an SDK client. */
+  kind: "builtin" | "skill" | "client" | string;
+  input?: { hint: string };
+}
+
+/** One Skill as Copilot lists it. */
+export interface CopilotSkill {
+  name: string;
+  /** The slash command that invokes it, without the slash, when it differs from `name`. */
+  commandName?: string;
+  description: string;
+  /** Where Copilot found it: `project`, `inherited`, `personal-copilot`, `builtin`, ... */
+  source: string;
+  userInvocable: boolean;
+  enabled: boolean;
+  path?: string;
+  argumentHint?: string;
+}
+
+/**
+ * What running a slash command returned. `text` is output to show; `agent-prompt`
+ * is a prompt the client is to send the agent next; the rest are outcomes a
+ * terminal UI would act on.
+ */
+export type CopilotCommandResult =
+  | { kind: "text"; text: string; markdown?: boolean }
+  | { kind: "agent-prompt"; prompt: string; displayPrompt?: string; notice?: string }
+  | { kind: "completed"; message?: string }
+  | { kind: "add-timeline-entry"; entry: { text: string } }
+  | { kind: "select-subcommand"; command: string; title: string; options: { name: string; description?: string }[] }
+  | { kind: "show-dialog" | "set-model" | "set-plan-model" };
+
+/** Copilot's single question with optional choices, asked through its `ask_user` tool. */
+export interface CopilotUserInputRequest {
+  question: string;
+  choices?: string[];
+  allowFreeform?: boolean;
+}
+
+export interface CopilotUserInputResponse {
+  answer: string;
+  wasFreeform: boolean;
+}
+
 /** What the adapter hands Copilot when it opens or resumes a session. */
 export interface CopilotSessionOptions {
   model: string;
   workingDirectory: string;
   onPermissionRequest: PermissionHandler;
+  /** Holds the Turn until the human answers. Rejecting fails the question tool. */
+  onUserInputRequest: (request: CopilotUserInputRequest) => Promise<CopilotUserInputResponse>;
 }
 
 /**
@@ -45,8 +97,18 @@ export interface CopilotSessionHandle {
   on(handler: (event: SessionEvent) => void): () => void;
   /** Called once if the runtime goes away underneath the session. */
   onDisconnected(handler: () => void): void;
+  /** Hands Copilot a prompt; while a Turn runs, it waits in Copilot's own queue. */
   send(prompt: string): Promise<void>;
   abort(): Promise<void>;
+  /**
+   * Ends the running Turn and starts the next queued prompt in its place.
+   * Resolves false when there was no Turn to interrupt.
+   */
+  interruptMainTurn(): Promise<boolean>;
+  listCommands(): Promise<CopilotCommand[]>;
+  listSkills(): Promise<CopilotSkill[]>;
+  /** Runs a slash command. Rejects with Copilot's message, such as a usage line, when it refuses. */
+  invokeCommand(name: string, input?: string): Promise<CopilotCommandResult>;
   listTasks(): Promise<CopilotTask[]>;
   cancelTask(id: string): Promise<void>;
   disconnect(): Promise<void>;
@@ -130,14 +192,22 @@ class SdkCopilotRuntime implements CopilotRuntime {
   }
 }
 
-function sdkSessionConfig(options: CopilotSessionOptions) {
+export function sdkSessionConfig(options: CopilotSessionOptions) {
   return {
     clientName: "rc-agent",
     model: options.model,
     workingDirectory: options.workingDirectory,
     onPermissionRequest: options.onPermissionRequest,
     // Loads the project's own Copilot configuration, its Skills included.
+    // Measured on CLI 1.0.88: that brings in the project's `.claude/skills`
+    // and `.github/skills`, and `~/.copilot/skills`, but not `~/.claude/skills`.
     enableConfigDiscovery: true,
+    // The single question with choices, which the phone's picker shows.
+    askUserVariant: "legacy" as const,
+    onUserInputRequest: options.onUserInputRequest,
+    // JSON-schema forms have no picker on the phone. Declined, so whatever
+    // asked can carry on without an answer rather than wait for one.
+    onElicitationRequest: () => ({ action: "decline" as const }),
   };
 }
 
@@ -167,6 +237,26 @@ class SdkCopilotSession implements CopilotSessionHandle {
 
   async abort(): Promise<void> {
     await this.session.abort();
+  }
+
+  async interruptMainTurn(): Promise<boolean> {
+    // Flushing keeps the prompt queued behind the Turn, which then runs next.
+    const { interrupted } = await this.session.rpc.interruptMainTurn({ flushQueued: true });
+    return interrupted;
+  }
+
+  async listCommands(): Promise<CopilotCommand[]> {
+    const { commands } = await this.session.rpc.commands.list();
+    return commands;
+  }
+
+  async listSkills(): Promise<CopilotSkill[]> {
+    const { skills } = await this.session.rpc.skills.list();
+    return skills;
+  }
+
+  async invokeCommand(name: string, input?: string): Promise<CopilotCommandResult> {
+    return (await this.session.rpc.commands.invoke({ name, ...(input ? { input } : {}) })) as CopilotCommandResult;
   }
 
   async listTasks(): Promise<CopilotTask[]> {

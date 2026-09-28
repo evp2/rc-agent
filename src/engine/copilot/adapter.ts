@@ -1,15 +1,24 @@
 import type { PermissionHandler, SessionEvent } from "@github/copilot-sdk";
 
+import { homedir } from "node:os";
+import { join, sep } from "node:path";
+
 import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
 import type { CopilotProviderConfig } from "../../provider";
-import type { Engine, EngineEvent, EngineSession, EngineUsage, OpenOptions } from "../types";
+import type { SkillInfo } from "../../relay/client";
+import type { Engine, EngineEvent, EngineQuestion, EngineSession, EngineUsage, OpenOptions } from "../types";
 import {
   startCopilotRuntime,
+  type CopilotCommand,
+  type CopilotCommandResult,
   type CopilotRuntime,
   type CopilotSessionHandle,
   type CopilotSessionOptions,
+  type CopilotSkill,
   type CopilotTask,
+  type CopilotUserInputRequest,
+  type CopilotUserInputResponse,
 } from "./runtime";
 
 export interface CopilotEngineDeps {
@@ -39,14 +48,34 @@ export const approveEverything: PermissionHandler = (request) => {
 
 type TurnOutcome = Extract<EngineEvent, { type: "turn_ended" }>["outcome"];
 
+/** A Command or Steer that never ran, to be reported once the running Turn has ended. */
+interface Unrun {
+  cause: "command" | "steer";
+  outcome: "stopped" | "error";
+  errors?: string[];
+}
+
 interface RunningTurn {
   startedAt: number;
   usage: EngineUsage | undefined;
   errors: string[];
+  /**
+   * Set while a Local command's call runs. Copilot works some commands
+   * through prompts of its own, and whatever they show belongs to this Turn,
+   * which ends when the call returns.
+   */
+  localCommand?: boolean;
+  /** Set once a Local command has handed the agent a prompt, whose user message continues this Turn. */
+  promptPending?: boolean;
+  /** Set once the Turn has reported a compaction, which a `/compact`'s own text would only repeat. */
+  compacted?: boolean;
 }
 
 /** Said against every Command the connector can no longer hand to Copilot. */
 const RUNTIME_GONE = "the Copilot runtime exited";
+
+/** Copilot's own question tool. Its questions reach the human through `onQuestion`, never as a tool call. */
+const QUESTION_TOOL = "ask_user";
 
 /**
  * One long-lived Copilot session, translated into neutral Engine events.
@@ -61,17 +90,33 @@ const RUNTIME_GONE = "the Copilot runtime exited";
  * sent meanwhile wait here. That keeps each Turn's cause certain, and lets a
  * Stop drop the waiting ones without depending on what Copilot does with its
  * own queue on an abort.
+ *
+ * A Steer is the one prompt handed over mid-Turn. It waits in Copilot's own
+ * queue while any tool call already running finishes; then the main turn is
+ * interrupted, and Copilot runs the queued Steer in its place. That cuts the
+ * Turn at the same tool-call boundary Claude's Steer does. Copilot's own
+ * "immediate" steering is never used: it adds the message to the Turn rather
+ * than cutting it, and whether the rest of the Turn still runs is up to the
+ * model.
  */
 class CopilotEngineSession implements EngineSession {
   private readonly outbox = new AsyncQueue<EngineEvent>();
   /** Commands waiting for Copilot to go idle. */
   private readonly waiting: string[] = [];
-  /** Commands a Stop dropped while a Turn was still ending; each is reported once that Turn has. */
-  private readonly droppedByStop: string[] = [];
+  /** Commands and Steers that won't run, each reported once the Turn still running has ended. */
+  private readonly unrunAfterTurn: Unrun[] = [];
   /** A Command handed to Copilot whose user message hasn't come back yet. */
   private delivering = false;
-  /** Set by a Stop that landed while a Command was being handed over: its Turn is aborted as soon as it starts. */
+  /** Set by a Stop that landed while a Command or Steer was being handed over: its Turn is aborted as soon as it starts. */
   private abortWhenStarted = false;
+  /** A Steer queued with Copilot whose user message hasn't come back yet. */
+  private steerText: string | undefined;
+  /** Set while a Steer waits for the tool calls already running to finish before it cuts the Turn. */
+  private cutAtToolBoundary = false;
+  /** A model announced between Turns, held for the next one. */
+  private heldAnnouncement: string | undefined;
+  /** The main agent's tool calls that have started and not yet returned. */
+  private readonly runningTools = new Set<string>();
   private turn: RunningTurn | undefined;
   private contextPercentage: number | undefined;
   /** Background tasks reported started and not yet settled. */
@@ -86,6 +131,14 @@ class CopilotEngineSession implements EngineSession {
   private quelling = false;
   private refreshingTasks: Promise<void> | undefined;
   private tasksStale = false;
+  /** Every slash command Copilot can run, by lower-cased name and alias. */
+  private commands = new Map<string, CopilotCommand>();
+  private refreshingMenu: Promise<void> | undefined;
+  private menuStale = false;
+  /** Calls of the question tool, whose start and result are kept off the phone. */
+  private readonly questionCalls = new Set<string>();
+  /** One per Question waiting on the human; a Stop or close withdraws them all. */
+  private readonly pendingQuestions = new Set<AbortController>();
   private dead = false;
   private closed = false;
   private readonly unsubscribe: () => void;
@@ -93,11 +146,47 @@ class CopilotEngineSession implements EngineSession {
   constructor(
     private readonly runtime: CopilotRuntime,
     private readonly session: CopilotSessionHandle,
+    private readonly options: OpenOptions,
     conversation: Extract<EngineEvent, { type: "conversation" }>,
   ) {
     this.outbox.push(conversation);
     this.unsubscribe = session.on((e) => this.handle(e));
     session.onDisconnected(() => this.runtimeGone());
+  }
+
+  /**
+   * Reads Copilot's Skills and slash commands into the menu, and into the
+   * list a Command is checked against to tell a Local command from a prompt.
+   * Copilot's change notifications carry nothing, so each one re-reads both,
+   * collapsing a burst into one read plus one more if any arrived meanwhile.
+   * Resolves once the lists are current.
+   */
+  refreshMenu(): Promise<void> {
+    if (this.refreshingMenu) {
+      this.menuStale = true;
+      return this.refreshingMenu;
+    }
+    this.refreshingMenu = (async () => {
+      do {
+        this.menuStale = false;
+        try {
+          const [skills, commands] = await Promise.all([this.session.listSkills(), this.session.listCommands()]);
+          if (this.closed) return;
+          this.commands = new Map(
+            commands.flatMap((c) => [c.name, ...(c.aliases ?? [])].map((name) => [name.toLowerCase(), c] as const)),
+          );
+          this.outbox.push({
+            type: "menu",
+            skills: skills.filter(isMenuSkill).map(skillInfo),
+            localCommands: commands.filter((c) => c.kind === "builtin").map(commandInfo),
+          });
+        } catch (e) {
+          console.error("Failed to list Copilot's Skills and commands:", (e as Error).message);
+        }
+      } while (this.menuStale && !this.closed);
+      this.refreshingMenu = undefined;
+    })();
+    return this.refreshingMenu;
   }
 
   get events(): AsyncIterable<EngineEvent> {
@@ -107,18 +196,68 @@ class CopilotEngineSession implements EngineSession {
   send(text: string): void {
     if (this.closed) return;
     if (this.dead) {
-      this.reportUnrun("error", [RUNTIME_GONE]);
+      this.reportUnrun({ cause: "command", outcome: "error", errors: [RUNTIME_GONE] });
       return;
     }
     this.waiting.push(text);
     this.deliverNext();
   }
 
-  steer(): void {
-    throw new Error("Steering isn't available on Copilot sessions yet");
+  steer(text: string): void {
+    if (!this.turn || this.quelling || this.dead || this.closed) throw new Error("there is no running Turn to Steer");
+    // Copilot runs a Local command through a call of its own, not as a
+    // prompt, so there is nothing to queue behind the Turn; and a Local
+    // command's own Turn has no main turn to cut.
+    if (this.asLocalCommand(text) || this.turn.localCommand) {
+      throw new Error("a Local command runs as a Turn of its own on Copilot");
+    }
+    if (this.steerText !== undefined) throw new Error("a Steer is already on its way into this Turn");
+    this.steerText = text;
+    this.session.send(text).then(
+      () => {
+        if (this.steerText !== text || !this.turn) return;
+        // Cutting now would cancel a tool call mid-run, which goes further
+        // than a Steer does; the cut waits for the tool-call boundary.
+        if (this.runningTools.size) this.cutAtToolBoundary = true;
+        else this.cut();
+      },
+      (e) => {
+        if (this.steerText !== text) return;
+        this.steerText = undefined;
+        const unrun: Unrun = { cause: "steer", outcome: "error", errors: [(e as Error).message] };
+        if (this.turn) this.unrunAfterTurn.push(unrun);
+        else this.reportUnrun(unrun);
+      },
+    );
+  }
+
+  /**
+   * Copilot's question tool, put to the human. Its single question with
+   * choices becomes a one-question Question, keyed by the tool call that
+   * asked it. Rejects once the Question is withdrawn, which fails the tool;
+   * by then the Turn it held has been stopped.
+   */
+  async ask(request: CopilotUserInputRequest): Promise<CopilotUserInputResponse> {
+    if (this.closed || !this.turn) throw new Error("there is no Turn to ask a question in");
+    const choices = request.choices ?? [];
+    const question: EngineQuestion = {
+      toolUseId: [...this.questionCalls].at(-1) ?? `${QUESTION_TOOL}-${this.questionCalls.size}`,
+      questions: [{ question: request.question, options: choices.map((label) => ({ label })), multiSelect: false }],
+    };
+    const withdraw = new AbortController();
+    this.pendingQuestions.add(withdraw);
+    try {
+      const answer = await this.options.onQuestion(question, withdraw.signal);
+      // A typed answer stands in for a pick, as it does in the phone's picker.
+      const text = answer.response?.trim() || answer.answers[request.question] || "";
+      return { answer: text, wasFreeform: !choices.includes(text) };
+    } finally {
+      this.pendingQuestions.delete(withdraw);
+    }
   }
 
   stop(): void {
+    this.withdrawQuestions();
     const dropped = this.waiting.splice(0);
     // Reported before the stopped Turn ends, so everything a Stop did is
     // visible before the phone hears that Turn is over.
@@ -127,14 +266,28 @@ class CopilotEngineSession implements EngineSession {
     }
     this.liveTasks.clear();
 
-    if (this.turn) {
-      this.droppedByStop.push(...dropped);
+    const droppedUnrun = dropped.map((): Unrun => ({ cause: "command", outcome: "stopped" }));
+    if (this.turn?.localCommand) {
+      // Its call can't be taken back, but its Turn ends here; whatever it
+      // returns is dropped.
+      this.unrunAfterTurn.push(...droppedUnrun);
+      this.endTurn("stopped");
       void this.abort();
-    } else if (this.delivering) {
-      this.droppedByStop.push(...dropped);
+    } else if (this.turn?.promptPending || (!this.turn && (this.delivering || this.steerText !== undefined))) {
+      // Handed over but not yet started, there is nothing yet to abort.
+      this.unrunAfterTurn.push(...droppedUnrun);
       this.abortWhenStarted = true;
+    } else if (this.turn) {
+      if (this.steerText !== undefined) {
+        // Copilot drops its queue on an abort, the Steer included.
+        this.steerText = undefined;
+        this.cutAtToolBoundary = false;
+        this.unrunAfterTurn.push({ cause: "steer", outcome: "stopped" });
+      }
+      this.unrunAfterTurn.push(...droppedUnrun);
+      void this.abort();
     } else {
-      for (const _ of dropped) this.reportUnrun("stopped");
+      for (const unrun of droppedUnrun) this.reportUnrun(unrun);
     }
     // Detached shells and background agents survive an abort, and would
     // wake the agent back into the work the human just stopped.
@@ -150,22 +303,108 @@ class CopilotEngineSession implements EngineSession {
     if (this.closed) return;
     this.closed = true;
     this.unsubscribe();
+    this.withdrawQuestions();
     if (this.turn) this.endTurn("stopped");
     await this.session.disconnect().catch(() => undefined);
     await this.runtime.stop().catch(() => undefined);
     this.outbox.close();
   }
 
+  private withdrawQuestions(): void {
+    for (const withdraw of this.pendingQuestions) withdraw.abort();
+    this.pendingQuestions.clear();
+  }
+
   private deliverNext(): void {
-    if (this.turn || this.quelling || this.delivering || this.dead || this.closed) return;
+    if (this.turn || this.quelling || this.delivering || this.steerText !== undefined || this.dead || this.closed) return;
     const text = this.waiting.shift();
     if (text === undefined) return;
+    const local = this.asLocalCommand(text);
+    if (local) {
+      this.runLocalCommand(local.name, local.input);
+      return;
+    }
     this.delivering = true;
     this.session.send(text).catch((e) => {
       if (!this.delivering) return;
       this.delivering = false;
-      this.reportUnrun("error", [(e as Error).message]);
+      this.reportUnrun({ cause: "command", outcome: "error", errors: [(e as Error).message] });
       this.deliverNext();
+    });
+  }
+
+  /**
+   * The Local command `text` names, if it names one Copilot lists. Copilot
+   * hands any other text, slash or not, to the model as it stands -- and so
+   * would it a Local command, since slash commands only run through the
+   * command call (measured).
+   */
+  private asLocalCommand(text: string): { name: string; input?: string } | undefined {
+    const match = /^\/(\S+)\s*([\s\S]*)$/.exec(text.trim());
+    const command = match && this.commands.get(match[1].toLowerCase());
+    if (!command) return undefined;
+    return { name: command.name, ...(match[2] ? { input: match[2] } : {}) };
+  }
+
+  /** Runs a Local command as a Turn of its own, which ends when Copilot's call returns. */
+  private runLocalCommand(name: string, input: string | undefined): void {
+    this.startTurn("command");
+    const turn = this.turn!;
+    turn.localCommand = true;
+    this.session.invokeCommand(name, input).then(
+      (result) => this.localCommandReturned(turn, name, result),
+      (e) => {
+        if (this.turn !== turn) return;
+        turn.errors.push(copilotMessage(e));
+        this.endTurn("error");
+      },
+    );
+  }
+
+  /**
+   * Shows what a Local command returned. Text output reads fine as a status
+   * line (measured: plain text, some of it Markdown or a small text chart).
+   * A Skill's command returns the prompt the agent is to run, which is sent
+   * on, and the Turn then ends the way any prompt's does.
+   */
+  private localCommandReturned(turn: RunningTurn, name: string, result: CopilotCommandResult): void {
+    if (this.turn !== turn) return;
+    turn.localCommand = false;
+    const status = (text: string | undefined) => text && this.outbox.push({ type: "status", text });
+    switch (result.kind) {
+      case "agent-prompt":
+        status(result.notice);
+        turn.promptPending = true;
+        this.session.send(result.prompt).catch((e) => {
+          if (this.turn !== turn) return;
+          turn.errors.push(copilotMessage(e));
+          this.endTurn("error");
+        });
+        return;
+      case "text":
+        if (!turn.compacted) status(result.text);
+        break;
+      case "completed":
+        status(result.message);
+        break;
+      case "add-timeline-entry":
+        status(result.entry.text);
+        break;
+      case "select-subcommand":
+        status(`${result.title}: ${result.options.map((o) => `/${result.command} ${o.name}`).join(", ")}`);
+        break;
+      default:
+        status(`/${name} needs Copilot's own terminal`);
+    }
+    this.endTurn(turn.errors.length ? "error" : "success");
+  }
+
+  /** Interrupts the main turn; Copilot then runs the queued Steer as the next one. */
+  private cut(): void {
+    this.cutAtToolBoundary = false;
+    this.session.interruptMainTurn().catch((e) => {
+      // The Steer stays queued, and runs once the Turn ends on its own.
+      console.error("Failed to cut the Copilot Turn for a Steer:", (e as Error).message);
     });
   }
 
@@ -219,11 +458,21 @@ class CopilotEngineSession implements EngineSession {
       }
       case "user.message": {
         this.quellNextWake = false;
+        if (this.turn?.localCommand) return;
+        if (this.turn?.promptPending) {
+          this.turn.promptPending = false;
+          if (this.abortWhenStarted) {
+            this.abortWhenStarted = false;
+            void this.abort();
+          }
+          return;
+        }
         if (this.turn) this.endTurn("success");
-        const cause = this.delivering ? "command" : "engine";
+        const cause = this.delivering ? "command" : this.steerText !== undefined ? "steer" : "engine";
+        if (cause === "steer") this.steerText = undefined;
         this.delivering = false;
         this.startTurn(cause);
-        if (cause === "command" && this.abortWhenStarted) {
+        if (cause !== "engine" && this.abortWhenStarted) {
           this.abortWhenStarted = false;
           void this.abort();
         }
@@ -242,6 +491,11 @@ class CopilotEngineSession implements EngineSession {
       case "tool.execution_start":
         this.ensureTurn();
         if (this.quelling) return;
+        this.runningTools.add(event.data.toolCallId);
+        if (event.data.toolName === QUESTION_TOOL) {
+          this.questionCalls.add(event.data.toolCallId);
+          return;
+        }
         this.outbox.push({
           type: "tool_use",
           toolUseId: event.data.toolCallId,
@@ -250,8 +504,10 @@ class CopilotEngineSession implements EngineSession {
         });
         return;
       case "tool.execution_complete":
+        this.runningTools.delete(event.data.toolCallId);
+        if (this.cutAtToolBoundary && !this.runningTools.size) this.cut();
         // A result straggling in after its Turn ended belongs to no Turn.
-        if (!this.turn) return;
+        if (!this.turn || this.questionCalls.has(event.data.toolCallId)) return;
         this.outbox.push({
           type: "tool_result",
           toolUseId: event.data.toolCallId,
@@ -281,14 +537,37 @@ class CopilotEngineSession implements EngineSession {
       case "session.background_tasks_changed":
         this.refreshTasks();
         return;
+      case "session.compaction_start":
+        // Copilot compacts on its own in the background once the context
+        // fills past its threshold; only a `/compact` is manual.
+        this.outbox.push({ type: "compacting", trigger: event.data.trigger === "manual" ? "manual" : "auto" });
+        return;
+      case "session.compaction_complete":
+        if (!event.data.success) {
+          this.outbox.push({ type: "status", text: `compaction failed${event.data.error ? `: ${event.data.error}` : ""}` });
+          return;
+        }
+        if (this.turn) this.turn.compacted = true;
+        this.outbox.push({
+          type: "compacted",
+          preTokens: event.data.preCompactionTokens,
+          postTokens: event.data.postCompactionTokens,
+        });
+        return;
+      case "session.skills_loaded":
+      case "commands.changed":
+        void this.refreshMenu();
+        return;
       case "abort":
-        if (this.turn) this.endTurn("stopped");
+        // Cut short for a Steer, the Turn ended the way a Steered one does;
+        // anything else that aborts it is a Stop.
+        if (this.turn) this.endTurn(this.steerText !== undefined ? "success" : "stopped");
         return;
       case "assistant.idle":
         // A wake-up follows its notification directly; by an idle, any that
         // was coming has come.
         this.quellNextWake = false;
-        if (this.turn) {
+        if (this.turn && !this.turn.localCommand && !this.turn.promptPending) {
           const outcome: TurnOutcome = event.data.aborted
             ? "stopped"
             : this.turn.errors.length
@@ -300,8 +579,15 @@ class CopilotEngineSession implements EngineSession {
     }
   }
 
+  /**
+   * Copilot resolves an `auto` model just before the Turn it serves starts.
+   * Announced between Turns, it is held until that Turn has started: the
+   * Turn a Steer cut short must be followed directly by the Steer's own.
+   */
   private announce(model: string | undefined): void {
-    if (model) this.outbox.push({ type: "announce", model, permissionMode: PERMISSION_MODE });
+    if (!model) return;
+    if (this.turn) this.outbox.push({ type: "announce", model, permissionMode: PERMISSION_MODE });
+    else this.heldAnnouncement = model;
   }
 
   /**
@@ -322,15 +608,21 @@ class CopilotEngineSession implements EngineSession {
     this.startTurn("engine");
   }
 
-  private startTurn(cause: "command" | "engine"): void {
+  private startTurn(cause: "command" | "steer" | "engine"): void {
     this.turn = { startedAt: Date.now(), usage: undefined, errors: [] };
     this.outbox.push({ type: "turn_started", cause });
+    const held = this.heldAnnouncement;
+    this.heldAnnouncement = undefined;
+    this.announce(held);
   }
 
   private endTurn(outcome: TurnOutcome): void {
     const turn = this.turn;
     if (!turn) return;
     this.turn = undefined;
+    this.runningTools.clear();
+    // With no Turn left to cut, a queued Steer simply runs next.
+    this.cutAtToolBoundary = false;
     this.outbox.push({
       type: "turn_ended",
       outcome,
@@ -341,13 +633,13 @@ class CopilotEngineSession implements EngineSession {
         ? { contextPercentage: this.contextPercentage }
         : {}),
     });
-    for (const _ of this.droppedByStop.splice(0)) this.reportUnrun("stopped");
+    for (const unrun of this.unrunAfterTurn.splice(0)) this.reportUnrun(unrun);
     this.deliverNext();
   }
 
-  /** A Turn for a Command that never ran, so whoever sent it hears how it ended. */
-  private reportUnrun(outcome: "stopped" | "error", errors?: string[]): void {
-    this.outbox.push({ type: "turn_started", cause: "command" });
+  /** A Turn for a Command or Steer that never ran, so whoever sent it hears how it ended. */
+  private reportUnrun({ cause, outcome, errors }: Unrun): void {
+    this.outbox.push({ type: "turn_started", cause });
     this.outbox.push({ type: "turn_ended", outcome, durationMs: 0, ...(errors ? { errors } : {}) });
   }
 
@@ -359,11 +651,16 @@ class CopilotEngineSession implements EngineSession {
       this.turn.errors.push(RUNTIME_GONE);
       this.endTurn("error");
     }
+    const gone = (cause: Unrun["cause"]): Unrun => ({ cause, outcome: "error", errors: [RUNTIME_GONE] });
+    if (this.steerText !== undefined) {
+      this.steerText = undefined;
+      this.reportUnrun(gone("steer"));
+    }
     if (this.delivering) {
       this.delivering = false;
-      this.reportUnrun("error", [RUNTIME_GONE]);
+      this.reportUnrun(gone("command"));
     }
-    for (const _ of this.waiting.splice(0)) this.reportUnrun("error", [RUNTIME_GONE]);
+    for (const _ of this.waiting.splice(0)) this.reportUnrun(gone("command"));
   }
 
   /**
@@ -426,6 +723,31 @@ class CopilotEngineSession implements EngineSession {
   }
 }
 
+/** Copilot's refusal, without the RPC wrapping around it. */
+function copilotMessage(e: unknown): string {
+  return (e as Error).message.replace(/^Request [\w.]+ failed with message: /, "");
+}
+
+/** Where Claude Code keeps a developer's personal Skills, written for Claude rather than Copilot. */
+const CLAUDE_PERSONAL_SKILLS = join(homedir(), ".claude", "skills") + sep;
+
+/**
+ * A Skill the human can invoke, from anywhere but the developer's personal
+ * Claude Skills. Copilot doesn't load those today (measured on CLI 1.0.88);
+ * this keeps them off the menu should a later version start to.
+ */
+function isMenuSkill(skill: CopilotSkill): boolean {
+  return skill.userInvocable && skill.enabled && !skill.path?.startsWith(CLAUDE_PERSONAL_SKILLS);
+}
+
+function skillInfo(skill: CopilotSkill): SkillInfo {
+  return { name: skill.commandName ?? skill.name, description: skill.description, argumentHint: skill.argumentHint ?? "" };
+}
+
+function commandInfo(command: CopilotCommand): SkillInfo {
+  return { name: command.name, description: command.description, argumentHint: command.input?.hint ?? "" };
+}
+
 /** Copilot lists foreground shells as tasks too; only work that runs on its own is a Background task. */
 function isBackgroundTask(task: CopilotTask): boolean {
   if (task.type === "shell") return task.attachmentMode === "detached";
@@ -463,7 +785,7 @@ function addUsage(
  */
 export class CopilotEngine implements Engine {
   readonly kind = "copilot" as const;
-  readonly capabilities = { steer: false, fork: false };
+  readonly capabilities = { steer: true, fork: false };
   private runtime: Promise<CopilotRuntime> | undefined;
 
   constructor(private readonly deps: CopilotEngineDeps) {}
@@ -503,32 +825,40 @@ export class CopilotEngine implements Engine {
   }
 
   private async openOn(runtime: CopilotRuntime, options: OpenOptions): Promise<EngineSession> {
+    // Copilot takes the question handler when the session is made, before
+    // there is an Engine session to answer it; it only asks inside a Turn,
+    // by which time there is.
+    let engineSession: CopilotEngineSession | undefined;
     const sessionOptions: CopilotSessionOptions = {
       model: this.deps.model,
       workingDirectory: options.projectDir,
       onPermissionRequest: approveEverything,
+      onUserInputRequest: (request) =>
+        engineSession ? engineSession.ask(request) : Promise.reject(new Error("the session isn't open yet")),
+    };
+    // The menu is read before the session is handed over, so the first
+    // Command can already be told apart from a Local command.
+    const wrap = async (session: CopilotSessionHandle, conversation: Extract<EngineEvent, { type: "conversation" }>) => {
+      engineSession = new CopilotEngineSession(runtime, session, options, conversation);
+      await engineSession.refreshMenu();
+      return engineSession;
     };
 
     if (options.resume) {
       try {
         const session = await runtime.resumeSession(options.resume, sessionOptions);
-        return new CopilotEngineSession(runtime, session, { type: "conversation", id: session.sessionId, resumed: true });
+        return await wrap(session, { type: "conversation", id: session.sessionId, resumed: true });
       } catch (e) {
         // A Conversation that can't be reopened is never a reason to fail:
         // start fresh and say so. Anything that stops a fresh session too --
         // auth, licence, policy -- fails below, with Copilot's own message.
         console.log(`Couldn't resume Copilot conversation ${options.resume}: ${(e as Error).message}`);
         const session = await runtime.createSession(sessionOptions);
-        return new CopilotEngineSession(runtime, session, {
-          type: "conversation",
-          id: session.sessionId,
-          resumed: false,
-          lostPrevious: true,
-        });
+        return wrap(session, { type: "conversation", id: session.sessionId, resumed: false, lostPrevious: true });
       }
     }
     const session = await runtime.createSession(sessionOptions);
-    return new CopilotEngineSession(runtime, session, { type: "conversation", id: session.sessionId, resumed: false });
+    return wrap(session, { type: "conversation", id: session.sessionId, resumed: false });
   }
 
   async forkConversation(_input: { conversationId: string; fromDir: string; toDir: string }): Promise<string | undefined> {
