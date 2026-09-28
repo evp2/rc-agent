@@ -867,6 +867,33 @@ test("CopilotEngine: Stop during a Local command ends its Turn, and its late res
   assert.deepEqual(late, []);
 });
 
+test("CopilotEngine: Stop just as a Skill's prompt is handed over stops that prompt's Turn once it starts", async () => {
+  let startPrompt: (() => void) | undefined;
+  let started = false;
+  const runtime = commandRuntime({
+    onInvoke: async () => ({ kind: "agent-prompt", prompt: "Run the hello skill." }),
+    onSend: (s) => {
+      startPrompt = () => {
+        started = true;
+        s.emit([event("user.message", { content: "Run the hello skill.", delivery: "idle" })]);
+      };
+    },
+    // An abort before the prompt's Turn has started has nothing to abort.
+    onAbort: (s) => started && s.emit([event("abort", { reason: "user_initiated" }), event("assistant.idle", { aborted: true })]),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/hello");
+  await until(() => runtime.session.sent.length === 1);
+  session.stop();
+  startPrompt!();
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(only(events, "turn_started"), [{ type: "turn_started", cause: "command" }]);
+  assert.equal(only(events, "turn_ended")[0].outcome, "stopped");
+  assert.equal(runtime.session.aborts, 1);
+  await session.close();
+});
+
 test("CopilotEngine: Copilot compacting on its own is reported as automatic, which the phone shows as an overflow", async () => {
   const runtime = new FakeCopilotRuntime({
     onSend: (s) => {

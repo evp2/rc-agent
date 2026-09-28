@@ -273,6 +273,10 @@ class CopilotEngineSession implements EngineSession {
       this.unrunAfterTurn.push(...droppedUnrun);
       this.endTurn("stopped");
       void this.abort();
+    } else if (this.turn?.promptPending || (!this.turn && (this.delivering || this.steerText !== undefined))) {
+      // Handed over but not yet started, there is nothing yet to abort.
+      this.unrunAfterTurn.push(...droppedUnrun);
+      this.abortWhenStarted = true;
     } else if (this.turn) {
       if (this.steerText !== undefined) {
         // Copilot drops its queue on an abort, the Steer included.
@@ -282,9 +286,6 @@ class CopilotEngineSession implements EngineSession {
       }
       this.unrunAfterTurn.push(...droppedUnrun);
       void this.abort();
-    } else if (this.delivering || this.steerText !== undefined) {
-      this.unrunAfterTurn.push(...droppedUnrun);
-      this.abortWhenStarted = true;
     } else {
       for (const unrun of droppedUnrun) this.reportUnrun(unrun);
     }
@@ -460,6 +461,10 @@ class CopilotEngineSession implements EngineSession {
         if (this.turn?.localCommand) return;
         if (this.turn?.promptPending) {
           this.turn.promptPending = false;
+          if (this.abortWhenStarted) {
+            this.abortWhenStarted = false;
+            void this.abort();
+          }
           return;
         }
         if (this.turn) this.endTurn("success");
