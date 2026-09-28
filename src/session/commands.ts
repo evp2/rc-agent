@@ -15,9 +15,7 @@ export function persist(ctx: SessionContext, patch: Partial<ConnectorState>): vo
 
 /**
  * Best-effort: a failed publish leaves the phone's menu stale, not broken.
- * The Worktree list rides this same report (see
- * docs/adr/0029-a-worktree-list-entry-reuses-its-siblings-control-credential.md)
- * and is recomputed on every call, since listing git worktrees and reading a
+ * The Worktree list rides this same report and is recomputed on every call, since listing git worktrees and reading a
  * handful of local state files is cheap -- a change there (a sibling starting
  * or stopping) publishes on its own even when skills and local commands
  * haven't changed.

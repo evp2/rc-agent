@@ -4,9 +4,8 @@ import { realpathSync } from "node:fs";
 import { liveConnector } from "./state";
 
 /**
- * One entry in the Worktree list (see CONTEXT.md and
- * docs/adr/0029-a-worktree-list-entry-reuses-its-siblings-control-credential.md):
- * a git worktree sharing the attached session's repository, live or not.
+ * One entry in the Worktree list: a git worktree sharing the attached
+ * session's repository, live or not.
  * `controlUrl` is present only for a live, non-self entry -- there is nowhere
  * to switch to for a dead sibling, and switching to the self entry makes no
  * sense.
@@ -21,8 +20,7 @@ export interface WorktreeEntry {
 /**
  * Canonicalizes a path for comparison, falling back to the input when it no
  * longer exists on disk -- a worktree whose directory was removed by hand
- * still has a `git worktree list` entry (see ADR 0029) but nothing left to
- * resolve.
+ * still has a `git worktree list` entry but nothing left to resolve.
  */
 function canonical(path: string): string {
   try {
@@ -56,7 +54,10 @@ export function listWorktreePaths(sourceWorktreePath: string): string[] {
  * direct Fork lineage. Liveness is decided exactly the way {@link
  * liveConnector} already decides it for the attached connector on itself: a
  * local pid check against that sibling's own state file, never corroborated
- * against the relay's view of the session (ADR 0029).
+ * against the relay's view of the session. Every sibling is on this same
+ * machine, so holding siblings to a stricter check than the connector applies
+ * to itself buys nothing: a session the relay Ended while its connector is
+ * still up shows as live and fails softly when tapped.
  *
  * The self entry is looked up by `sourceWorktreePath` itself, not by git's
  * (possibly realpath-canonicalized) rendering of it, since that is the exact

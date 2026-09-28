@@ -126,7 +126,7 @@ export interface SessionContext {
 
   /**
    * Whether a Context-window warning has already fired for the current
-   * threshold crossing (see CONTEXT.md) -- the edge-trigger's own arm/suppress
+   * threshold crossing -- the edge-trigger's own arm/suppress
    * flag. Set once `context_percentage` crosses the configured threshold, and
    * cleared the moment it drops back below, so the warning fires once per
    * crossing rather than on every subsequent Turn. In-memory only, unlike

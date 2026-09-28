@@ -7,7 +7,7 @@ import type { TurnClaims } from "./inFlight";
 import { checkInterrupt, watchForInterrupt } from "./watchers";
 
 /**
- * Whether this reading should fire a Context-window warning (see CONTEXT.md),
+ * Whether this reading should fire a Context-window warning,
  * and what `contextWarningActive` becomes afterward. Pure and exported so the
  * edge-trigger's arm/re-arm behavior is directly testable across a sequence
  * of readings, the same way Auto-compact's `isAutoCompactDue` is (loop.ts).

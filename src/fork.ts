@@ -138,8 +138,8 @@ export function readForkNameState(plan: ForkPlan, sourceWorktreePath: string): F
  * purpose is to keep the phone client out of git's error grammar.
  *
  * It also makes the check and the definition the same code: a fork name is
- * taken when the branch or the directory exists, which is the rule stated in
- * CONTEXT.md, tested here rather than restated anywhere else.
+ * taken when the branch or the directory exists, and that rule is tested
+ * here rather than restated anywhere else.
  */
 export function classifyForkFailure(
   plan: ForkPlan,

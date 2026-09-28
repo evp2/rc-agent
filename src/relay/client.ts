@@ -89,9 +89,9 @@ export interface EventInput {
   no_notify?: boolean;
   /** Rounded percent of the model's context window in use, on `turn_complete` and the compact-boundary `status` event. Omitted when the SDK's `getContextUsage()` call failed. */
   context_percentage?: number;
-  /** True on the `turn_complete`/`status` event where `context_percentage` just crossed the configured Context-window-warning threshold (see CONTEXT.md) -- edge-triggered, so only the event that caused the crossing carries it. */
+  /** True on the `turn_complete`/`status` event where `context_percentage` just crossed the configured Context-window-warning threshold -- edge-triggered, so only the event that caused the crossing carries it. */
   context_warning?: boolean;
-  /** True on a `status` event fired just before the SDK compacts the conversation on its own -- a Context-window overflow (see CONTEXT.md and ADR 0024), never set for a connector- or human-issued `/compact`. */
+  /** True on a `status` event fired just before the SDK compacts the conversation on its own -- a Context-window overflow, sent before compaction so the phone can warn that context is about to be summarised away, never set for a connector- or human-issued `/compact`. */
   context_overflow?: boolean;
   /** Token counts off the SDK's result message, carried on every `usage` event alongside `cost_usd`. */
   input_tokens?: number;

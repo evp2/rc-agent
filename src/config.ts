@@ -42,7 +42,7 @@ export interface ConnectorConfig {
   inactivityCompact?: InactivityCompactConfig;
   /**
    * The percent of the model's context window in use at which a
-   * Context-window warning fires (see CONTEXT.md). Unlike `inactivityCompact`,
+   * Context-window warning fires. Unlike `inactivityCompact`,
    * this feature has no off switch -- only its threshold is configurable, so
    * this is a plain percent rather than a nested config object.
    */

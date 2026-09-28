@@ -148,7 +148,7 @@ test("executeForkPlan lets git's own error propagate for a branch name collision
   assert.throws(() => executeForkPlan(plan, repo));
 });
 
-// --- classification, the domain rule from CONTEXT.md ---
+// --- classification: a fork name is taken when its branch or directory exists ---
 
 function planFor(repo: string, name: string): ReturnType<typeof planFork> {
   return planFork({
