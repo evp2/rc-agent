@@ -113,6 +113,8 @@ class CopilotEngineSession implements EngineSession {
   private steerText: string | undefined;
   /** Set while a Steer waits for the tool calls already running to finish before it cuts the Turn. */
   private cutAtToolBoundary = false;
+  /** A model announced between Turns, held for the next one. */
+  private heldAnnouncement: string | undefined;
   /** The main agent's tool calls that have started and not yet returned. */
   private readonly runningTools = new Set<string>();
   private turn: RunningTurn | undefined;
@@ -572,8 +574,15 @@ class CopilotEngineSession implements EngineSession {
     }
   }
 
+  /**
+   * Copilot resolves an `auto` model just before the Turn it serves starts.
+   * Announced between Turns, it is held until that Turn has started: the
+   * Turn a Steer cut short must be followed directly by the Steer's own.
+   */
   private announce(model: string | undefined): void {
-    if (model) this.outbox.push({ type: "announce", model, permissionMode: PERMISSION_MODE });
+    if (!model) return;
+    if (this.turn) this.outbox.push({ type: "announce", model, permissionMode: PERMISSION_MODE });
+    else this.heldAnnouncement = model;
   }
 
   /**
@@ -597,6 +606,9 @@ class CopilotEngineSession implements EngineSession {
   private startTurn(cause: "command" | "steer" | "engine"): void {
     this.turn = { startedAt: Date.now(), usage: undefined, errors: [] };
     this.outbox.push({ type: "turn_started", cause });
+    const held = this.heldAnnouncement;
+    this.heldAnnouncement = undefined;
+    this.announce(held);
   }
 
   private endTurn(outcome: TurnOutcome): void {

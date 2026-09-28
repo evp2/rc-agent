@@ -418,6 +418,11 @@ test("CopilotEngine: a recorded Steer lets the running tool call finish, then cu
     ["tool_result", "turn_ended:success", "turn_started:steer", "PINEAPPLE", "turn_ended:success"],
     "step 2 finished, no step 3 ran, and the Steer's Turn followed the cut one directly",
   );
+  // Copilot resolves its `auto` model before running the queued Steer; that
+  // announcement waits until the Steer's Turn has started.
+  const cutAt = events.findIndex((e) => e.type === "turn_ended");
+  assert.deepEqual(events[cutAt + 1], { type: "turn_started", cause: "steer" });
+  assert.equal(events[cutAt + 2].type, "announce");
   await session.close();
 });
 
