@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import type { SessionEvent } from "@github/copilot-sdk";
@@ -9,6 +11,7 @@ import type { EngineAnswer, EngineEvent, EngineQuestion } from "../src/engine/ty
 import {
   event,
   FakeCopilotRuntime,
+  type FakeCopilotSession,
   loadFixture,
   simpleTurn,
   splitAt,
@@ -635,6 +638,249 @@ test("CopilotEngine: Stop with a Question pending ends the Turn, withdraws the Q
   await session.close();
   await reading;
   assert.deepEqual(late, [], "nothing from the withdrawn Question reaches the phone");
+});
+
+// --- Menu ----------------------------------------------------------------------
+
+/** What Copilot listed for a project with `.claude/skills/hello` and `.github/skills/ghskill` (CLI 1.0.88), trimmed. */
+function recordedMenu(session: FakeCopilotSession): void {
+  session.skills = [
+    { name: "ghskill", commandName: "ghskill", description: "A skill in .github/skills.", source: "project", userInvocable: true, enabled: true, path: "/p/.github/skills/ghskill/SKILL.md" },
+    { name: "hello", commandName: "hello", description: "Says hello back.", source: "project", userInvocable: true, enabled: true, path: "/p/.claude/skills/hello/SKILL.md", argumentHint: "[name]" },
+    { name: "mine", commandName: "mine", description: "A personal Copilot skill.", source: "personal-copilot", userInvocable: true, enabled: true, path: "/home/me/.copilot/skills/mine/SKILL.md" },
+    { name: "customize-cloud-agent", description: "Built in.", source: "builtin", userInvocable: false, enabled: true },
+    { name: "for-claude", description: "Written for Claude.", source: "personal-agents", userInvocable: true, enabled: true, path: join(homedir(), ".claude", "skills", "for-claude", "SKILL.md") },
+  ];
+  session.commands = [
+    { name: "compact", description: "Summarize conversation history", kind: "builtin", input: { hint: "focus instructions" } },
+    { name: "usage", description: "Display session usage metrics", kind: "builtin" },
+    { name: "context", description: "Show context window token usage", kind: "builtin" },
+    { name: "ghskill", description: "A skill in .github/skills.", kind: "skill", input: { hint: "instructions for the skill" } },
+    { name: "hello", description: "Says hello back.", kind: "skill", input: { hint: "instructions for the skill" } },
+  ];
+}
+
+class MenuRuntime extends FakeCopilotRuntime {
+  override async createSession(options: Parameters<FakeCopilotRuntime["createSession"]>[0]) {
+    const s = await super.createSession(options);
+    recordedMenu(s);
+    return s;
+  }
+}
+
+test("CopilotEngine: the menu lists the project's Skills and Copilot's Local commands, split by where they come from", async () => {
+  const session = await engineOn(new MenuRuntime()).open(openOptions());
+  const [menu] = only(await collect(session.events[Symbol.asyncIterator](), (e) => e.type === "menu"), "menu");
+  assert.deepEqual(menu.skills, [
+    { name: "ghskill", description: "A skill in .github/skills.", argumentHint: "" },
+    { name: "hello", description: "Says hello back.", argumentHint: "[name]" },
+    { name: "mine", description: "A personal Copilot skill.", argumentHint: "" },
+  ]);
+  assert.deepEqual(menu.localCommands, [
+    { name: "compact", description: "Summarize conversation history", argumentHint: "focus instructions" },
+    { name: "usage", description: "Display session usage metrics", argumentHint: "" },
+    { name: "context", description: "Show context window token usage", argumentHint: "" },
+  ]);
+  assert.ok(!menu.localCommands.some((c) => c.name === "clear"), "Copilot offers SDK clients no /clear");
+  await session.close();
+});
+
+test("CopilotEngine: the menu refreshes when Copilot's Skills or commands change", async () => {
+  const runtime = new MenuRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  await collect(it, (e) => e.type === "menu");
+
+  runtime.session.skills.push({ name: "fresh", description: "Just added.", source: "project", userInvocable: true, enabled: true });
+  runtime.session.emit([event("session.skills_loaded", { skills: [] })]);
+  const [refreshed] = only(await collect(it, (e) => e.type === "menu"), "menu");
+  assert.ok(refreshed.skills.some((k) => k.name === "fresh"));
+
+  runtime.session.commands.push({ name: "review", description: "Review changes", kind: "builtin" });
+  runtime.session.emit([event("commands.changed", {})]);
+  const [again] = only(await collect(it, (e) => e.type === "menu"), "menu");
+  assert.ok(again.localCommands.some((c) => c.name === "review"));
+  await session.close();
+});
+
+// --- Local commands and compaction ---------------------------------------------
+
+/** A MenuRuntime whose slash commands answer as `onInvoke` says. */
+function commandRuntime(script: FakeSessionScript): MenuRuntime {
+  return new MenuRuntime(script);
+}
+
+test("CopilotEngine: /compact runs through Copilot's command call, as an ordinary Turn with no overflow notice", async () => {
+  // What `/compact` did on CLI 1.0.88: compaction events while the call ran,
+  // a fresh context reading, then a line of text as the call's result.
+  const runtime = commandRuntime({
+    onInvoke: async (s) => {
+      s.emit([
+        event("session.compaction_start", { trigger: "manual", currentTokens: 10155 }),
+        event("session.compaction_complete", { success: true, preCompactionTokens: 4300, postCompactionTokens: 306 }),
+        event("session.usage_info", { tokenLimit: 128000, currentTokens: 10418 }),
+      ]);
+      await new Promise((r) => setTimeout(r, 5));
+      return { kind: "text", text: "Compacted conversation history and removed 1 message and 3,994 tokens." };
+    },
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  await collect(it, (e) => e.type === "menu");
+  session.send("/compact");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+
+  assert.deepEqual(runtime.session.invoked, [{ name: "compact" }]);
+  assert.deepEqual(runtime.session.sent, [], "never sent to the model as a prompt");
+  assert.deepEqual(
+    events.map((e) => e.type),
+    ["turn_started", "compacting", "compacted", "turn_ended"],
+    "one Turn, whose compaction already says what the command's own text would",
+  );
+  assert.deepEqual(only(events, "compacting"), [{ type: "compacting", trigger: "manual" }]);
+  assert.deepEqual(only(events, "compacted")[0], { type: "compacted", preTokens: 4300, postTokens: 306 });
+  const [ended] = only(events, "turn_ended");
+  assert.equal(ended.outcome, "success");
+  assert.equal(ended.contextPercentage, 8, "10418 of 128000 tokens, read after the compaction");
+  await session.close();
+});
+
+test("CopilotEngine: a Local command's text output becomes a status line", async () => {
+  const usage = "Session Usage\n\nChanges: +0 -0\nRequests: 1 AI Units (6s)\nTokens: input 9.2k, output 5, cached 1.2k";
+  const runtime = commandRuntime({ onInvoke: async () => ({ kind: "text", text: usage }) });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/usage");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(events.filter((e) => e.type !== "conversation" && e.type !== "menu"), [
+    { type: "turn_started", cause: "command" },
+    { type: "status", text: usage },
+    events.at(-1),
+  ]);
+  assert.equal(only(events, "turn_ended")[0].outcome, "success");
+  await session.close();
+});
+
+test("CopilotEngine: a Skill's command hands the agent its prompt, all in the one Turn", async () => {
+  const runtime = commandRuntime({
+    onInvoke: async () => ({ kind: "agent-prompt", prompt: "The user explicitly invoked the /hello skill.", displayPrompt: "/hello" }),
+    onSend: (s) => s.emit(simpleTurn("HELLO-SKILL-RAN Bob")),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/hello Bob");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(runtime.session.invoked, [{ name: "hello", input: "Bob" }]);
+  assert.deepEqual(runtime.session.sent, ["The user explicitly invoked the /hello skill."]);
+  assert.deepEqual(only(events, "turn_started"), [{ type: "turn_started", cause: "command" }]);
+  assert.deepEqual(only(events, "assistant_text").map((e) => e.text), ["HELLO-SKILL-RAN Bob"]);
+  assert.equal(only(events, "turn_ended")[0].outcome, "success");
+  await session.close();
+});
+
+test("CopilotEngine: a Local command Copilot refuses ends its Turn with Copilot's message", async () => {
+  const runtime = commandRuntime({
+    onInvoke: async () => {
+      throw new Error("Request session.commands.invoke failed with message: Usage: /compact [focus instructions]");
+    },
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/compact now please");
+  const [ended] = only(await collect(it, (e) => e.type === "turn_ended"), "turn_ended");
+  assert.equal(ended.outcome, "error");
+  assert.deepEqual(ended.errors, ["Usage: /compact [focus instructions]"]);
+  await session.close();
+});
+
+test("CopilotEngine: a Local command that wants a choice made says what the choices are", async () => {
+  const runtime = commandRuntime({
+    onInvoke: async () => ({
+      kind: "select-subcommand",
+      command: "usage",
+      title: "Usage",
+      options: [{ name: "today" }, { name: "week" }],
+    }),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/usage");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(only(events, "status").map((e) => e.text), ["Usage: /usage today, /usage week"]);
+  await session.close();
+});
+
+test("CopilotEngine: text that merely starts with a slash is a prompt, not a Local command", async () => {
+  const runtime = commandRuntime({ onSend: (s) => s.emit(simpleTurn()) });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/tmp/build.log shows a failure -- why?");
+  await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(runtime.session.invoked, []);
+  assert.deepEqual(runtime.session.sent, ["/tmp/build.log shows a failure -- why?"]);
+  await session.close();
+});
+
+test("CopilotEngine: a Local command can't be Steered in; it waits for the Turn to end", async () => {
+  const runtime = commandRuntime({
+    onSend: (s, p, i) => i === 0 && hangsUntilAborted.onSend!(s, p, i),
+    onInvoke: async () => ({ kind: "text", text: "done" }),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("go");
+  await collect(it, (e) => e.type === "assistant_text");
+  assert.throws(() => session.steer("/compact"));
+  await session.close();
+});
+
+test("CopilotEngine: Stop during a Local command ends its Turn, and its late result is dropped", async () => {
+  let finish: ((r: { kind: "text"; text: string }) => void) | undefined;
+  const runtime = commandRuntime({
+    onInvoke: () => new Promise((resolve) => (finish = resolve)),
+    onAbort: (s) => s.emit([event("abort", { reason: "user_initiated" })]),
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/compact");
+  await collect(it, (e) => e.type === "turn_started");
+  session.stop();
+  const [ended] = only(await collect(it, (e) => e.type === "turn_ended"), "turn_ended");
+  assert.equal(ended.outcome, "stopped");
+  finish!({ kind: "text", text: "Compacted." });
+  const late: EngineEvent[] = [];
+  const reading = (async () => {
+    for (;;) {
+      const n = await it.next();
+      if (n.done) return;
+      late.push(n.value);
+    }
+  })();
+  await new Promise((r) => setTimeout(r, 20));
+  await session.close();
+  await reading;
+  assert.deepEqual(late, []);
+});
+
+test("CopilotEngine: Copilot compacting on its own is reported as automatic, which the phone shows as an overflow", async () => {
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s) => {
+      const [start, rest] = splitAt(simpleTurn(), (e) => e.type === "assistant.idle");
+      s.emit([
+        ...start,
+        event("session.compaction_start", { trigger: "threshold" }),
+        event("session.compaction_complete", { success: true, preCompactionTokens: 100000, postCompactionTokens: 20000 }),
+        ...rest,
+      ]);
+    },
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("go");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(only(events, "compacting"), [{ type: "compacting", trigger: "auto" }]);
+  assert.deepEqual(only(events, "compacted"), [{ type: "compacted", preTokens: 100000, postTokens: 20000 }]);
+  await session.close();
 });
 
 // --- Opening a session ------------------------------------------------------

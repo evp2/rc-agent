@@ -64,7 +64,7 @@ export type CopilotCommandResult =
   | { kind: "completed"; message?: string }
   | { kind: "add-timeline-entry"; entry: { text: string } }
   | { kind: "select-subcommand"; command: string; title: string; options: { name: string; description?: string }[] }
-  | { kind: string };
+  | { kind: "show-dialog" | "set-model" | "set-plan-model" };
 
 /** Copilot's single question with optional choices, asked through its `ask_user` tool. */
 export interface CopilotUserInputRequest {
