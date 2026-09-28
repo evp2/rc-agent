@@ -33,9 +33,9 @@ export class WakeCauses {
   take(): string {
     const settled = this.settledSinceLastTurn;
     this.settledSinceLastTurn = [];
-    if (!settled.length) return "working again on its own";
+    if (!settled.length) return "turn started";
     const named = settled.filter((d): d is string => !!d);
-    return named.length ? `working again: ${named.join(", ")} finished` : "working again: a background task finished";
+    return named.length ? `turn started: ${named.join(", ")} finished` : "turn started: a background task finished";
   }
 }
 

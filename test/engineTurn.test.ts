@@ -33,20 +33,20 @@ test("a Turn the Engine starts after a Background task finishes is preceded by a
   h.session.triggerEngineTurn();
   await until(() => completes(h).length === 2);
 
-  const line = indexOfText(h, "working again: npm test finished");
+  const line = indexOfText(h, "turn started: npm test finished");
   assert.notEqual(line, -1);
   assert.equal(h.ctx.eventBuffer[line].type, "status");
   assert.ok(line < indexOfText(h, "the tests passed"), "the line comes before the Turn's own output");
   await h.close();
 });
 
-test("a Turn the Engine starts with no known cause says it is working again on its own", async () => {
+test("a Turn the Engine starts with no known cause says a turn started", async () => {
   const h = await makeTurnHarness({ handlerFor: () => sayAndFinish("carrying on") });
 
   h.session.triggerEngineTurn();
   await until(() => completes(h).length === 1);
 
-  const line = indexOfText(h, "working again on its own");
+  const line = indexOfText(h, "turn started");
   assert.notEqual(line, -1);
   assert.ok(line < indexOfText(h, "carrying on"));
   await h.close();
@@ -257,12 +257,12 @@ test("on Claude, the Turn the agent starts when a Background task finishes names
   await until(() => completes(h).length === 2);
   await until(() => h.relay.lastReport === false);
 
-  const workingAgain = h.ctx.eventBuffer.filter((e) => e.text?.startsWith("working again"));
+  const turnStarted = h.ctx.eventBuffer.filter((e) => e.text?.startsWith("turn started"));
   assert.deepEqual(
-    workingAgain.map((e) => e.text),
-    ["working again: a long-running background task finished"],
+    turnStarted.map((e) => e.text),
+    ["turn started: a long-running background task finished"],
   );
-  assert.ok(indexOfText(h, workingAgain[0].text!) < indexOfText(h, "the background task is done"));
+  assert.ok(indexOfText(h, turnStarted[0].text!) < indexOfText(h, "the background task is done"));
   assert.equal(completes(h)[1].no_notify, true);
   assert.deepEqual(h.relay.reports, [true, false, true, false]);
   await h.close();
@@ -287,7 +287,7 @@ test("on Copilot, the recorded wake-up after a detached shell finishes names tha
   await until(() => completes(h).length === 2);
   await until(() => h.relay.lastReport === false);
 
-  const line = indexOfText(h, "working again: Start detached delayed marker finished");
+  const line = indexOfText(h, "turn started: Start detached delayed marker finished");
   assert.notEqual(line, -1);
   assert.ok(line < indexOfText(h, "Done."), "the line comes before the Turn's own output");
   assert.equal(completes(h)[1].no_notify, true);
