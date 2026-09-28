@@ -650,10 +650,16 @@ test("CopilotEngine: a Steer that lands as the Turn finishes on its own still ru
   let finish: (() => void) | undefined;
   const runtime = new FakeCopilotRuntime({
     onSend: (s, _p, i) => {
-      if (i > 0) return;
-      const [start, rest] = splitAt(simpleTurn("first"), (e) => e.type === "assistant.idle");
-      s.emit(start);
-      finish = () => s.emit([...rest, event("user.message", { content: "late", delivery: "queued" }), ...simpleTurn("second").slice(1)]);
+      if (i === 0) {
+        const [start, rest] = splitAt(simpleTurn("first"), (e) => e.type === "assistant.idle");
+        s.emit(start);
+        finish = () => s.emit(rest);
+        return;
+      }
+      // Copilot had gone idle by the time the Steer reached it, so it runs
+      // straight away, and Copilot's reply comes after the idle.
+      s.emit([event("user.message", { content: "late", delivery: "idle" }), ...simpleTurn("second").slice(1)]);
+      return new Promise((r) => setImmediate(r));
     },
     // Too late: the Turn had already finished.
     onInterrupt: () => false,
@@ -670,6 +676,7 @@ test("CopilotEngine: a Steer that lands as the Turn finishes on its own still ru
     ["success", "steer", "success"],
   );
   assert.deepEqual(only(events, "assistant_text").map((e) => e.text), ["second"]);
+  assert.deepEqual(runtime.session.sent, ["go", "late"], "the Steer is handed over once, not again after the idle");
   await session.close();
 });
 
@@ -698,6 +705,101 @@ test("CopilotEngine: Stop while a Steer waits for the running tool call ends the
   runtime.session.emit([event("tool.execution_complete", { toolCallId: STEP_2, success: true, result: { content: "step2" } })]);
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(runtime.session.interrupts, 0, "the finished tool call no longer triggers the cut");
+  await session.close();
+});
+
+/**
+ * A first Command whose Turn runs until something ends it; `endTurn` says
+ * how. Every later prompt runs as a plain Turn that answers with its own text.
+ */
+function droppedSteerRuntime(onInterrupt: FakeSessionScript["onInterrupt"]) {
+  return new FakeCopilotRuntime({
+    onSend: (s, p, i) => {
+      if (i === 0) return hangsUntilAborted.onSend!(s, p, i);
+      // The Steer's first send only queues it behind the running Turn.
+      if (p === "change of plan" && s.sent.filter((x) => x === p).length === 1) return;
+      s.emit([event("user.message", { content: p, delivery: "idle" }), ...simpleTurn(p).slice(1)]);
+    },
+    onInterrupt,
+  });
+}
+
+test("CopilotEngine: a Steer Copilot drops from its queue runs as the Steer's own Turn, and later Commands still run", async () => {
+  // Copilot runs a queued prompt straight after the Turn ends, with no idle
+  // in between (measured); an idle with the Steer still queued means Copilot
+  // dropped it.
+  const runtime = droppedSteerRuntime((s) => {
+    s.emit([event("abort", { reason: "user_abort" }), event("assistant.idle", { aborted: true })]);
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("go");
+  await collect(it, (e) => e.type === "assistant_text");
+  session.steer("change of plan");
+  await until(() => runtime.session.interrupts === 1);
+  session.send("next");
+  const events = await collectTurns(it, 3);
+  assert.deepEqual(
+    events.filter((e) => e.type === "turn_started" || e.type === "turn_ended").map((e) => (e.type === "turn_started" ? e.cause : e.outcome)),
+    ["success", "steer", "success", "command", "success"],
+  );
+  assert.deepEqual(only(events, "assistant_text").map((e) => e.text), ["change of plan", "next"]);
+  assert.deepEqual(runtime.session.sent, ["go", "change of plan", "change of plan", "next"]);
+  await session.close();
+});
+
+test("CopilotEngine: a Steer Copilot drops twice is reported as never run, and later Commands still run", async () => {
+  const runtime = new FakeCopilotRuntime({
+    onSend: (s, p, i) => {
+      if (i === 0) return hangsUntilAborted.onSend!(s, p, i);
+      if (p === "change of plan") {
+        // Queued the first time; dropped again straight away the second.
+        if (s.sent.length > 2) s.emit([event("assistant.idle", {})]);
+        return;
+      }
+      s.emit([event("user.message", { content: p, delivery: "idle" }), ...simpleTurn(p).slice(1)]);
+    },
+    onInterrupt: (s) => {
+      s.emit([event("abort", { reason: "user_abort" }), event("assistant.idle", { aborted: true })]);
+    },
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("go");
+  await collect(it, (e) => e.type === "assistant_text");
+  session.steer("change of plan");
+  await until(() => runtime.session.interrupts === 1);
+  session.send("next");
+  const events = await collectTurns(it, 3);
+  assert.deepEqual(
+    events.filter((e) => e.type === "turn_started" || e.type === "turn_ended").map((e) => (e.type === "turn_started" ? e.cause : e.outcome)),
+    ["success", "steer", "error", "command", "success"],
+  );
+  assert.deepEqual(only(events, "assistant_text").map((e) => e.text), ["next"]);
+  await session.close();
+});
+
+test("CopilotEngine: a Steer whose cut Copilot refuses, and that the Turn then ends without running, still runs", async () => {
+  const runtime = droppedSteerRuntime((s) => {
+    s.emit([
+      event("assistant.message", { messageId: "m2", content: "finished anyway", toolRequests: [] }),
+      event("assistant.idle", {}),
+    ]);
+    throw new Error("interrupt failed");
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("go");
+  await collect(it, (e) => e.type === "assistant_text");
+  session.steer("change of plan");
+  await until(() => runtime.session.interrupts === 1);
+  session.send("next");
+  const events = await collectTurns(it, 3);
+  assert.deepEqual(
+    events.filter((e) => e.type === "turn_started" || e.type === "turn_ended").map((e) => (e.type === "turn_started" ? e.cause : e.outcome)),
+    ["success", "steer", "success", "command", "success"],
+  );
+  assert.deepEqual(only(events, "assistant_text").map((e) => e.text), ["finished anyway", "change of plan", "next"]);
   await session.close();
 });
 

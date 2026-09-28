@@ -68,8 +68,11 @@ export function simpleTurn(text = "hi", model = "gpt-test"): SessionEvent[] {
 
 /** What a fake session does when the adapter calls it. Each reaction may emit events. */
 export interface FakeSessionScript {
-  /** Called on each `send()`, with how many sends came before it. */
-  onSend?: (session: FakeCopilotSession, prompt: string, index: number) => void;
+  /**
+   * Called on each `send()`, with how many sends came before it. A promise
+   * returned holds the send until it settles, as Copilot's reply can lag.
+   */
+  onSend?: (session: FakeCopilotSession, prompt: string, index: number) => unknown;
   onAbort?: (session: FakeCopilotSession) => void;
   /** Called on each `interruptMainTurn()`; its return is whether a Turn was interrupted (default true). */
   onInterrupt?: (session: FakeCopilotSession) => boolean | void;
@@ -123,7 +126,8 @@ export class FakeCopilotSession implements CopilotSessionHandle {
     if (this.script.sendError) throw this.script.sendError;
     const index = this.sent.length;
     this.sent.push(prompt);
-    this.script.onSend?.(this, prompt, index);
+    const reaction = this.script.onSend?.(this, prompt, index);
+    if (reaction instanceof Promise) await reaction;
   }
 
   async abort(): Promise<void> {

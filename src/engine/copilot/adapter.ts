@@ -117,8 +117,12 @@ class CopilotEngineSession implements EngineSession {
   private delivering = false;
   /** Set by a Stop that landed while a Command or Steer was being handed over: its Turn is aborted as soon as it starts. */
   private abortWhenStarted = false;
-  /** A Steer queued with Copilot whose user message hasn't come back yet. */
+  /** A Steer handed to Copilot whose user message hasn't come back yet. */
   private steerText: string | undefined;
+  /** Set once Copilot has taken that Steer into its queue. */
+  private steerQueued = false;
+  /** Set once that Steer has been handed over a second time, after Copilot dropped it. */
+  private steerResent = false;
   /** Set while a Steer waits for the tool calls already running to finish before it cuts the Turn. */
   private cutAtToolBoundary = false;
   /** A model announced between Turns, held for the next one. */
@@ -227,9 +231,16 @@ class CopilotEngineSession implements EngineSession {
     }
     if (this.steerText !== undefined) throw new Error("a Steer is already on its way into this Turn");
     this.steerText = text;
+    this.queueSteer(text);
+  }
+
+  /** Hands the Steer to Copilot, and once it is queued behind the running Turn, cuts that Turn. */
+  private queueSteer(text: string): void {
     this.session.send(text).then(
       () => {
-        if (this.steerText !== text || !this.turn) return;
+        if (this.steerText !== text) return;
+        this.steerQueued = true;
+        if (!this.turn) return;
         // Cutting now would cancel a tool call mid-run, which goes further
         // than a Steer does; the cut waits for the tool-call boundary.
         if (this.runningTools.size) this.cutAtToolBoundary = true;
@@ -237,12 +248,46 @@ class CopilotEngineSession implements EngineSession {
       },
       (e) => {
         if (this.steerText !== text) return;
-        this.steerText = undefined;
+        this.clearSteer();
         const unrun: Unrun = { cause: "steer", outcome: "error", errors: [(e as Error).message] };
         if (this.turn) this.unrunAfterTurn.push(unrun);
         else this.reportUnrun(unrun);
       },
     );
+  }
+
+  private clearSteer(): void {
+    this.steerText = undefined;
+    this.steerQueued = false;
+    this.steerResent = false;
+  }
+
+  /**
+   * Copilot runs a queued prompt as soon as the Turn ahead of it ends, without
+   * going idle in between (measured); going idle with the Steer still queued
+   * means Copilot dropped it. Left alone, it would hold back every Command
+   * after it. It is handed over once more, to run as the Steer's own Turn --
+   * unless a Stop has landed since, or Copilot drops it again, and then it is
+   * reported as never run.
+   */
+  private steerDropped(): void {
+    const text = this.steerText!;
+    this.steerQueued = false;
+    if (!this.abortWhenStarted && !this.steerResent) {
+      this.steerResent = true;
+      this.queueSteer(text);
+      return;
+    }
+    this.clearSteer();
+    const stopped = this.abortWhenStarted;
+    this.abortWhenStarted = false;
+    this.reportUnrun(
+      stopped
+        ? { cause: "steer", outcome: "stopped" }
+        : { cause: "steer", outcome: "error", errors: ["Copilot dropped the Steer without running it"] },
+    );
+    for (const unrun of this.unrunAfterTurn.splice(0)) this.reportUnrun(unrun);
+    this.deliverNext();
   }
 
   /**
@@ -294,7 +339,7 @@ class CopilotEngineSession implements EngineSession {
     } else if (this.turn) {
       if (this.steerText !== undefined) {
         // Copilot drops its queue on an abort, the Steer included.
-        this.steerText = undefined;
+        this.clearSteer();
         this.cutAtToolBoundary = false;
         this.unrunAfterTurn.push({ cause: "steer", outcome: "stopped" });
       }
@@ -431,7 +476,8 @@ class CopilotEngineSession implements EngineSession {
   private cut(): void {
     this.cutAtToolBoundary = false;
     this.session.interruptMainTurn().catch((e) => {
-      // The Steer stays queued, and runs once the Turn ends on its own.
+      // The Steer stays queued, and runs once the Turn ends on its own; if
+      // Copilot drops it instead, the idle that follows hands it over again.
       console.error("Failed to cut the Copilot Turn for a Steer:", (e as Error).message);
     });
   }
@@ -503,7 +549,7 @@ class CopilotEngineSession implements EngineSession {
         }
         if (this.turn) this.endTurn("success");
         const cause = this.delivering ? "command" : this.steerText !== undefined ? "steer" : "engine";
-        if (cause === "steer") this.steerText = undefined;
+        if (cause === "steer") this.clearSteer();
         this.delivering = false;
         this.startTurn(cause);
         if (cause !== "engine" && this.abortWhenStarted) {
@@ -613,6 +659,7 @@ class CopilotEngineSession implements EngineSession {
               : "success";
           this.endTurn(outcome);
         }
+        if (!this.turn && this.steerQueued) this.steerDropped();
         return;
     }
   }
@@ -691,7 +738,7 @@ class CopilotEngineSession implements EngineSession {
     }
     const gone = (cause: Unrun["cause"]): Unrun => ({ cause, outcome: "error", errors: [RUNTIME_GONE] });
     if (this.steerText !== undefined) {
-      this.steerText = undefined;
+      this.clearSteer();
       this.reportUnrun(gone("steer"));
     }
     if (this.delivering) {
