@@ -49,7 +49,11 @@ export class FakeRelay {
     return { seq: `auto-${this.postedCommands.length}`, created_at: new Date().toISOString() };
   }
 
+  /** Set to make every postEvents batch carrying an `image` Event reject, as a relay that refuses the Image would. */
+  rejectImageEvents: Error | undefined;
+
   async postEvents(events: EventInput[]): Promise<number> {
+    if (this.rejectImageEvents && events.some((e) => e.type === "image")) throw this.rejectImageEvents;
     this.posted.push(...events);
     return events.length;
   }
@@ -59,14 +63,29 @@ export class FakeRelay {
   /** Every upload sent to S3, keyed by the image id its signature carried. */
   readonly uploaded: { imageId: string; bytes: Uint8Array; contentType: string }[] = [];
 
+  /** Set to make the next signImageUpload reject, as a relay refusing to sign would. */
+  failNextSign: Error | undefined;
+  /** Set to make the next uploadImage reject, as a failed S3 POST would. */
+  failNextUpload: Error | undefined;
+
   async signImageUpload(contentType: string, byteLength: number): Promise<ImageUpload> {
     this.signed.push({ contentType, byteLength });
+    if (this.failNextSign) {
+      const e = this.failNextSign;
+      this.failNextSign = undefined;
+      throw e;
+    }
     const imageId = `img-${this.signed.length}`;
     return { imageId, url: "https://bucket.s3.test/", fields: { key: `images/sess/${imageId}` } };
   }
 
   async uploadImage(upload: ImageUpload, bytes: Uint8Array, contentType: string): Promise<void> {
     this.uploaded.push({ imageId: upload.imageId, bytes, contentType });
+    if (this.failNextUpload) {
+      const e = this.failNextUpload;
+      this.failNextUpload = undefined;
+      throw e;
+    }
   }
 
   /** Every putSkills call, so a test can assert what the periodic report carried. */

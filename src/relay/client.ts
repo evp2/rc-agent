@@ -369,7 +369,7 @@ export class RelayClient {
     });
     await checkTerminal(res);
     if (!res.ok) {
-      throw new Error(`the relay refused to sign the upload: HTTP ${res.status} ${await res.text()}`);
+      throw new Error(`HTTP ${res.status} ${await res.text()}`);
     }
     const body = (await res.json()) as {
       image_id: string;
@@ -388,7 +388,7 @@ export class RelayClient {
     form.append("file", new Blob([bytes], { type: contentType }));
     const res = await boundedFetch(upload.url, { method: "POST", body: form }, IMAGE_UPLOAD_TIMEOUT_MS);
     if (!res.ok) {
-      throw new Error(`the upload failed: HTTP ${res.status} ${await res.text()}`);
+      throw new Error(`HTTP ${res.status} ${await res.text()}`);
     }
   }
 
