@@ -58,11 +58,14 @@ async function readImage(path: string): Promise<{ bytes: Uint8Array; contentType
     }
     if (size > MAX_IMAGE_BYTES) {
       return {
-        reason: `${path} is ${megabytes(size)}, over the 10MB limit for an image; take a smaller screenshot or crop it`,
+        reason: `${path} is ${megabytes(size)}, over the ${MAX_IMAGE_BYTES / (1024 * 1024)}MB limit for an image; take a smaller screenshot or crop it`,
       };
     }
     const bytes = new Uint8Array(size);
-    await handle.read(bytes, 0, size, 0);
+    // A screenshot still being written can shrink between stat and read;
+    // uploading it anyway would send a picture padded out with zeros.
+    const read = await handle.read(bytes, 0, size, 0);
+    if (read.bytesRead !== size) return { reason: `${path} changed while it was being read; try again once it's finished writing` };
     return { bytes, contentType };
   } catch (e) {
     return { reason: `couldn't read ${path}: ${(e as Error).message}` };

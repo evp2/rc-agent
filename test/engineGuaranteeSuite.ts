@@ -9,6 +9,7 @@ import type {
   EngineQuestion,
   ShowImageOutcome,
 } from "../src/engine/types.ts";
+import { IMAGE_SHOWN } from "../src/engine/showImageTool.ts";
 
 /** The `show_image` call every {@link EngineGuaranteeHarness.makeShowImageEngine} Turn makes. */
 export const SHOW_IMAGE_CALL: EngineImage = {
@@ -230,7 +231,8 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
       const result = toolResult();
       assert.ok(result, "the call returned a tool result to the SDK");
       assert.equal(result.isError, !outcome.shown);
-      if (!outcome.shown) assert.equal(result.text, outcome.reason, "the failure carries the reason");
+      if (outcome.shown) assert.equal(result.text, IMAGE_SHOWN, "the success is the shared confirmation");
+      else assert.equal(result.text, outcome.reason, "the failure carries the reason");
       await session.close();
     });
   }
