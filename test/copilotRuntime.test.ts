@@ -55,3 +55,15 @@ test("a session asks its questions as a single question with choices, and declin
   assert.deepEqual(await config.onElicitationRequest(), { action: "decline" });
   assert.equal(config.enableConfigDiscovery, true, "the project's Skills load");
 });
+
+test("a session hands Copilot the connector's own tools, and none when there are none", () => {
+  const base = {
+    model: "auto",
+    workingDirectory: "/p",
+    onPermissionRequest: () => ({ kind: "approve-once" as const }),
+    onUserInputRequest: async () => ({ answer: "x", wasFreeform: false }),
+  };
+  const tools = [{ name: "show_image", handler: () => "ok" }];
+  assert.deepEqual(sdkSessionConfig({ ...base, tools }).tools, tools);
+  assert.equal("tools" in sdkSessionConfig(base), false);
+});

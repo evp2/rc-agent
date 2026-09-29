@@ -7,7 +7,13 @@ import type { SessionEvent } from "@github/copilot-sdk";
 
 import { approveEverything, CopilotEngine } from "../src/engine/copilot/adapter.ts";
 import type { CopilotRuntime } from "../src/engine/copilot/runtime.ts";
-import type { EngineAnswer, EngineEvent, EngineQuestion } from "../src/engine/types.ts";
+import type {
+  EngineAnswer,
+  EngineEvent,
+  EngineImage,
+  EngineQuestion,
+  ShowImageOutcome,
+} from "../src/engine/types.ts";
 import {
   event,
   FakeCopilotRuntime,
@@ -17,7 +23,12 @@ import {
   splitAt,
   type FakeSessionScript,
 } from "./copilotDoubles.ts";
-import { runEngineGuaranteeSuite, type EngineGuaranteeHarness } from "./engineGuaranteeSuite.ts";
+import {
+  runEngineGuaranteeSuite,
+  SHOW_IMAGE_CALL,
+  type EngineGuaranteeHarness,
+  type ShowImageToolResult,
+} from "./engineGuaranteeSuite.ts";
 
 function engineOn(runtime: CopilotRuntime, model = "auto"): CopilotEngine {
   return new CopilotEngine({ startRuntime: async () => runtime, model });
@@ -96,6 +107,44 @@ const harness: EngineGuaranteeHarness = {
         },
       }),
     ),
+
+  // Copilot starts the call, the SDK runs the registered handler, and only
+  // once it has replied does the call complete and the Turn go on.
+  makeShowImageEngine: () => {
+    let seen: ShowImageToolResult | undefined;
+    const { toolUseId, path, caption } = SHOW_IMAGE_CALL;
+    const engine = engineOn(
+      new FakeCopilotRuntime({
+        onSend: async (s) => {
+          s.emit([
+            event("user.message", { content: "show me", delivery: "idle" }),
+            event("assistant.turn_start", { turnId: "0" }),
+            event("tool.execution_start", {
+              toolCallId: toolUseId,
+              toolName: "show_image",
+              arguments: { path, caption },
+            }),
+          ]);
+          const reply = await s.callTool("show_image", { path, caption }, toolUseId);
+          seen =
+            "error" in reply
+              ? { text: reply.error, isError: true }
+              : typeof reply.result === "string"
+                ? { text: reply.result, isError: false }
+                : { text: reply.result.textResultForLlm, isError: reply.result.resultType !== "success" };
+          s.emit([
+            event("tool.execution_complete", {
+              toolCallId: toolUseId,
+              success: !seen.isError,
+              result: { content: seen.text },
+            }),
+            ...simpleTurn("there it is").slice(2),
+          ]);
+        },
+      }),
+    );
+    return { engine, toolResult: () => seen };
+  },
 };
 
 runEngineGuaranteeSuite("CopilotEngine", harness);
@@ -1393,6 +1442,105 @@ test("CopilotEngine: reports it can't Fork, so a Fork is refused before any work
 
 test("CopilotEngine: reports it can Steer", () => {
   assert.equal(engineOn(new FakeCopilotRuntime()).capabilities.steer, true);
+});
+
+// --- show_image forwards to onShowImage -------------------------------------
+
+/** Opens a session with the given `onShowImage`, on a fake runtime whose session the test then drives. */
+async function openWithShowImage(
+  onShowImage: (image: EngineImage, signal: AbortSignal) => Promise<ShowImageOutcome>,
+): Promise<{ runtime: FakeCopilotRuntime; close(): Promise<void> }> {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open({ ...openOptions(), onShowImage });
+  return { runtime, close: () => session.close() };
+}
+
+test("CopilotEngine: show_image is registered, and a call reaches onShowImage with its tool call's id", async () => {
+  const received: { image: EngineImage; signal: AbortSignal }[] = [];
+  const { runtime, close } = await openWithShowImage(async (image, signal) => {
+    received.push({ image, signal });
+    return { shown: true };
+  });
+
+  const tool = runtime.session.options.tools?.find((t) => t.name === "show_image");
+  assert.ok(tool, "show_image is offered to the Engine");
+  assert.deepEqual((tool.parameters as { required?: string[] }).required, ["path"]);
+
+  const signal = new AbortController().signal;
+  const reply = await runtime.session.callTool(
+    "show_image",
+    { path: "/tmp/shot.png", caption: "the login page" },
+    "call_img",
+    signal,
+  );
+
+  assert.deepEqual(
+    received.map((r) => r.image),
+    [{ toolUseId: "call_img", path: "/tmp/shot.png", caption: "the login page" }],
+  );
+  assert.equal(received[0].signal, signal, "the call's own signal, which the SDK aborts when the call is over");
+  assert.ok("result" in reply && typeof reply.result === "object", `a tool result came back: ${JSON.stringify(reply)}`);
+  assert.equal(reply.result.resultType, "success");
+  assert.equal(reply.result.binaryResultsForLlm, undefined, "only text goes back to the model, never the image");
+  await close();
+});
+
+test("CopilotEngine: a show_image with no caption reaches onShowImage without one", async () => {
+  const received: EngineImage[] = [];
+  const { runtime, close } = await openWithShowImage(async (image) => {
+    received.push(image);
+    return { shown: true };
+  });
+
+  await runtime.session.callTool("show_image", { path: "/tmp/shot.png" }, "call_img");
+
+  assert.deepEqual(received, [{ toolUseId: "call_img", path: "/tmp/shot.png" }]);
+  await close();
+});
+
+test("CopilotEngine: a show_image that fails comes back to the Engine as a failure carrying the reason", async () => {
+  const { runtime, close } = await openWithShowImage(async () => ({ shown: false, reason: "not a PNG" }));
+
+  const reply = await runtime.session.callTool("show_image", { path: "/tmp/notes.txt" }, "call_img");
+
+  assert.ok("result" in reply && typeof reply.result === "object", `a tool result came back: ${JSON.stringify(reply)}`);
+  assert.equal(reply.result.resultType, "failure");
+  assert.equal(reply.result.textResultForLlm, "not a PNG");
+  assert.equal(reply.result.error, "not a PNG");
+  await close();
+});
+
+test("CopilotEngine: a show_image whose onShowImage throws comes back as a failure carrying the message", async () => {
+  const { runtime, close } = await openWithShowImage(async () => {
+    throw new Error("relay unreachable");
+  });
+
+  const reply = await runtime.session.callTool("show_image", { path: "/tmp/shot.png" }, "call_img");
+
+  assert.ok("result" in reply && typeof reply.result === "object", `a tool result came back: ${JSON.stringify(reply)}`);
+  assert.equal(reply.result.resultType, "failure");
+  assert.equal(reply.result.textResultForLlm, "relay unreachable");
+  await close();
+});
+
+test("CopilotEngine: a resumed Conversation is offered show_image too", async () => {
+  const runtime = new FakeCopilotRuntime();
+  runtime.known.add("copilot-earlier");
+  const session = await engineOn(runtime).open({
+    ...openOptions({ resume: "copilot-earlier" }),
+    onShowImage: async () => ({ shown: true }),
+  });
+
+  assert.ok(runtime.session.options.tools?.some((t) => t.name === "show_image"));
+  await session.close();
+});
+
+test("CopilotEngine: a session opened without onShowImage offers no show_image tool", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+
+  assert.ok(!runtime.session.options.tools?.some((t) => t.name === "show_image"));
+  await session.close();
 });
 
 // --- Permissions ------------------------------------------------------------

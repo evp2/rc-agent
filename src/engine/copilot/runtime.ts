@@ -7,6 +7,7 @@ import {
   type CopilotSession,
   type PermissionHandler,
   type SessionEvent,
+  type Tool,
 } from "@github/copilot-sdk";
 
 import type { CopilotProviderConfig } from "../../provider";
@@ -87,6 +88,8 @@ export interface CopilotSessionOptions {
   onPermissionRequest: PermissionHandler;
   /** Holds the Turn until the human answers. Rejecting fails the question tool. */
   onUserInputRequest: (request: CopilotUserInputRequest) => Promise<CopilotUserInputResponse>;
+  /** The connector's own tools, run in this process when the model calls them. */
+  tools?: Tool[];
 }
 
 /**
@@ -210,6 +213,7 @@ export function sdkSessionConfig(options: CopilotSessionOptions) {
     // JSON-schema forms have no picker on the phone. Declined, so whatever
     // asked can carry on without an answer rather than wait for one.
     onElicitationRequest: () => ({ action: "decline" as const }),
+    ...(options.tools ? { tools: options.tools } : {}),
   };
 }
 

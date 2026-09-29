@@ -1,4 +1,4 @@
-import type { PermissionHandler, SessionEvent } from "@github/copilot-sdk";
+import type { PermissionHandler, SessionEvent, Tool, ToolResultObject } from "@github/copilot-sdk";
 
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
@@ -7,6 +7,13 @@ import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
 import type { CopilotProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
+import {
+  forwardShowImage,
+  IMAGE_SHOWN,
+  SHOW_IMAGE_CAPTION_DESCRIPTION,
+  SHOW_IMAGE_DESCRIPTION,
+  SHOW_IMAGE_PATH_DESCRIPTION,
+} from "../showImageTool";
 import type { Engine, EngineEvent, EngineQuestion, EngineSession, EngineUsage, OpenOptions } from "../types";
 import {
   startCopilotRuntime,
@@ -45,6 +52,46 @@ export const approveEverything: PermissionHandler = (request) => {
   if (managed !== undefined && managed !== false) return { kind: "no-result" };
   return { kind: "approve-once" };
 };
+
+/**
+ * The `show_image` tool, run in this process when the model calls it. The
+ * handler only forwards: what happens to the file is the connector's
+ * business, behind `onShowImage`.
+ */
+function showImageTool(onShowImage: NonNullable<OpenOptions["onShowImage"]>): Tool {
+  const failure = (reason: string): ToolResultObject => ({
+    textResultForLlm: reason,
+    resultType: "failure",
+    error: reason,
+  });
+  return {
+    name: "show_image",
+    description: SHOW_IMAGE_DESCRIPTION,
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: SHOW_IMAGE_PATH_DESCRIPTION },
+        caption: { type: "string", description: SHOW_IMAGE_CAPTION_DESCRIPTION },
+      },
+      required: ["path"],
+    },
+    // Nothing to approve: it only shows the human a file, and every other
+    // tool is approved anyway.
+    skipPermission: true,
+    defer: "never",
+    handler: async (args, invocation): Promise<ToolResultObject> => {
+      const { path, caption } = (args ?? {}) as { path?: unknown; caption?: unknown };
+      if (typeof path !== "string" || !path) return failure("the image couldn't be shown: no path was given");
+      const outcome = await forwardShowImage(
+        onShowImage,
+        { toolUseId: invocation.toolCallId, path, ...(typeof caption === "string" && caption ? { caption } : {}) },
+        // Aborted once Copilot is done with the call, or the session disconnects.
+        invocation.signal ?? new AbortController().signal,
+      );
+      return outcome.shown ? { textResultForLlm: IMAGE_SHOWN, resultType: "success" } : failure(outcome.reason);
+    },
+  };
+}
 
 type TurnOutcome = Extract<EngineEvent, { type: "turn_ended" }>["outcome"];
 
@@ -1004,6 +1051,7 @@ export class CopilotEngine implements Engine {
       onPermissionRequest: approveEverything,
       onUserInputRequest: (request) =>
         engineSession ? engineSession.ask(request) : Promise.reject(new Error("the session isn't open yet")),
+      ...(options.onShowImage ? { tools: [showImageTool(options.onShowImage)] } : {}),
     };
     // The menu is read before the session is handed over, so the first
     // Command can already be told apart from a Local command.

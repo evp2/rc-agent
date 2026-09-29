@@ -26,7 +26,12 @@ import {
   scriptedQuery,
   taskStarted,
 } from "./claudeDoubles.ts";
-import { runEngineGuaranteeSuite, type EngineGuaranteeHarness } from "./engineGuaranteeSuite.ts";
+import {
+  runEngineGuaranteeSuite,
+  SHOW_IMAGE_CALL,
+  type EngineGuaranteeHarness,
+  type ShowImageToolResult,
+} from "./engineGuaranteeSuite.ts";
 import { reactiveQuery } from "./engineReactiveQuery.ts";
 
 function noQuestionsExpected() {
@@ -81,7 +86,47 @@ const harness: EngineGuaranteeHarness = {
       }),
       env: {},
     }),
+
+  // The model's call goes to the in-process MCP server the adapter handed
+  // the SDK, over the same protocol the real CLI speaks to it, before the
+  // rest of the Turn reaches the adapter.
+  makeShowImageEngine: () => {
+    let seen: ShowImageToolResult | undefined;
+    let options: Options | undefined;
+    const calling = assistantText("let me show you");
+    const { query } = scriptedQuery([init(), calling, assistantText("there it is"), result()], {
+      onOptions: (o) => {
+        options = o;
+      },
+      onYield: async (m) => {
+        if (m !== calling) return;
+        const { toolUseId, path, caption } = SHOW_IMAGE_CALL;
+        const client = await connectToShowImageServer(options);
+        const reply = await client.callTool({
+          name: "show_image",
+          arguments: { path, caption },
+          _meta: { "claudecode/toolUseId": toolUseId },
+        });
+        await client.close();
+        const [first] = reply.content as { type: string; text?: string }[];
+        seen = { text: first?.text ?? "", isError: reply.isError === true };
+      },
+    });
+    return { engine: new ClaudeEngine({ query, env: {} }), toolResult: () => seen };
+  },
 };
+
+/** An MCP client connected to the in-process server the adapter handed the SDK in `options`. */
+async function connectToShowImageServer(options: Options | undefined): Promise<Client> {
+  const servers = Object.values(options?.mcpServers ?? {});
+  const server = servers.find((s): s is McpSdkServerConfigWithInstance => s.type === "sdk");
+  assert.ok(server, "an in-process MCP server was handed to the SDK");
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.instance.connect(serverTransport);
+  const client = new Client({ name: "test", version: "0" });
+  await client.connect(clientTransport);
+  return client;
+}
 
 runEngineGuaranteeSuite("ClaudeEngine", harness);
 
@@ -263,13 +308,7 @@ async function openWithShowImage(
   session.send("show me");
   await collect(it, (e) => e.type === "turn_started");
 
-  const servers = Object.values(capturedOptions?.mcpServers ?? {});
-  const server = servers.find((s): s is McpSdkServerConfigWithInstance => s.type === "sdk");
-  assert.ok(server, "an in-process MCP server was handed to the SDK");
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  await server.instance.connect(serverTransport);
-  const client = new Client({ name: "test", version: "0" });
-  await client.connect(clientTransport);
+  const client = await connectToShowImageServer(capturedOptions);
   return {
     client,
     async close() {

@@ -1,7 +1,27 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { Engine, EngineAnswer, EngineEvent, EngineQuestion } from "../src/engine/types.ts";
+import type {
+  Engine,
+  EngineAnswer,
+  EngineEvent,
+  EngineImage,
+  EngineQuestion,
+  ShowImageOutcome,
+} from "../src/engine/types.ts";
+
+/** The `show_image` call every {@link EngineGuaranteeHarness.makeShowImageEngine} Turn makes. */
+export const SHOW_IMAGE_CALL: EngineImage = {
+  toolUseId: "show-image-1",
+  path: "/tmp/shot.png",
+  caption: "the login page",
+};
+
+/** What the SDK was handed back for a `show_image` call, reduced to what every Engine's tool result carries. */
+export interface ShowImageToolResult {
+  text: string;
+  isError: boolean;
+}
 
 /**
  * What a test harness supplies so the suite can drive each guarantee against
@@ -22,12 +42,25 @@ export interface EngineGuaranteeHarness {
   makeSteerableEngine(): Engine;
   /** A Turn that starts one Background task (id `"bg-1"`) and then hangs open until `stop()` lands. */
   makeBackgroundTaskEngine(): Engine;
+  /**
+   * A Turn whose model calls `show_image` as {@link SHOW_IMAGE_CALL}, the
+   * way the Engine's SDK really would, then finishes once the call has
+   * returned. `toolResult()` is what the SDK got back from it, read once the
+   * Turn has ended; undefined if the call never returned.
+   */
+  makeShowImageEngine(): { engine: Engine; toolResult(): ShowImageToolResult | undefined };
 }
 
-function openOptions(overrides: { resume?: string } = {}): {
+function openOptions(
+  overrides: {
+    resume?: string;
+    onShowImage?: (image: EngineImage, signal: AbortSignal) => Promise<ShowImageOutcome>;
+  } = {},
+): {
   projectDir: string;
   resume?: string;
   onQuestion: (q: EngineQuestion, signal: AbortSignal) => Promise<EngineAnswer>;
+  onShowImage?: (image: EngineImage, signal: AbortSignal) => Promise<ShowImageOutcome>;
 } {
   return {
     projectDir: "/tmp/engine-guarantee-suite",
@@ -176,6 +209,31 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
     assert.equal((settled as Extract<EngineEvent, { type: "task_settled" }>).status, "stopped");
     await session.close();
   });
+
+  for (const outcome of [{ shown: true }, { shown: false, reason: "not a PNG" }] satisfies ShowImageOutcome[]) {
+    const kind = outcome.shown ? "success" : "failure";
+    test(`${name}: a show_image call reaches onShowImage, and its ${kind} comes back as the tool result`, async () => {
+      const { engine, toolResult } = harness.makeShowImageEngine();
+      const received: EngineImage[] = [];
+      const session = await engine.open(
+        openOptions({
+          onShowImage: async (image) => {
+            received.push(image);
+            return outcome;
+          },
+        }),
+      );
+      const it = session.events[Symbol.asyncIterator]();
+      session.send("show me");
+      await readUntil(it, turnEnded);
+      assert.deepEqual(received, [SHOW_IMAGE_CALL]);
+      const result = toolResult();
+      assert.ok(result, "the call returned a tool result to the SDK");
+      assert.equal(result.isError, !outcome.shown);
+      if (!outcome.shown) assert.equal(result.text, outcome.reason, "the failure carries the reason");
+      await session.close();
+    });
+  }
 
   test(`${name}: a missing Conversation opens fresh and is reported as lost`, async () => {
     const session = await harness.makeSimpleEngine().open(openOptions({ resume: "a-conversation-that-does-not-exist" }));

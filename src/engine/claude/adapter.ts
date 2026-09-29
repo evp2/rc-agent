@@ -19,6 +19,13 @@ import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
 import type { ClaudeProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
+import {
+  forwardShowImage,
+  IMAGE_SHOWN,
+  SHOW_IMAGE_CAPTION_DESCRIPTION,
+  SHOW_IMAGE_DESCRIPTION,
+  SHOW_IMAGE_PATH_DESCRIPTION,
+} from "../showImageTool";
 import type {
   Engine,
   EngineEvent,
@@ -99,11 +106,6 @@ function stringifyToolResultContent(content: unknown): string | undefined {
 /** What the in-process MCP server is called, so its tools reach the model as `mcp__rc-agent__<name>`. */
 const MCP_SERVER_NAME = "rc-agent";
 
-const SHOW_IMAGE_DESCRIPTION =
-  "Show the human an image file from this machine -- a screenshot you took, a chart or diagram you rendered. " +
-  "It appears inline in their transcript on their phone. Use it whenever seeing the picture would help them " +
-  "more than a description would. Returns only a confirmation; the image does not come back to you.";
-
 /**
  * The in-process MCP server carrying `show_image`. The handler only forwards:
  * what happens to the file is the connector's business, behind
@@ -114,8 +116,8 @@ function showImageServer(onShowImage: NonNullable<OpenOptions["onShowImage"]>): 
     "show_image",
     SHOW_IMAGE_DESCRIPTION,
     {
-      path: z.string().describe("Path to the image file. Absolute, or relative to the working directory."),
-      caption: z.string().optional().describe("What the human should look at in the image."),
+      path: z.string().describe(SHOW_IMAGE_PATH_DESCRIPTION),
+      caption: z.string().optional().describe(SHOW_IMAGE_CAPTION_DESCRIPTION),
     },
     async ({ path, caption }, extra) => {
       // The CLI sends every MCP call's own tool-use id along in `_meta`,
@@ -130,14 +132,9 @@ function showImageServer(onShowImage: NonNullable<OpenOptions["onShowImage"]>): 
           isError: true,
         };
       }
-      let outcome;
-      try {
-        outcome = await onShowImage({ toolUseId, path, ...(caption ? { caption } : {}) }, signal);
-      } catch (e) {
-        outcome = { shown: false as const, reason: (e as Error).message };
-      }
+      const outcome = await forwardShowImage(onShowImage, { toolUseId, path, ...(caption ? { caption } : {}) }, signal);
       return outcome.shown
-        ? { content: [{ type: "text", text: "The image is now showing in the human's transcript." }] }
+        ? { content: [{ type: "text", text: IMAGE_SHOWN }] }
         : { content: [{ type: "text", text: outcome.reason }], isError: true };
     },
   );

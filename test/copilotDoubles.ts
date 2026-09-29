@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { SessionEvent } from "@github/copilot-sdk";
+import type { SessionEvent, ToolResultObject } from "@github/copilot-sdk";
 
 import type {
   CopilotCommand,
@@ -65,6 +65,9 @@ export function simpleTurn(text = "hi", model = "gpt-test"): SessionEvent[] {
     event("session.idle", {}),
   ];
 }
+
+/** What the SDK hands the runtime back for one tool call: the handler's result, or the message it threw. */
+export type SdkToolReply = { result: string | ToolResultObject } | { error: string };
 
 /** What a fake session does when the adapter calls it. Each reaction may emit events. */
 export interface FakeSessionScript {
@@ -140,6 +143,35 @@ export class FakeCopilotSession implements CopilotSessionHandle {
   /** Asks the question the way Copilot's `ask_user` tool does: through the handler the adapter gave at open. */
   ask(request: CopilotUserInputRequest): Promise<CopilotUserInputResponse> {
     return this.options.onUserInputRequest(request);
+  }
+
+  /**
+   * Runs a tool the adapter registered, the way the SDK does when the model
+   * calls it, and returns what the SDK would hand the runtime back.
+   */
+  async callTool(
+    name: string,
+    args: unknown,
+    toolCallId: string,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<SdkToolReply> {
+    const tool = this.options.tools?.find((t) => t.name === name);
+    if (!tool?.handler) throw new Error(`no tool named ${name} was registered`);
+    try {
+      const invocation = { sessionId: this.sessionId, toolCallId, toolName: name, arguments: args, signal };
+      const raw = await tool.handler(args, invocation);
+      // The SDK's own normalization: a result object passes through, a
+      // string is the text, anything else is sent as JSON.
+      if (raw == null) return { result: "" };
+      if (typeof raw === "string") return { result: raw };
+      const object = raw as { textResultForLlm?: unknown; resultType?: unknown };
+      if (typeof object.textResultForLlm === "string" && typeof object.resultType === "string") {
+        return { result: raw as ToolResultObject };
+      }
+      return { result: JSON.stringify(raw) };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
   }
 
   async interruptMainTurn(): Promise<boolean> {
