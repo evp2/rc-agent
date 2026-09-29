@@ -4,7 +4,9 @@ import { delimiter, isAbsolute, join, resolve } from "node:path";
 import {
   CopilotClient,
   RuntimeConnection,
+  type ContextTier,
   type CopilotSession,
+  type ModelInfo,
   type PermissionHandler,
   type SessionEvent,
   type Tool,
@@ -90,6 +92,9 @@ export interface CopilotSessionOptions {
   onUserInputRequest: (request: CopilotUserInputRequest) => Promise<CopilotUserInputResponse>;
   /** The connector's own tools, run in this process when the model calls them. */
   tools?: Tool[];
+  /** Effort and context tier from the developer's own Copilot settings. */
+  reasoningEffort?: ReasoningEffort;
+  contextTier?: ContextTier;
 }
 
 /**
@@ -185,16 +190,57 @@ class SdkCopilotRuntime implements CopilotRuntime {
   }
 
   async createSession(options: CopilotSessionOptions): Promise<CopilotSessionHandle> {
-    return new SdkCopilotSession(await this.client.createSession(sdkSessionConfig(options)));
+    const withSettings = { ...options, ...(await this.modelSettings(options.model)) };
+    return new SdkCopilotSession(await this.client.createSession(sdkSessionConfig(withSettings)));
   }
 
   async resumeSession(id: string, options: CopilotSessionOptions): Promise<CopilotSessionHandle> {
-    return new SdkCopilotSession(await this.client.resumeSession(id, sdkSessionConfig(options)));
+    const withSettings = { ...options, ...(await this.modelSettings(options.model)) };
+    return new SdkCopilotSession(await this.client.resumeSession(id, sdkSessionConfig(withSettings)));
+  }
+
+  /**
+   * A session made through the SDK does not pick up `effortLevel` and
+   * `contextTier` from the developer's settings.json, so they are read from
+   * the runtime and passed in. The settings RPC is experimental and the model
+   * list needs a login, so a failure of either just means no settings apply.
+   */
+  private async modelSettings(model: string): Promise<Pick<CopilotSessionOptions, "reasoningEffort" | "contextTier">> {
+    try {
+      const { settings } = await this.client.rpc.user.settings.get();
+      const chosen = { effortLevel: settings.effortLevel?.value, contextTier: settings.contextTier?.value };
+      const info = chosen.effortLevel == null ? undefined : (await this.client.listModels()).find((m) => m.id === model);
+      return resolveModelSettings(chosen, info);
+    } catch (e) {
+      console.log(`Couldn't read Copilot's model settings: ${(e as Error).message}`);
+      return {};
+    }
   }
 
   async stop(): Promise<void> {
     await this.client.stop();
   }
+}
+
+type ReasoningEffort = NonNullable<ModelInfo["supportedReasoningEfforts"]>[number];
+
+const CONTEXT_TIERS: readonly unknown[] = ["default", "long_context"];
+
+/**
+ * Narrows the developer's saved `effortLevel` and `contextTier` to what a
+ * session can be given. Effort is dropped unless the model lists that level:
+ * Copilot refuses to create a session that asks a model, `auto` included, for
+ * an effort it doesn't support.
+ */
+export function resolveModelSettings(
+  saved: { effortLevel?: unknown; contextTier?: unknown },
+  model: Pick<ModelInfo, "supportedReasoningEfforts"> | undefined,
+): Pick<CopilotSessionOptions, "reasoningEffort" | "contextTier"> {
+  const effort = model?.supportedReasoningEfforts?.find((level) => level === saved.effortLevel);
+  return {
+    ...(effort ? { reasoningEffort: effort } : {}),
+    ...(CONTEXT_TIERS.includes(saved.contextTier) ? { contextTier: saved.contextTier as ContextTier } : {}),
+  };
 }
 
 export function sdkSessionConfig(options: CopilotSessionOptions) {
@@ -214,6 +260,8 @@ export function sdkSessionConfig(options: CopilotSessionOptions) {
     // asked can carry on without an answer rather than wait for one.
     onElicitationRequest: () => ({ action: "decline" as const }),
     ...(options.tools ? { tools: options.tools } : {}),
+    ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    ...(options.contextTier ? { contextTier: options.contextTier } : {}),
   };
 }
 

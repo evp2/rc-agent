@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { chooseRuntime, sdkSessionConfig } from "../src/engine/copilot/runtime.ts";
+import { chooseRuntime, resolveModelSettings, sdkSessionConfig } from "../src/engine/copilot/runtime.ts";
 
 function binDirWithCopilot(): string {
   const dir = mkdtempSync(join(tmpdir(), "crc-copilot-bin-"));
@@ -66,4 +66,33 @@ test("a session hands Copilot the connector's own tools, and none when there are
   const tools = [{ name: "show_image", handler: () => "ok" }];
   assert.deepEqual(sdkSessionConfig({ ...base, tools }).tools, tools);
   assert.equal("tools" in sdkSessionConfig(base), false);
+});
+
+test("saved effort is passed only when the model lists that level", () => {
+  const model = { supportedReasoningEfforts: ["low", "high"] as ("low" | "high")[] };
+  assert.deepEqual(resolveModelSettings({ effortLevel: "high" }, model), { reasoningEffort: "high" });
+  assert.deepEqual(resolveModelSettings({ effortLevel: "max" }, model), {});
+  assert.deepEqual(resolveModelSettings({ effortLevel: "high" }, {}), {}, "auto lists none, and refuses one");
+  assert.deepEqual(resolveModelSettings({ effortLevel: "high" }, undefined), {});
+  assert.deepEqual(resolveModelSettings({ effortLevel: null }, model), {}, "unset settings come back null");
+});
+
+test("a saved context tier is passed when it is one Copilot knows", () => {
+  assert.deepEqual(resolveModelSettings({ contextTier: "long_context" }, undefined), { contextTier: "long_context" });
+  assert.deepEqual(resolveModelSettings({ contextTier: "huge" }, undefined), {});
+  assert.deepEqual(resolveModelSettings({ contextTier: null }, undefined), {});
+});
+
+test("a session config carries effort and tier only when there are some", () => {
+  const base = {
+    model: "m",
+    workingDirectory: "/p",
+    onPermissionRequest: () => ({ kind: "approve-once" as const }),
+    onUserInputRequest: async () => ({ answer: "x", wasFreeform: false }),
+  };
+  const config = sdkSessionConfig({ ...base, reasoningEffort: "low", contextTier: "long_context" });
+  assert.equal(config.reasoningEffort, "low");
+  assert.equal(config.contextTier, "long_context");
+  assert.equal("reasoningEffort" in sdkSessionConfig(base), false);
+  assert.equal("contextTier" in sdkSessionConfig(base), false);
 });
