@@ -1,9 +1,10 @@
 import { FakeEngine, sayAndFinish, type FakeEngineScript, type FakeEngineSession } from "../src/engine/fakeEngine.ts";
 import type { Engine, EngineSession } from "../src/engine/types.ts";
-import type { CommandRecord, EventInput, RelayClient } from "../src/relay/client.ts";
+import type { CommandRecord, EventInput, ImageUpload, RelayClient } from "../src/relay/client.ts";
 import type { SessionContext } from "../src/session/context.ts";
 import { createBannerDeduper } from "../src/session/engineEvents.ts";
 import { InFlight, type InFlightDeps } from "../src/session/inFlight.ts";
+import { showImage } from "../src/session/images.ts";
 import { pumpEngineEvents } from "../src/session/pump.ts";
 import { answerQuestion } from "../src/session/watchers.ts";
 import type { ConnectorState } from "../src/state.ts";
@@ -51,6 +52,21 @@ export class FakeRelay {
   async postEvents(events: EventInput[]): Promise<number> {
     this.posted.push(...events);
     return events.length;
+  }
+
+  /** Every upload the relay was asked to sign. */
+  readonly signed: { contentType: string; byteLength: number }[] = [];
+  /** Every upload sent to S3, keyed by the image id its signature carried. */
+  readonly uploaded: { imageId: string; bytes: Uint8Array; contentType: string }[] = [];
+
+  async signImageUpload(contentType: string, byteLength: number): Promise<ImageUpload> {
+    this.signed.push({ contentType, byteLength });
+    const imageId = `img-${this.signed.length}`;
+    return { imageId, url: "https://bucket.s3.test/", fields: { key: `images/sess/${imageId}` } };
+  }
+
+  async uploadImage(upload: ImageUpload, bytes: Uint8Array, contentType: string): Promise<void> {
+    this.uploaded.push({ imageId: upload.imageId, bytes, contentType });
   }
 
   /** Every putSkills call, so a test can assert what the periodic report carried. */
@@ -181,6 +197,7 @@ export async function makeTurnHarness(
     projectDir,
     resume: opts.resume,
     onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
+    onShowImage: (image, signal) => showImage(ctx, image, signal),
   });
 
   ctx = {

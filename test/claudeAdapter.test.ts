@@ -4,11 +4,19 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
-import type { HookInput, Options } from "@anthropic-ai/claude-agent-sdk";
+import type { HookInput, McpSdkServerConfigWithInstance, Options } from "@anthropic-ai/claude-agent-sdk";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { ClaudeEngine } from "../src/engine/claude/adapter.ts";
 import { transcriptPath } from "../src/engine/claude/transcript.ts";
-import type { EngineAnswer, EngineEvent, EngineQuestion } from "../src/engine/types.ts";
+import type {
+  EngineAnswer,
+  EngineEvent,
+  EngineImage,
+  EngineQuestion,
+  ShowImageOutcome,
+} from "../src/engine/types.ts";
 import {
   assistantText,
   compactBoundary,
@@ -230,6 +238,111 @@ test("ClaudeEngine: an assistant message's AskUserQuestion tool_use produces no 
   session.send("ask something");
   const events = await collect(it, (e) => e.type === "turn_ended");
   assert.ok(!events.some((e) => e.type === "tool_use"), "the question tool never becomes a tool_use event");
+  await session.close();
+});
+
+// --- show_image forwards to onShowImage -------------------------------------
+
+/**
+ * Opens a session with the given `onShowImage`, starts a Turn, and connects
+ * an MCP client to whatever in-process server the adapter handed the SDK --
+ * the same protocol the real CLI speaks to it.
+ */
+async function openWithShowImage(
+  onShowImage: (image: EngineImage, signal: AbortSignal) => Promise<ShowImageOutcome>,
+): Promise<{ client: Client; close(): Promise<void> }> {
+  let capturedOptions: Options | undefined;
+  const { query } = scriptedQuery([init()], {
+    onOptions: (options) => {
+      capturedOptions = options;
+    },
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected(), onShowImage });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("show me");
+  await collect(it, (e) => e.type === "turn_started");
+
+  const servers = Object.values(capturedOptions?.mcpServers ?? {});
+  const server = servers.find((s): s is McpSdkServerConfigWithInstance => s.type === "sdk");
+  assert.ok(server, "an in-process MCP server was handed to the SDK");
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.instance.connect(serverTransport);
+  const client = new Client({ name: "test", version: "0" });
+  await client.connect(clientTransport);
+  return {
+    client,
+    async close() {
+      await client.close();
+      await session.close();
+    },
+  };
+}
+
+test("ClaudeEngine: show_image is registered, and a call reaches onShowImage with its tool-use id", async () => {
+  let received: EngineImage | undefined;
+  const { client, close } = await openWithShowImage(async (image) => {
+    received = image;
+    return { shown: true };
+  });
+
+  const { tools } = await client.listTools();
+  assert.ok(tools.some((t) => t.name === "show_image"), "show_image is offered to the Engine");
+
+  const result = await client.callTool({
+    name: "show_image",
+    arguments: { path: "/tmp/shot.png", caption: "the login page" },
+    _meta: { "claudecode/toolUseId": "toolu_img" },
+  });
+
+  assert.deepEqual(received, { toolUseId: "toolu_img", path: "/tmp/shot.png", caption: "the login page" });
+  assert.equal(result.isError, undefined);
+  assert.equal((result.content as { type: string }[])[0].type, "text");
+  await close();
+});
+
+test("ClaudeEngine: a show_image that fails comes back to the Engine as an error carrying the reason", async () => {
+  const { client, close } = await openWithShowImage(async () => ({ shown: false, reason: "not a PNG" }));
+
+  const result = await client.callTool({
+    name: "show_image",
+    arguments: { path: "/tmp/notes.txt" },
+    _meta: { "claudecode/toolUseId": "toolu_img" },
+  });
+
+  assert.equal(result.isError, true);
+  assert.deepEqual(result.content, [{ type: "text", text: "not a PNG" }]);
+  await close();
+});
+
+test("ClaudeEngine: a show_image call with no tool-use id is refused before it reaches onShowImage", async () => {
+  let called = false;
+  const { client, close } = await openWithShowImage(async () => {
+    called = true;
+    return { shown: true };
+  });
+
+  const result = await client.callTool({ name: "show_image", arguments: { path: "/tmp/shot.png" } });
+
+  assert.equal(called, false);
+  assert.equal(result.isError, true);
+  await close();
+});
+
+test("ClaudeEngine: a session opened without onShowImage offers no show_image tool", async () => {
+  let capturedOptions: Options | undefined;
+  const { query } = scriptedQuery([init()], {
+    onOptions: (options) => {
+      capturedOptions = options;
+    },
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("hello");
+  await collect(it, (e) => e.type === "turn_started");
+
+  assert.equal(capturedOptions?.mcpServers, undefined);
   await session.close();
 });
 

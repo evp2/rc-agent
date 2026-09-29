@@ -10,6 +10,7 @@ import { persist } from "./commands";
 import type { SessionContext } from "./context";
 import { createBannerDeduper } from "./engineEvents";
 import { flushEvents } from "./events";
+import { showImage } from "./images";
 import { InFlight } from "./inFlight";
 import { pumpEngineEvents } from "./pump";
 import { runTurn } from "./turn";
@@ -215,6 +216,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     projectDir: config.projectDir,
     resume: conversationId,
     onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
+    onShowImage: (image, signal) => showImage(ctx, image, signal),
   });
 
   ctx = {

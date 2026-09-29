@@ -1,15 +1,19 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import type {
-  CanUseTool,
-  HookInput,
-  Options,
-  Query,
-  SDKMessage,
-  SDKUserMessage,
-  query as realQuery,
+import {
+  createSdkMcpServer,
+  tool,
+  type CanUseTool,
+  type HookInput,
+  type McpSdkServerConfigWithInstance,
+  type Options,
+  type Query,
+  type SDKMessage,
+  type SDKUserMessage,
+  type query as realQuery,
 } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 
 import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
@@ -90,6 +94,54 @@ function stringifyToolResultContent(content: unknown): string | undefined {
       .join("\n");
   }
   return JSON.stringify(content);
+}
+
+/** What the in-process MCP server is called, so its tools reach the model as `mcp__rc-agent__<name>`. */
+const MCP_SERVER_NAME = "rc-agent";
+
+const SHOW_IMAGE_DESCRIPTION =
+  "Show the human an image file from this machine -- a screenshot you took, a chart or diagram you rendered. " +
+  "It appears inline in their transcript on their phone. Use it whenever seeing the picture would help them " +
+  "more than a description would. Returns only a confirmation; the image does not come back to you.";
+
+/**
+ * The in-process MCP server carrying `show_image`. The handler only forwards:
+ * what happens to the file is the connector's business, behind
+ * `onShowImage`.
+ */
+function showImageServer(onShowImage: NonNullable<OpenOptions["onShowImage"]>): McpSdkServerConfigWithInstance {
+  const showImage = tool(
+    "show_image",
+    SHOW_IMAGE_DESCRIPTION,
+    {
+      path: z.string().describe("Path to the image file. Absolute, or relative to the working directory."),
+      caption: z.string().optional().describe("What the human should look at in the image."),
+    },
+    async ({ path, caption }, extra) => {
+      // The CLI sends every MCP call's own tool-use id along in `_meta`,
+      // which is what lets the phone put the picture where the call was.
+      const { _meta, signal } = extra as { _meta?: Record<string, unknown>; signal: AbortSignal };
+      const toolUseId = _meta?.["claudecode/toolUseId"];
+      if (typeof toolUseId !== "string" || !toolUseId) {
+        // Without it the phone could never place the picture, so it would
+        // vanish; better the Engine hears that than believes it was shown.
+        return {
+          content: [{ type: "text", text: "the image couldn't be shown: this call carried no tool-use id" }],
+          isError: true,
+        };
+      }
+      let outcome;
+      try {
+        outcome = await onShowImage({ toolUseId, path, ...(caption ? { caption } : {}) }, signal);
+      } catch (e) {
+        outcome = { shown: false as const, reason: (e as Error).message };
+      }
+      return outcome.shown
+        ? { content: [{ type: "text", text: "The image is now showing in the human's transcript." }] }
+        : { content: [{ type: "text", text: outcome.reason }], isError: true };
+    },
+  );
+  return createSdkMcpServer({ name: MCP_SERVER_NAME, tools: [showImage], alwaysLoad: true });
 }
 
 type TurnEndedExtra = Partial<Omit<Extract<EngineEvent, { type: "turn_ended" }>, "type" | "durationMs">>;
@@ -195,6 +247,11 @@ class ClaudeEngineSession implements EngineSession {
       canUseTool: this.makeCanUseTool(),
       ...(this.conversationId ? { resume: this.conversationId } : {}),
       hooks: { PreCompact: [{ hooks: [this.makePreCompactHook()] }] },
+      // A fresh server per query: an in-process MCP server instance binds to
+      // one transport, and each query brings its own.
+      ...(this.options.onShowImage
+        ? { mcpServers: { [MCP_SERVER_NAME]: showImageServer(this.options.onShowImage) } }
+        : {}),
     };
 
     const activeQuery = this.deps.query({ prompt: input, options: claudeOptions });

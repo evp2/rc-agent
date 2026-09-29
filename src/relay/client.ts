@@ -54,7 +54,8 @@ export type EventType =
   | "background_task_started"
   | "background_task_settled"
   | "background_tasks_changed"
-  | "usage";
+  | "usage"
+  | "image";
 
 /** How a Background task ended. `interrupted` is the connector's own outcome for a task a process restart killed, not one the SDK reports. */
 export type TaskStatus = "completed" | "failed" | "stopped" | "interrupted";
@@ -110,6 +111,19 @@ export interface EventInput {
   fork_error?: string;
   /** Why the Fork failed, when it could be classified -- an addition to `fork_error`, never a replacement. */
   fork_error_code?: ForkErrorCode;
+  /** On an `image` event: the id the relay minted when it signed the upload. */
+  image_id?: string;
+  /** On an `image` event: the Image's MIME type. */
+  content_type?: string;
+  /** On an `image` event: what the Engine wants the human to look at, if it said. */
+  caption?: string;
+}
+
+/** A presigned S3 POST for one Image, as the relay hands it back: where to send it, and the form fields its policy was signed over. */
+export interface ImageUpload {
+  imageId: string;
+  url: string;
+  fields: Record<string, string>;
 }
 
 export interface CreateSessionInput {
@@ -151,6 +165,9 @@ function boundedFetch(
 ): Promise<Response> {
   return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
 }
+
+/** An Image can be up to 10MB, so its upload gets far longer than a JSON call to finish. */
+const IMAGE_UPLOAD_TIMEOUT_MS = 120_000;
 
 /**
  * Thin fetch wrapper around the relay's JSON API. One instance per connector
@@ -334,6 +351,45 @@ export class RelayClient {
     }
     const body = (await res.json()) as { accepted: number };
     return body.accepted;
+  }
+
+  /**
+   * Asks the relay to mint an Image id and sign an upload for it. The
+   * signature pins the object key, the content type and a size cap, so S3
+   * itself refuses anything else -- this connector never holds AWS
+   * credentials.
+   *
+   * Throws {@link SessionEndedError} once the relay reports the session gone.
+   */
+  async signImageUpload(contentType: string, byteLength: number): Promise<ImageUpload> {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/images`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.authHeaders() },
+      body: JSON.stringify({ content_type: contentType, byte_length: byteLength }),
+    });
+    await checkTerminal(res);
+    if (!res.ok) {
+      throw new Error(`the relay refused to sign the upload: HTTP ${res.status} ${await res.text()}`);
+    }
+    const body = (await res.json()) as {
+      image_id: string;
+      upload: { url: string; fields: Record<string, string> };
+    };
+    return { imageId: body.image_id, url: body.upload.url, fields: body.upload.fields };
+  }
+
+  /**
+   * Sends an Image's bytes straight to S3 with the POST the relay signed. The
+   * file must be the form's last part: S3 ignores any field after it.
+   */
+  async uploadImage(upload: ImageUpload, bytes: Uint8Array, contentType: string): Promise<void> {
+    const form = new FormData();
+    for (const [name, value] of Object.entries(upload.fields)) form.append(name, value);
+    form.append("file", new Blob([bytes], { type: contentType }));
+    const res = await boundedFetch(upload.url, { method: "POST", body: form }, IMAGE_UPLOAD_TIMEOUT_MS);
+    if (!res.ok) {
+      throw new Error(`the upload failed: HTTP ${res.status} ${await res.text()}`);
+    }
   }
 
   /**

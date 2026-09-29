@@ -49,6 +49,14 @@ export interface OpenOptions {
    * (rejecting is fine).
    */
   onQuestion(question: EngineQuestion, signal: AbortSignal): Promise<EngineAnswer>;
+  /**
+   * Called when the Engine uses its `show_image` tool. The adapter only
+   * registers the tool and forwards here; everything about the file and its
+   * trip to the phone is the connector's. The outcome goes back to the
+   * Engine as the tool's result -- text only, never the image itself. Absent
+   * means the Engine offers no `show_image` tool at all.
+   */
+  onShowImage?(image: EngineImage, signal: AbortSignal): Promise<ShowImageOutcome>;
 }
 
 export interface EngineSession {
@@ -84,6 +92,17 @@ export interface EngineQuestion {
     multiSelect: boolean;
   }[];
 }
+
+/** One `show_image` call: a file on this machine the Engine chose to show the human. */
+export interface EngineImage {
+  /** The call's own tool-use id, so the phone can put the picture where the call was. */
+  toolUseId: string;
+  path: string;
+  caption?: string;
+}
+
+/** Either the Image reached the phone, or the reason it didn't, for the Engine to act on. */
+export type ShowImageOutcome = { shown: true } | { shown: false; reason: string };
 
 export interface EngineAnswer {
   answers: Record<string, string>;

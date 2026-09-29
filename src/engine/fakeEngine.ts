@@ -6,11 +6,13 @@ import type {
   Engine,
   EngineAnswer,
   EngineEvent,
+  EngineImage,
   EngineKind,
   EngineQuestion,
   EngineSession,
   EngineUsage,
   OpenOptions,
+  ShowImageOutcome,
 } from "./types";
 
 /** What a scripted Turn's body can do and observe, handed to a {@link FakeTurnHandler}. */
@@ -22,6 +24,12 @@ export interface FakeTurnContext {
   emit(event: Exclude<EngineEvent, { type: "turn_started" } | { type: "turn_ended" }>): void;
   /** Invokes `onQuestion` exactly as a real Engine would, and returns the Answer. */
   ask(question: EngineQuestion): Promise<EngineAnswer>;
+  /**
+   * Emits the `show_image` call's `tool_use`, then invokes `onShowImage` the
+   * way a real Engine would and emits its outcome as the `tool_result`.
+   * Resolves to the outcome.
+   */
+  showImage(image: EngineImage): Promise<ShowImageOutcome>;
   /**
    * Resolves the next time `steer()` is called while this Turn is running,
    * with the steered text. A handler that means to be steerable races this
@@ -123,6 +131,10 @@ class TurnController implements FakeTurnContext {
     return this.session.askQuestion(question, this);
   }
 
+  showImage(image: EngineImage): Promise<ShowImageOutcome> {
+    return this.session.showImage(image, this);
+  }
+
   waitForSteer(): Promise<string> {
     // A Turn that ends (or is stopped) without ever being Steered leaves this
     // hanging rather than rejecting, since nothing is left that will ever
@@ -206,6 +218,28 @@ class FakeEngineSessionImpl implements FakeEngineSession {
     return this.options.onQuestion(question, abortController.signal).finally(() => {
       this.pendingQuestion = undefined;
     });
+  }
+
+  async showImage(image: EngineImage, turn: TurnController): Promise<ShowImageOutcome> {
+    const onShowImage = this.options.onShowImage;
+    if (!onShowImage) throw new Error("this session was opened without onShowImage");
+    this.outbox.push({
+      type: "tool_use",
+      toolUseId: image.toolUseId,
+      name: "show_image",
+      input: { path: image.path, ...(image.caption !== undefined ? { caption: image.caption } : {}) },
+    });
+    const abortController = new AbortController();
+    if (turn.stopped) abortController.abort();
+    else void turn.waitForStop().then(() => abortController.abort());
+    const outcome = await onShowImage(image, abortController.signal);
+    this.outbox.push({
+      type: "tool_result",
+      toolUseId: image.toolUseId,
+      text: outcome.shown ? "shown" : outcome.reason,
+      isError: !outcome.shown,
+    });
+    return outcome;
   }
 
   send(text: string): void {
