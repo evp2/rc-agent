@@ -540,6 +540,25 @@ test("CopilotEngine: a background agent settles with the status Copilot's comple
   await session.close();
 });
 
+test("CopilotEngine: a background agent Copilot lists as idle has finished, and settles as completed", async () => {
+  // Copilot keeps a finished agent listed as idle, open to follow-up
+  // messages, and never goes on to list it completed (measured on CLI 1.0.88).
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  const agent = { id: "agent-1", type: "agent", executionMode: "background", toolCallId: "call-agent", description: "say hello" } as const;
+  runtime.session.tasks = [{ ...agent, status: "running" }];
+  runtime.session.emit([event("session.background_tasks_changed", {})]);
+  await collect(it, (e) => e.type === "tasks_changed");
+
+  runtime.session.tasks = [{ ...agent, status: "idle" }];
+  runtime.session.emit([event("session.background_tasks_changed", {})]);
+  const events = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(events, "task_settled").map((e) => [e.taskId, e.toolUseId, e.status]), [["agent-1", "call-agent", "completed"]]);
+  assert.deepEqual(only(events, "tasks_changed")[0].tasks, []);
+  await session.close();
+});
+
 test("CopilotEngine: closing ends the Background tasks still running, and reports none of them settled", async () => {
   // They would outlive the connector; left unsettled, the next start reports
   // them interrupted by the restart.

@@ -970,8 +970,13 @@ function isBackgroundTask(task: CopilotTask): boolean {
   return task.executionMode !== "sync";
 }
 
+/**
+ * An agent that has done its work goes idle, open to follow-up messages, and
+ * Copilot never goes on to list it completed (measured on CLI 1.0.88), so an
+ * idle agent has finished.
+ */
 function isRunning(task: CopilotTask): boolean {
-  return task.status === "running" || task.status === "idle";
+  return task.status === "running" || (task.status === "idle" && task.type !== "agent");
 }
 
 /**
