@@ -88,6 +88,10 @@ export interface FakeSessionScript {
 export class FakeCopilotSession implements CopilotSessionHandle {
   readonly sent: string[] = [];
   readonly cancelled: string[] = [];
+  /** Ids of the schedules removed, in order. */
+  readonly schedulesStopped: number[] = [];
+  /** Ids of the schedules Copilot has registered. */
+  schedules: number[] = [];
   readonly invoked: { name: string; input?: string }[] = [];
   aborts = 0;
   interrupts = 0;
@@ -205,6 +209,17 @@ export class FakeCopilotSession implements CopilotSessionHandle {
     this.cancelled.push(id);
     const task = this.tasks.find((t) => t.id === id);
     if (task) task.status = "cancelled";
+  }
+
+  /** Removes a schedule the way Copilot does, announcing it cancelled (measured on CLI 1.0.88). */
+  async listSchedules(): Promise<number[]> {
+    return this.schedules;
+  }
+
+  async stopSchedule(id: number): Promise<void> {
+    this.schedulesStopped.push(id);
+    this.schedules = this.schedules.filter((s) => s !== id);
+    this.emit([event("session.schedule_cancelled", { id })]);
   }
 
   async disconnect(): Promise<void> {

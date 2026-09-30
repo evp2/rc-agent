@@ -121,6 +121,10 @@ export interface CopilotSessionHandle {
   invokeCommand(name: string, input?: string): Promise<CopilotCommandResult>;
   listTasks(): Promise<CopilotTask[]>;
   cancelTask(id: string): Promise<void>;
+  /** The ids of the scheduled prompts still registered. */
+  listSchedules(): Promise<number[]>;
+  /** Removes a scheduled prompt, so it fires no more. */
+  stopSchedule(id: number): Promise<void>;
   disconnect(): Promise<void>;
 }
 
@@ -328,6 +332,15 @@ class SdkCopilotSession implements CopilotSessionHandle {
     if (task?.type === "shell" && task.attachmentMode === "detached" && task.status === "running" && task.pid) {
       killProcessGroupOf(task.pid);
     }
+  }
+
+  async listSchedules(): Promise<number[]> {
+    const { entries } = await this.session.rpc.schedule.list();
+    return entries.map((e) => e.id);
+  }
+
+  async stopSchedule(id: number): Promise<void> {
+    await this.session.rpc.schedule.stop({ id });
   }
 
   async disconnect(): Promise<void> {

@@ -420,8 +420,8 @@ class CopilotEngineSession implements EngineSession {
     } else {
       for (const unrun of droppedUnrun) this.reportUnrun(unrun);
     }
-    // Detached shells and background agents survive an abort, and would
-    // wake the agent back into the work the human just stopped.
+    // Detached shells, background agents and schedules survive an abort, and
+    // would wake the agent back into the work the human just stopped.
     void this.cancelBackgroundTasks();
   }
 
@@ -432,15 +432,18 @@ class CopilotEngineSession implements EngineSession {
    * then reports it completed.
    */
   async killTask(taskId: string): Promise<void> {
-    if (this.liveTasks.get(taskId)?.taskType === "shell") this.shellsKilled.add(taskId);
-    await this.session.cancelTask(taskId).catch(() => undefined);
+    const taskType = this.liveTasks.get(taskId)?.taskType;
+    if (taskType === "shell") this.shellsKilled.add(taskId);
+    if (taskType === "schedule") await this.session.stopSchedule(scheduleIdOf(taskId)).catch(() => undefined);
+    else await this.session.cancelTask(taskId).catch(() => undefined);
     if (this.settleTask(taskId, "stopped")) this.reportLiveTasks();
   }
 
   /**
    * Ends the Background tasks still running too, since they would outlive the
    * connector -- Copilot's runtime going away leaves a detached shell running,
-   * and a resumed session doesn't list it. None is reported settled: the
+   * and a resumed session doesn't list it, while a schedule comes back with
+   * the resumed session and fires again. None is reported settled: the
    * next start reports each as interrupted by the restart.
    */
   async close(): Promise<void> {
@@ -579,16 +582,13 @@ class CopilotEngineSession implements EngineSession {
   }
 
   private async cancelBackgroundTasks(): Promise<void> {
-    let tasks: CopilotTask[];
-    try {
-      tasks = await this.session.listTasks();
-    } catch {
-      return;
-    }
+    const tasks = await this.session.listTasks().catch((): CopilotTask[] => []);
     for (const task of tasks.filter((t) => isBackgroundTask(t) && isRunning(t))) {
       if (task.type === "shell") this.shellsKilled.add(task.id);
       await this.session.cancelTask(task.id).catch(() => undefined);
     }
+    const schedules = await this.session.listSchedules().catch((): number[] => []);
+    for (const id of schedules) await this.session.stopSchedule(id).catch(() => undefined);
   }
 
   private handle(event: SessionEvent): void {
@@ -709,6 +709,20 @@ class CopilotEngineSession implements EngineSession {
         return;
       case "session.background_tasks_changed":
         this.refreshTasks();
+        return;
+      case "session.schedule_created": {
+        // A schedule wakes the agent on its own until removed, so it is shown
+        // as a Background task, which the human can Kill.
+        const taskId = scheduleTaskId(event.data.id);
+        const description = event.data.displayPrompt ?? event.data.prompt;
+        this.liveTasks.set(taskId, { taskType: "schedule", description });
+        this.outbox.push({ type: "task_started", taskId, description, taskType: "schedule", ambient: false });
+        this.reportLiveTasks();
+        return;
+      }
+      case "session.schedule_cancelled":
+        // A one-shot schedule that has fired; one removed by Kill has already settled.
+        if (this.settleTask(scheduleTaskId(event.data.id), "completed")) this.reportLiveTasks();
         return;
       case "session.compaction_start":
         // Copilot compacts on its own in the background once the context
@@ -965,6 +979,15 @@ function isMenuCommand(command: CopilotCommand): boolean {
 
 function commandInfo(command: CopilotCommand): SkillInfo {
   return { name: command.name, description: command.description, argumentHint: command.input?.hint ?? "" };
+}
+
+/** Copilot numbers schedules apart from its tasks, so the Background task for one is named apart too. */
+function scheduleTaskId(id: number): string {
+  return `schedule-${id}`;
+}
+
+function scheduleIdOf(taskId: string): number {
+  return Number(taskId.slice("schedule-".length));
 }
 
 /** Copilot lists foreground shells as tasks too; only work that runs on its own is a Background task. */

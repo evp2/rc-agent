@@ -586,6 +586,92 @@ test("CopilotEngine: a finished background agent a follow-up message wakes is ru
   await session.close();
 });
 
+test("CopilotEngine: a schedule Copilot creates is a Background task, named for the prompt it fires", async () => {
+  // Measured on CLI 1.0.88: `/every` and `/after`, and the agent's own
+  // manage_schedule, each announce the schedule they register.
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  runtime.session.emit([
+    event("session.schedule_created", { id: 1, intervalMs: 60000, prompt: "probe the host", recurring: true, origin: "user" }),
+  ]);
+  const events = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(
+    only(events, "task_started").map((e) => [e.taskId, e.taskType, e.description, e.toolUseId]),
+    [["schedule-1", "schedule", "probe the host", undefined]],
+  );
+  assert.deepEqual(only(events, "tasks_changed")[0].tasks.map((t) => t.taskId), ["schedule-1"]);
+  await session.close();
+});
+
+test("CopilotEngine: Kill on a schedule removes it from Copilot, so it fires no more, and its card shows stopped", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  runtime.session.emit([
+    event("session.schedule_created", { id: 1, intervalMs: 60000, prompt: "probe the host", recurring: true, origin: "user" }),
+    event("session.schedule_created", { id: 2, intervalMs: 60000, prompt: "check the deploy", recurring: true, origin: "user" }),
+  ]);
+  await collect(it, (e) => e.type === "tasks_changed" && e.tasks.length === 2);
+
+  await session.killTask("schedule-1");
+  const events = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(runtime.session.schedulesStopped, [1]);
+  assert.deepEqual(runtime.session.cancelled, [], "a schedule isn't one of Copilot's tasks");
+  assert.deepEqual(only(events, "task_settled").map((e) => [e.taskId, e.status]), [["schedule-1", "stopped"]]);
+  assert.deepEqual(only(events, "tasks_changed")[0].tasks.map((t) => t.taskId), ["schedule-2"]);
+  await session.close();
+});
+
+test("CopilotEngine: a one-shot schedule that has fired settles as completed", async () => {
+  // Measured on CLI 1.0.88: an `/after` schedule is cancelled once it fires.
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  runtime.session.emit([
+    event("session.schedule_created", { id: 2, intervalMs: 10000, prompt: "check once", recurring: false, origin: "user" }),
+  ]);
+  await collect(it, (e) => e.type === "tasks_changed");
+
+  runtime.session.emit([
+    event("user.message", { content: "[Scheduled prompt #2]\ncheck once", source: "schedule-2", delivery: "idle" }),
+    event("assistant.idle", {}),
+    event("session.schedule_cancelled", { id: 2 }),
+  ]);
+  const events = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(events, "task_settled").map((e) => [e.taskId, e.status]), [["schedule-2", "completed"]]);
+  assert.deepEqual(only(events, "tasks_changed")[0].tasks, []);
+  await session.close();
+});
+
+test("CopilotEngine: Stop removes every schedule from Copilot, as it ends every other Background task", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  runtime.session.schedules = [1];
+  runtime.session.emit([
+    event("session.schedule_created", { id: 1, intervalMs: 60000, prompt: "probe the host", recurring: true, origin: "user" }),
+  ]);
+  await collect(it, (e) => e.type === "tasks_changed");
+
+  session.stop();
+  const events = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(events, "task_settled").map((e) => [e.taskId, e.status]), [["schedule-1", "stopped"]]);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(runtime.session.schedulesStopped, [1]);
+  await session.close();
+});
+
+test("CopilotEngine: closing removes every schedule from Copilot, even one registered before the connector opened", async () => {
+  // Copilot keeps schedules across a resume; left in place, one would go on
+  // firing after the restart had reported it interrupted.
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  runtime.session.schedules = [3];
+  await session.close();
+  assert.deepEqual(runtime.session.schedulesStopped, [3]);
+});
+
 test("CopilotEngine: closing ends the Background tasks still running, and reports none of them settled", async () => {
   // They would outlive the connector; left unsettled, the next start reports
   // them interrupted by the restart.
