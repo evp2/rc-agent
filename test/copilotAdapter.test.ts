@@ -559,6 +559,33 @@ test("CopilotEngine: a background agent Copilot lists as idle has finished, and 
   await session.close();
 });
 
+test("CopilotEngine: a finished background agent a follow-up message wakes is running again, then settles again", async () => {
+  // Copilot's write_agent takes an idle agent back to running, under the same
+  // id, and it goes idle again once it has answered (measured on CLI 1.0.88).
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  const agent = { id: "agent-1", type: "agent", executionMode: "background", toolCallId: "call-agent", description: "say hello" } as const;
+  for (const status of ["running", "idle"] as const) {
+    runtime.session.tasks = [{ ...agent, status }];
+    runtime.session.emit([event("session.background_tasks_changed", {})]);
+    await collect(it, (e) => e.type === "tasks_changed");
+  }
+
+  runtime.session.tasks = [{ ...agent, status: "running" }];
+  runtime.session.emit([event("session.background_tasks_changed", {})]);
+  const revived = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(revived, "task_started").map((e) => [e.taskId, e.toolUseId]), [["agent-1", "call-agent"]]);
+  assert.deepEqual(only(revived, "tasks_changed")[0].tasks.map((t) => t.taskId), ["agent-1"]);
+
+  runtime.session.tasks = [{ ...agent, status: "idle" }];
+  runtime.session.emit([event("session.background_tasks_changed", {})]);
+  const settled = await collect(it, (e) => e.type === "tasks_changed");
+  assert.deepEqual(only(settled, "task_settled").map((e) => [e.taskId, e.status]), [["agent-1", "completed"]]);
+  assert.deepEqual(only(settled, "tasks_changed")[0].tasks, []);
+  await session.close();
+});
+
 test("CopilotEngine: closing ends the Background tasks still running, and reports none of them settled", async () => {
   // They would outlive the connector; left unsettled, the next start reports
   // them interrupted by the restart.

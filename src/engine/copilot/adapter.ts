@@ -882,6 +882,9 @@ class CopilotEngineSession implements EngineSession {
       } else if (!isRunning(task)) {
         const status = task.status === "cancelled" ? "stopped" : task.status === "failed" ? "failed" : "completed";
         changed = this.settleTask(task.id, status) || changed;
+        // An idle agent can be woken by a follow-up message, running again
+        // under the same id, so it may be reported again.
+        if (task.status === "idle") this.seenTasks.delete(task.id);
       }
     }
     // Copilot keeps a finished Background task listed; one that has gone
