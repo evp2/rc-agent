@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { chooseRuntime, clearConversation, resolveModelSettings, sdkSessionConfig } from "../src/engine/copilot/runtime.ts";
+import type { CurrentModel } from "@github/copilot-sdk";
 
 function binDirWithCopilot(): string {
   const dir = mkdtempSync(join(tmpdir(), "crc-copilot-bin-"));
@@ -97,16 +98,43 @@ test("a session config carries effort and tier only when there are some", () => 
   assert.equal("contextTier" in sdkSessionConfig(base), false);
 });
 
-/** A Copilot session that holds `events` and answers a rewind with `outcome`, keeping the rewinds asked of it. */
+/**
+ * A Copilot session that holds `events` and answers a rewind with `outcome`,
+ * keeping the rewinds and model switches asked of it. It starts on `model`;
+ * a rewind puts it back on `modelAfterRewind`, as Copilot does to a model
+ * chosen after the point rewound to.
+ */
 function rewindableSession(
   events: { id: string; type: string }[],
   outcome: { outcome: string; eventsRemoved?: number; error?: string } = { outcome: "success", eventsRemoved: 4 },
+  options: { model?: CurrentModel; modelAfterRewind?: CurrentModel; switchFails?: string } = {},
 ) {
+  const { model = { modelId: "auto" }, modelAfterRewind = model, switchFails } = options;
   const rewinds: unknown[] = [];
+  const switches: unknown[] = [];
+  let current = model;
   return {
     rewinds,
+    switches,
     getEvents: async () => events,
-    rpc: { history: { rewind: async (params: unknown) => (rewinds.push(params), outcome) } },
+    rpc: {
+      history: {
+        rewind: async (params: unknown) => {
+          rewinds.push(params);
+          if (outcome.eventsRemoved !== undefined) current = modelAfterRewind;
+          return outcome;
+        },
+      },
+      model: {
+        getCurrent: async () => current,
+        switchTo: async (params: { modelId: string } & CurrentModel) => {
+          if (switchFails) throw new Error(switchFails);
+          switches.push(params);
+          current = params;
+          return { modelId: params.modelId };
+        },
+      },
+    },
   };
 }
 
@@ -135,4 +163,31 @@ test("clearing a Conversation fails with Copilot's reason when the rewind remove
     error: "journal is read-only",
   });
   await assert.rejects(clearConversation(failed), /journal is read-only/);
+});
+
+test("clearing a Conversation keeps the model, effort and context tier it was on", async () => {
+  const opus: CurrentModel = { modelId: "claude-opus-5.5", reasoningEffort: "high", contextTier: "long_context" };
+  const session = rewindableSession([{ id: "first", type: "user.message" }], undefined, {
+    model: opus,
+    modelAfterRewind: { modelId: "auto" },
+  });
+  await clearConversation(session);
+  assert.deepEqual(await session.rpc.model.getCurrent(), opus);
+});
+
+test("clearing a Conversation whose model the rewind left alone switches nothing", async () => {
+  const session = rewindableSession([{ id: "first", type: "user.message" }], undefined, {
+    model: { modelId: "claude-opus-5.5", reasoningEffort: "high" },
+  });
+  await clearConversation(session);
+  assert.deepEqual(session.switches, []);
+});
+
+test("clearing a Conversation that can't be put back on its model says it was cleared all the same", async () => {
+  const session = rewindableSession([{ id: "first", type: "user.message" }], undefined, {
+    model: { modelId: "claude-opus-5.5" },
+    modelAfterRewind: { modelId: "auto" },
+    switchFails: "model not available",
+  });
+  await assert.rejects(clearConversation(session), /cleared.*claude-opus-5\.5.*model not available/);
 });

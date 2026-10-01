@@ -5,6 +5,7 @@ import {
   CopilotClient,
   RuntimeConnection,
   type CommandDefinition,
+  type CurrentModel,
   type ContextTier,
   type CopilotSession,
   type ModelInfo,
@@ -292,7 +293,13 @@ export function sdkSessionConfig(options: CopilotSessionOptions) {
 /** The slice of an SDK session that clearing its Conversation needs. */
 type Rewindable = {
   getEvents(): Promise<{ id: string; type: string }[]>;
-  rpc: { history: { rewind(params: { eventId: string; mode: "conversation" }): Promise<RewindResult> } };
+  rpc: {
+    history: { rewind(params: { eventId: string; mode: "conversation" }): Promise<RewindResult> };
+    model: {
+      getCurrent(): Promise<CurrentModel>;
+      switchTo(params: { modelId: string } & Omit<CurrentModel, "modelId">): Promise<unknown>;
+    };
+  };
 };
 
 type RewindResult = { outcome: string; eventsRemoved?: number; error?: string };
@@ -304,14 +311,44 @@ type RewindResult = { outcome: string; eventsRemoved?: number; error?: string };
  * runs only from inside a tool call and seeds the cleared window with a
  * prompt, so reaching it would take a model call and the model choosing to
  * make it; a rewind takes neither, and keeps the session id.
+ *
+ * A rewind also undoes every model change made after the point it rewinds
+ * to, so the session is put back on the model it was on: a Conversation
+ * that was moved onto another model shouldn't silently drop back to the one
+ * it started with.
  */
 export async function clearConversation(session: Rewindable): Promise<void> {
   const first = (await session.getEvents()).find((e) => e.type === "user.message");
   if (!first) return;
+  const before = await session.rpc.model.getCurrent();
   const result = await session.rpc.history.rewind({ eventId: first.id, mode: "conversation" });
   // Copilot counts the events removed only once the Conversation itself is
   // cut; a later cleanup step can still report failing, harmlessly.
   if (result.eventsRemoved === undefined) throw new Error(result.error ?? result.outcome);
+  await restoreModel(session, before);
+}
+
+async function restoreModel(session: Rewindable, model: CurrentModel): Promise<void> {
+  const { modelId, reasoningEffort, contextTier, autoTier } = model;
+  if (!modelId) return;
+  const now = await session.rpc.model.getCurrent();
+  const same =
+    now.modelId === modelId &&
+    now.reasoningEffort === reasoningEffort &&
+    now.contextTier === contextTier &&
+    now.autoTier === autoTier;
+  if (same) return;
+  try {
+    await session.rpc.model.switchTo({
+      modelId,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(contextTier ? { contextTier } : {}),
+      // Copilot takes an Auto preference only alongside `auto` itself.
+      ...(modelId === "auto" && autoTier ? { autoTier } : {}),
+    });
+  } catch (e) {
+    throw new Error(`Conversation cleared, but couldn't put it back on ${modelId}: ${(e as Error).message}`);
+  }
 }
 
 class SdkCopilotSession implements CopilotSessionHandle {

@@ -145,7 +145,8 @@ before printing a phone URL, with Copilot's own message.
 The "/" menu lists the project's Skills (from `.claude/skills` and
 `.github/skills`, plus your own `~/.copilot/skills`) and Copilot's own Local
 commands, plus a `/clear` the connector supplies, since Copilot has none of
-its own: it empties the Conversation, and leaves Background tasks running.
+its own: it empties the Conversation, and leaves the model and Background
+tasks as they were.
 Your personal `~/.claude/skills`, written for Claude, are not handed to
 Copilot.
 
