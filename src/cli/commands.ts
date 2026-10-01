@@ -4,7 +4,7 @@ import { engineKindFor, type ConnectorConfig } from "../config";
 import { createEngine } from "../engine/create";
 import { ENGINE_KINDS, type EngineKind } from "../engine/types";
 import { runFork } from "../fork";
-import { printPairingQrCode } from "../qr";
+import { pairingQrUrl, printPairingQrCode } from "../qr";
 import { RelayClient, SessionEndedError } from "../relay/client";
 import { runConnector } from "../session/loop";
 import { spawnDetached } from "../spawn";
@@ -26,18 +26,22 @@ function printControlUrl(controlUrl: string | undefined): void {
 }
 
 /**
- * The phone URL, QR code, Control link, and share link -- the tail every
+ * The phone URL, Control link, QR code, and share link -- the tail every
  * "here's your running connector" report ends with, whether the connector
- * was already running, was just started, or was just forked.
+ * was already running, was just started, was just forked, or `rc-agent qr`
+ * was asked for it. The QR encodes the Control link unless `relay` asks for
+ * the relay's phone URL, and is printed directly under whichever link it
+ * encodes, so the text beside it is what a scan opens.
  */
-function printConnectionReport(state: {
-  phoneUrl: string;
-  controlUrl?: string;
-  staticUrl?: string;
-}): void {
+function printConnectionReport(
+  state: { phoneUrl: string; controlUrl?: string; staticUrl?: string },
+  relay: boolean,
+): void {
+  const qrUrl = pairingQrUrl(state, relay);
   console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
-  printPairingQrCode(state.phoneUrl);
+  if (qrUrl === state.phoneUrl) printPairingQrCode(qrUrl);
   printControlUrl(state.controlUrl);
+  if (qrUrl !== state.phoneUrl) printPairingQrCode(qrUrl);
   printShareUrl(state.staticUrl);
 }
 
@@ -54,7 +58,7 @@ function noteOtherEngine(config: ConnectorConfig): void {
   }
 }
 
-export async function runForeground(config: ConnectorConfig): Promise<void> {
+export async function runForeground(config: ConnectorConfig, relay: boolean): Promise<void> {
   const engine = engineKindFor(config.provider);
   const existing = liveConnector(config.projectDir, engine);
   if (existing && existing.pid !== process.pid) {
@@ -69,10 +73,7 @@ export async function runForeground(config: ConnectorConfig): Promise<void> {
   console.log(
     `Session ${handle.sessionId} ${handle.resumed ? "resumed" : "created"} for ${config.projectDir}`,
   );
-  console.log(`Open on your phone:\n  ${handle.phoneUrl}\n`);
-  printPairingQrCode(handle.phoneUrl);
-  printControlUrl(handle.controlUrl);
-  printShareUrl(handle.staticUrl);
+  printConnectionReport(handle, relay);
   console.log("");
   await handle.done;
 }
@@ -84,12 +85,16 @@ export async function runForeground(config: ConnectorConfig): Promise<void> {
  * The state file is the handoff: the child's stdout goes to a log, so the
  * parent cannot scrape it for the phone URL the way a foreground run prints it.
  */
-export async function start(config: ConnectorConfig, configPath: string): Promise<void> {
+export async function start(
+  config: ConnectorConfig,
+  configPath: string,
+  relay: boolean,
+): Promise<void> {
   const engine = engineKindFor(config.provider);
   const existing = liveConnector(config.projectDir, engine);
   if (existing) {
     console.log(`${ENGINE_LABEL[engine]} is already running for ${config.projectDir} (pid ${existing.pid}).`);
-    printConnectionReport(existing);
+    printConnectionReport(existing, relay);
     return;
   }
 
@@ -103,7 +108,7 @@ export async function start(config: ConnectorConfig, configPath: string): Promis
   }
   console.log(`Connector started for ${config.projectDir} (pid ${state.pid}).`);
   console.log(`Logging to ${logPath(config.projectDir, engine)}`);
-  printConnectionReport(state);
+  printConnectionReport(state, relay);
 }
 
 /**
@@ -114,13 +119,14 @@ export async function fork(
   config: ConnectorConfig,
   name: string,
   fromRef: string | undefined,
+  relay: boolean,
 ): Promise<void> {
   const engine = createEngine(config);
   const conversationId = readState(config.projectDir, engine.kind)?.conversationId;
   const state = await runFork(config, engine, conversationId, name, fromRef);
   console.log(`Connector started for ${state.projectDir} (pid ${state.pid}).`);
   console.log(`Logging to ${logPath(state.projectDir, state.engine)}`);
-  printConnectionReport(state);
+  printConnectionReport(state, relay);
 }
 
 export async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
@@ -249,13 +255,18 @@ export async function status(config: ConnectorConfig): Promise<void> {
  * transcript back. Rotating is deliberately not offered here -- it is
  * `rc-agent stop --end` followed by `rc-agent start`.
  *
- * Defaults to the pairing QR (Control, embedded secret) -- this command
+ * Defaults to the pairing QR (Control) -- this command
  * overwhelmingly exists to re-pair a device the user themselves controls, and
  * that device wants full access, not the read-plus-Suggest a share link now
  * grants. `--share` switches to the Netlify share link instead, for handing
- * to someone else to watch and weigh in on.
+ * to someone else to watch and weigh in on. `--relay` keeps the pairing QR
+ * but encodes the relay's phone URL rather than the Control link.
  */
-export async function qr(config: ConnectorConfig, showShare: boolean): Promise<void> {
+export async function qr(
+  config: ConnectorConfig,
+  showShare: boolean,
+  relay: boolean,
+): Promise<void> {
   const engine = engineKindFor(config.provider);
   const state = readState(config.projectDir, engine);
   if (!state) {
@@ -296,10 +307,7 @@ export async function qr(config: ConnectorConfig, showShare: boolean): Promise<v
   const controlUrl =
     state.controlUrl ?? (await client?.fetchControlUrl().catch(() => undefined));
 
-  console.log(`Open on your phone:\n  ${state.phoneUrl}\n`);
-  printPairingQrCode(state.phoneUrl);
-  printControlUrl(controlUrl);
-  printShareUrl(state.staticUrl);
+  printConnectionReport({ ...state, controlUrl }, relay);
 }
 
 function tailLog(path: string, lines: number): string {

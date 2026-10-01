@@ -163,6 +163,7 @@ no worktree or branch is made.
 rc-agent start            # background (recommended)
 rc-agent status           # is it running? is the session alive?
 rc-agent qr               # print the pairing QR (--share for the share link)
+rc-agent qr --relay       # same, but the QR encodes the relay URL instead of the Netlify Control link
 rc-agent stop             # stop it, leaving the session resumable
 rc-agent stop --end       # stop it and end the session (destroys the conversation)
 

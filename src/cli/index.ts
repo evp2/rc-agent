@@ -25,6 +25,9 @@ Usage:
   rc-agent run     [--config <path>]   Run in the foreground (Ctrl-C to stop)
 
 With no subcommand, rc-agent runs in the foreground.
+
+The pairing QR that run, start, qr and fork print encodes the Netlify Control
+link. Add --relay to encode the relay's phone URL instead.
 `;
 
 async function main(): Promise<void> {
@@ -47,6 +50,7 @@ async function main(): Promise<void> {
       config: { type: "string", short: "c", default: "./connector.config.json" },
       end: { type: "boolean", default: false },
       share: { type: "boolean", default: false },
+      relay: { type: "boolean", default: false },
       from: { type: "string" },
     },
     allowPositionals: subcommand === "fork",
@@ -55,21 +59,22 @@ async function main(): Promise<void> {
   const configPath = resolve(values.config as string);
   const config = loadConfig(configPath);
 
+  const relay = values.relay as boolean;
   switch (subcommand) {
     case "run":
-      return runForeground(config);
+      return runForeground(config, relay);
     case "start":
-      return start(config, configPath);
+      return start(config, configPath, relay);
     case "stop":
       return stop(config, values.end as boolean);
     case "status":
       return status(config);
     case "qr":
-      return qr(config, values.share as boolean);
+      return qr(config, values.share as boolean, relay);
     case "fork": {
       const name = positionals[0];
       if (!name) throw new Error(`'rc-agent fork' requires a name.\n\n${USAGE}`);
-      return fork(config, name, values.from as string | undefined);
+      return fork(config, name, values.from as string | undefined, relay);
     }
   }
 }
