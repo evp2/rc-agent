@@ -7,6 +7,8 @@ import type { SessionEvent, ToolResultObject } from "@github/copilot-sdk";
 import type {
   CopilotCommand,
   CopilotCommandResult,
+  CopilotModel,
+  CopilotModelChoice,
   CopilotRuntime,
   CopilotSessionHandle,
   CopilotSessionOptions,
@@ -101,6 +103,12 @@ export class FakeCopilotSession implements CopilotSessionHandle {
   skills: CopilotSkill[] = [];
   /** How many of the next command-list reads fail. */
   failCommandReads = 0;
+  /** The model and effort the session is on. */
+  model: CopilotModelChoice = { modelId: "auto" };
+  /** Every switch asked of the session, in order. */
+  readonly switches: CopilotModelChoice[] = [];
+  /** Makes `switchModel` reject, as Copilot does when it refuses a model. */
+  switchError: Error | undefined;
   private readonly handlers = new Set<(event: SessionEvent) => void>();
   private disconnectHandler: (() => void) | undefined;
 
@@ -201,6 +209,19 @@ export class FakeCopilotSession implements CopilotSessionHandle {
     return this.script.onInvoke(this, name, input);
   }
 
+  async currentModel(): Promise<CopilotModelChoice> {
+    return this.model;
+  }
+
+  /** Switches the way Copilot does, announcing the change as an event. */
+  async switchModel(choice: CopilotModelChoice): Promise<void> {
+    if (this.switchError) throw this.switchError;
+    this.switches.push(choice);
+    const previousModel = this.model.modelId;
+    this.model = choice;
+    this.emit([event("session.model_change", { newModel: choice.modelId, previousModel, reasoningEffort: choice.reasoningEffort ?? null })]);
+  }
+
   async listTasks(): Promise<CopilotTask[]> {
     return this.tasks;
   }
@@ -235,6 +256,14 @@ export class FakeCopilotRuntime implements CopilotRuntime {
   readonly known = new Set<string>();
   /** Makes `createSession` reject, as Copilot does when policy forbids a session. */
   createError: Error | undefined;
+  /** The models Copilot offers the account, in the order it lists them. */
+  models: CopilotModel[] = [{ id: "auto", name: "Auto", enabled: true, efforts: [] }];
+  /** Makes `listModels` reject. */
+  modelsError: Error | undefined;
+  /** Holds `listModels` until it settles, as a slow runtime would. */
+  modelsGate: Promise<void> | undefined;
+  /** How many times the models have been asked for. */
+  modelReads = 0;
 
   constructor(private readonly script: FakeSessionScript = {}) {}
 
@@ -260,6 +289,13 @@ export class FakeCopilotRuntime implements CopilotRuntime {
     const s = new FakeCopilotSession(id, options, this.script);
     this.sessions.push(s);
     return s;
+  }
+
+  async listModels(): Promise<CopilotModel[]> {
+    this.modelReads += 1;
+    await this.modelsGate;
+    if (this.modelsError) throw this.modelsError;
+    return this.models;
   }
 
   async stop(): Promise<void> {

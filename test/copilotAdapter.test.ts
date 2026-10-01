@@ -1220,6 +1220,13 @@ function recordedMenu(session: FakeCopilotSession): void {
     { name: "compact", description: "Summarize conversation history", kind: "builtin", input: { hint: "focus instructions" } },
     { name: "usage", description: "Display session usage metrics", kind: "builtin" },
     { name: "context", description: "Show context window token usage", kind: "builtin" },
+    {
+      name: "model",
+      aliases: ["models"],
+      description: "Select the AI model for this session (use 'auto' to let Copilot pick automatically).",
+      kind: "builtin",
+      input: { hint: "model" },
+    },
     // The connector's own, which Copilot lists after its built-ins.
     { name: "clear", description: "Clear conversation history", kind: "client" },
     { name: "ghskill", description: "A skill in .github/skills.", kind: "skill", input: { hint: "instructions for the skill" } },
@@ -1248,6 +1255,8 @@ test("CopilotEngine: the menu lists the project's and personal Copilot Skills an
     { name: "usage", description: "Display session usage metrics", argumentHint: "" },
     { name: "context", description: "Show context window token usage", argumentHint: "" },
     { name: "clear", description: "Clear conversation history", argumentHint: "" },
+    { name: "model", description: "Choose the model and its effort", argumentHint: "[model] [effort]" },
+    { name: "effort", description: "Choose the model's effort", argumentHint: "[level]" },
   ]);
   await session.close();
 });
@@ -1395,6 +1404,266 @@ test("CopilotEngine: a /clear Copilot couldn't carry out ends its Turn with the 
   const [ended] = only(events, "turn_ended");
   assert.equal(ended.outcome, "error");
   assert.deepEqual(ended.errors, ["Command /clear failed: session-busy"]);
+  await session.close();
+});
+
+// --- Model picker --------------------------------------------------------------
+
+/** Models the way Copilot lists them for a paid plan, trimmed: `auto` first, one the policy keeps from being picked. */
+const MODELS = [
+  { id: "auto", name: "Auto", enabled: true, efforts: [] },
+  { id: "claude-opus-5.5", name: "Claude Opus 5.5", enabled: true, multiplier: 3, efforts: ["low", "medium", "high"], defaultEffort: "medium" },
+  { id: "gpt-5-mini", name: "GPT-5 mini", enabled: true, multiplier: 0, efforts: [] },
+  { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", enabled: false, multiplier: 1, efforts: ["low", "high"] },
+];
+
+/** An Engine on a runtime that lists {@link MODELS}, its session on `model`, answering each Question with what `pick` gives it. */
+async function pickerSession(pick: (q: EngineQuestion) => EngineAnswer, model: { modelId: string; reasoningEffort?: string } = { modelId: "auto" }) {
+  const runtime = new MenuRuntime();
+  runtime.models = MODELS;
+  const asked: EngineQuestion[] = [];
+  const session = await engineOn(runtime).open({
+    projectDir: "/tmp/copilot-project",
+    onQuestion: async (q) => (asked.push(q), pick(q)),
+  });
+  runtime.session.model = model;
+  const it = session.events[Symbol.asyncIterator]();
+  await collect(it, (e) => e.type === "menu");
+  return { runtime, session, it, asked };
+}
+
+/** Answers a one-question Question with the option whose label is `label`. */
+function choose(label: string) {
+  return (q: EngineQuestion): EngineAnswer => ({ answers: { [q.questions[0].question]: label } });
+}
+
+test("CopilotEngine: /model asks which model to use, offering those the plan allows, and switches to the one picked", async () => {
+  const { runtime, session, it, asked } = await pickerSession(choose("GPT-5 mini"));
+  session.send("/model");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.equal(asked.length, 1, "a model with no effort levels asks nothing more");
+  assert.deepEqual(asked[0].questions, [
+    {
+      question: "Which model should this session use?",
+      header: "Model",
+      options: [
+        { label: "Auto", description: "auto · current" },
+        { label: "Claude Opus 5.5", description: "claude-opus-5.5 · 3×" },
+        { label: "GPT-5 mini", description: "gpt-5-mini · 0×" },
+      ],
+      multiSelect: false,
+    },
+  ]);
+  assert.deepEqual(runtime.session.switches, [{ modelId: "gpt-5-mini" }]);
+  assert.deepEqual(runtime.session.invoked, [], "Copilot's own /model is never run");
+  assert.deepEqual(runtime.session.sent, [], "never sent to the model as a prompt");
+  assert.deepEqual(events.slice(0, -1), [
+    { type: "turn_started", cause: "command" },
+    { type: "status", text: "model set to GPT-5 mini" },
+  ]);
+  assert.equal(only(events, "turn_ended")[0].outcome, "success");
+  await session.close();
+});
+
+test("CopilotEngine: /model then asks for the effort when the model picked takes a choice of levels", async () => {
+  const answers = ["Claude Opus 5.5", "high"];
+  const { runtime, session, it, asked } = await pickerSession(
+    (q) => ({ answers: { [q.questions[0].question]: answers[asked.length - 1] } }),
+    { modelId: "claude-opus-5.5", reasoningEffort: "low" },
+  );
+  session.send("/model");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(asked[1]?.questions, [
+    {
+      question: "Which effort should Claude Opus 5.5 use?",
+      header: "Effort",
+      options: [
+        { label: "low", description: "current" },
+        { label: "medium", description: "default" },
+        { label: "high" },
+      ],
+      multiSelect: false,
+    },
+  ]);
+  assert.deepEqual(runtime.session.switches, [{ modelId: "claude-opus-5.5", reasoningEffort: "high" }]);
+  assert.deepEqual(only(events, "status"), [{ type: "status", text: "model set to Claude Opus 5.5 · effort high" }]);
+  assert.equal(only(events, "turn_ended")[0].outcome, "success");
+  await session.close();
+});
+
+test("CopilotEngine: /model with a model named switches straight to it, keeping the effort when the model takes it", async () => {
+  const neverAsked = () => assert.fail("nothing should be asked");
+  const cases: [string, { modelId: string; reasoningEffort?: string }, { modelId: string; reasoningEffort?: string }, string][] = [
+    // By part of its name, from a model whose effort it doesn't take: its default.
+    ["/model opus 5.5", { modelId: "auto" }, { modelId: "claude-opus-5.5", reasoningEffort: "medium" }, "model set to Claude Opus 5.5 · effort medium"],
+    ["/model claude-opus-5.5 high", { modelId: "auto" }, { modelId: "claude-opus-5.5", reasoningEffort: "high" }, "model set to Claude Opus 5.5 · effort high"],
+    ["/model Claude Opus 5.5", { modelId: "claude-opus-5.5", reasoningEffort: "low" }, { modelId: "claude-opus-5.5", reasoningEffort: "low" }, "model set to Claude Opus 5.5 · effort low"],
+    // A model with no effort levels is asked for none.
+    ["/models auto", { modelId: "claude-opus-5.5", reasoningEffort: "high" }, { modelId: "auto" }, "model set to Auto"],
+  ];
+  for (const [command, from, to, status] of cases) {
+    const { runtime, session, it } = await pickerSession(neverAsked, from);
+    session.send(command);
+    const events = await collect(it, (e) => e.type === "turn_ended");
+    assert.deepEqual(runtime.session.switches, [to], command);
+    assert.deepEqual(only(events, "status"), [{ type: "status", text: status }], command);
+    await session.close();
+  }
+});
+
+test("CopilotEngine: a model typed into /model's picker instead of picked is switched to all the same", async () => {
+  const { runtime, session, it } = await pickerSession(() => ({ answers: {}, response: "GPT-5 MINI" }));
+  session.send("/model");
+  await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(runtime.session.switches, [{ modelId: "gpt-5-mini" }]);
+  await session.close();
+});
+
+test("CopilotEngine: /model refuses a model the account can't use, or an effort it doesn't take, switching nothing", async () => {
+  const cases: [string, string][] = [
+    ["/model fable", 'no model called "fable"; this account can use auto, claude-opus-5.5, gpt-5-mini'],
+    // Kept from being picked by the account's policy.
+    ["/model gpt-6.1-sol", 'no model called "gpt-6.1-sol"; this account can use auto, claude-opus-5.5, gpt-5-mini'],
+    ["/model claude-opus-5.5 max", 'Claude Opus 5.5 takes effort low, medium, high, not "max"'],
+  ];
+  for (const [command, reason] of cases) {
+    const { runtime, session, it } = await pickerSession(() => assert.fail("nothing should be asked"));
+    session.send(command);
+    const events = await collect(it, (e) => e.type === "turn_ended");
+    assert.deepEqual(runtime.session.switches, [], command);
+    assert.deepEqual(only(events, "status"), [], command);
+    const [ended] = only(events, "turn_ended");
+    assert.equal(ended.outcome, "error", command);
+    assert.deepEqual(ended.errors, [reason], command);
+    await session.close();
+  }
+});
+
+test("CopilotEngine: /effort asks only for the effort of the model the session is on, or sets the one named", async () => {
+  const opus = { modelId: "claude-opus-5.5", reasoningEffort: "low" };
+  const picked = await pickerSession(choose("high"), opus);
+  picked.session.send("/effort");
+  const events = await collect(picked.it, (e) => e.type === "turn_ended");
+  assert.deepEqual(picked.asked.map((q) => q.questions[0].header), ["Effort"]);
+  assert.deepEqual(picked.runtime.session.switches, [{ modelId: "claude-opus-5.5", reasoningEffort: "high" }]);
+  assert.deepEqual(only(events, "status"), [{ type: "status", text: "effort set to high" }]);
+  await picked.session.close();
+
+  const named = await pickerSession(() => assert.fail("nothing should be asked"), opus);
+  named.session.send("/effort Medium");
+  await collect(named.it, (e) => e.type === "turn_ended");
+  assert.deepEqual(named.runtime.session.switches, [{ modelId: "claude-opus-5.5", reasoningEffort: "medium" }]);
+  await named.session.close();
+});
+
+test("CopilotEngine: /effort refuses on a model with no effort levels, or a level the model doesn't take", async () => {
+  const cases: [string, { modelId: string; reasoningEffort?: string }, string][] = [
+    ["/effort", { modelId: "auto" }, "Auto has no effort levels to choose from"],
+    ["/effort max", { modelId: "claude-opus-5.5", reasoningEffort: "low" }, 'Claude Opus 5.5 takes effort low, medium, high, not "max"'],
+  ];
+  for (const [command, model, reason] of cases) {
+    const { runtime, session, it } = await pickerSession(() => assert.fail("nothing should be asked"), model);
+    session.send(command);
+    const [ended] = only(await collect(it, (e) => e.type === "turn_ended"), "turn_ended");
+    assert.deepEqual(runtime.session.switches, [], command);
+    assert.equal(ended.outcome, "error", command);
+    assert.deepEqual(ended.errors, [reason], command);
+    await session.close();
+  }
+});
+
+test("CopilotEngine: a switch Copilot refuses, or a model list it can't give, ends /model's Turn with the reason", async () => {
+  const refused = await pickerSession(() => assert.fail("nothing should be asked"));
+  refused.runtime.session.switchError = new Error("Request session.model.switchTo failed with message: Model is not available on your plan");
+  refused.session.send("/model gpt-5-mini");
+  const [switchEnded] = only(await collect(refused.it, (e) => e.type === "turn_ended"), "turn_ended");
+  assert.equal(switchEnded.outcome, "error");
+  assert.deepEqual(switchEnded.errors, ["Model is not available on your plan"]);
+  await refused.session.close();
+
+  const unlisted = await pickerSession(() => assert.fail("nothing should be asked"));
+  unlisted.runtime.modelsError = new Error("Not authenticated");
+  unlisted.session.send("/model");
+  const events = await collect(unlisted.it, (e) => e.type === "turn_ended");
+  assert.deepEqual(only(events, "status"), []);
+  assert.deepEqual(only(events, "turn_ended")[0].errors, ["Not authenticated"]);
+  assert.deepEqual(unlisted.runtime.session.switches, []);
+  await unlisted.session.close();
+});
+
+test("CopilotEngine: Stop with /model's picker open cancels it: no switch, nothing said, nothing of Copilot's aborted", async () => {
+  let signal: AbortSignal | undefined;
+  const runtime = new MenuRuntime();
+  runtime.models = MODELS;
+  const session = await engineOn(runtime).open({
+    projectDir: "/tmp/copilot-project",
+    onQuestion: (_q, sig) => {
+      signal = sig;
+      return new Promise<EngineAnswer>((_resolve, reject) => sig.addEventListener("abort", () => reject(new Error("turn stopped"))));
+    },
+  });
+  const it = session.events[Symbol.asyncIterator]();
+  await collect(it, (e) => e.type === "menu");
+  session.send("/model");
+  await until(() => signal !== undefined);
+  session.stop();
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.equal(only(events, "turn_ended")[0].outcome, "stopped");
+  assert.equal(signal?.aborted, true, "the picker's Question is withdrawn");
+  assert.deepEqual(only(events, "status"), []);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(runtime.session.switches, []);
+  assert.equal(runtime.session.aborts, 0, "Copilot had nothing running to abort");
+  await session.close();
+});
+
+test("CopilotEngine: Stop before /model has its models to offer asks nothing and switches nothing", async () => {
+  for (const command of ["/model", "/model gpt-5-mini"]) {
+    let release!: () => void;
+    const { runtime, session, it, asked } = await pickerSession(choose("GPT-5 mini"));
+    runtime.modelsGate = new Promise((r) => (release = r));
+    session.send(command);
+    await until(() => runtime.modelReads === 1);
+    session.stop();
+    const events = await collect(it, (e) => e.type === "turn_ended");
+    assert.equal(only(events, "turn_ended")[0].outcome, "stopped", command);
+    release();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(asked, [], command);
+    assert.deepEqual(runtime.session.switches, [], command);
+    await session.close();
+  }
+});
+
+test("CopilotEngine: /model runs as the connector's own even when Copilot's command list can't be read", async () => {
+  class UnreadableMenuRuntime extends FakeCopilotRuntime {
+    override async createSession(options: Parameters<FakeCopilotRuntime["createSession"]>[0]) {
+      const s = await super.createSession(options);
+      s.failCommandReads = 2;
+      return s;
+    }
+  }
+  const runtime = new UnreadableMenuRuntime();
+  runtime.models = MODELS;
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("/model gpt-5-mini");
+  await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(runtime.session.switches, [{ modelId: "gpt-5-mini" }]);
+  assert.deepEqual(runtime.session.sent, [], "never sent to the model as a prompt");
+  await session.close();
+});
+
+test("CopilotEngine: a model /model switched to isn't announced again when the next Turn starts", async () => {
+  const { runtime, session, it } = await pickerSession(choose("GPT-5 mini"));
+  session.send("/model");
+  await collect(it, (e) => e.type === "turn_ended");
+  session.send("hello");
+  await until(() => runtime.session.sent.length === 1);
+  // A named model, unlike `auto`, isn't resolved again per Turn.
+  runtime.session.emit(simpleTurn("hi", "gpt-5-mini").filter((e) => e.type !== "session.auto_mode_resolved"));
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(only(events, "announce"), []);
   await session.close();
 });
 

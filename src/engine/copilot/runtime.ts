@@ -73,6 +73,25 @@ export type CopilotCommandResult =
   | { kind: "select-subcommand"; command: string; title: string; options: { name: string; description?: string }[] }
   | { kind: "show-dialog" | "set-model" | "set-plan-model" };
 
+/** One model Copilot offers the account. */
+export interface CopilotModel {
+  id: string;
+  name: string;
+  /** False when the account's policy keeps it from being picked. */
+  enabled: boolean;
+  /** What a request costs against the plan, relative to a standard one. */
+  multiplier?: number;
+  /** The effort levels it takes, if any. */
+  efforts: string[];
+  defaultEffort?: string;
+}
+
+/** A model, and the effort it runs at when one is set. */
+export interface CopilotModelChoice {
+  modelId: string;
+  reasoningEffort?: string;
+}
+
 /** Copilot's single question with optional choices, asked through its `ask_user` tool. */
 export interface CopilotUserInputRequest {
   question: string;
@@ -121,6 +140,10 @@ export interface CopilotSessionHandle {
   listSkills(): Promise<CopilotSkill[]>;
   /** Runs a slash command. Rejects with Copilot's message, such as a usage line, when it refuses. */
   invokeCommand(name: string, input?: string): Promise<CopilotCommandResult>;
+  /** The model and effort the session is on now. */
+  currentModel(): Promise<Partial<CopilotModelChoice>>;
+  /** Moves the session onto a model and effort. Rejects with Copilot's reason when it refuses. */
+  switchModel(choice: CopilotModelChoice): Promise<void>;
   listTasks(): Promise<CopilotTask[]>;
   cancelTask(id: string): Promise<void>;
   /** The ids of the scheduled prompts still registered. */
@@ -136,6 +159,8 @@ export interface CopilotRuntime {
   createSession(options: CopilotSessionOptions): Promise<CopilotSessionHandle>;
   /** Rejects when Copilot has no conversation with this id. */
   resumeSession(id: string, options: CopilotSessionOptions): Promise<CopilotSessionHandle>;
+  /** The models Copilot offers the account, in the order it lists them. */
+  listModels(): Promise<CopilotModel[]>;
   stop(): Promise<void>;
 }
 
@@ -240,6 +265,18 @@ class SdkCopilotRuntime implements CopilotRuntime {
       console.log(`Couldn't read Copilot's model settings: ${(e as Error).message}`);
       return {};
     }
+  }
+
+  async listModels(): Promise<CopilotModel[]> {
+    return (await this.client.listModels()).map((m) => ({
+      id: m.id,
+      name: m.name,
+      // Copilot lists `auto` with no policy at all.
+      enabled: !m.policy || m.policy.state === "enabled",
+      ...(m.billing?.multiplier !== undefined ? { multiplier: m.billing.multiplier } : {}),
+      efforts: m.supportedReasoningEfforts ?? [],
+      ...(m.defaultReasoningEffort ? { defaultEffort: m.defaultReasoningEffort } : {}),
+    }));
   }
 
   async stop(): Promise<void> {
@@ -397,6 +434,23 @@ class SdkCopilotSession implements CopilotSessionHandle {
 
   async invokeCommand(name: string, input?: string): Promise<CopilotCommandResult> {
     return (await this.session.rpc.commands.invoke({ name, ...(input ? { input } : {}) })) as CopilotCommandResult;
+  }
+
+  async currentModel(): Promise<Partial<CopilotModelChoice>> {
+    const { modelId, reasoningEffort } = await this.session.rpc.model.getCurrent();
+    return { ...(modelId ? { modelId } : {}), ...(reasoningEffort ? { reasoningEffort } : {}) };
+  }
+
+  async switchModel({ modelId, reasoningEffort }: CopilotModelChoice): Promise<void> {
+    // The context tier is passed back as it is, so a switch leaves it alone.
+    const { contextTier } = await this.session.rpc.model.getCurrent();
+    const result = await this.session.rpc.model.switchTo({
+      modelId,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(contextTier ? { contextTier } : {}),
+    });
+    // A switch Copilot queues behind other work still happens, just later.
+    if (result.status && result.status !== "applied" && !result.deferred) throw new Error(result.message ?? result.status);
   }
 
   async listTasks(): Promise<CopilotTask[]> {

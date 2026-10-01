@@ -146,7 +146,13 @@ The "/" menu lists the project's Skills (from `.claude/skills` and
 `.github/skills`, plus your own `~/.copilot/skills`) and Copilot's own Local
 commands, plus a `/clear` the connector supplies, since Copilot has none of
 its own: it empties the Conversation, and leaves the model and Background
-tasks as they were.
+tasks as they were. The connector also supplies `/model` and `/effort`, in
+place of Copilot's own `/model`, which switches nothing for the connector.
+`/model` alone asks which model to use, offering those your plan allows, then
+the effort when the model takes a choice of levels; `/model <model> [effort]`
+switches straight away, and `/effort [level]` changes only the effort. The
+choice lasts for the session until the connector restarts, which reopens it
+on the model in your config, and is never saved to your Copilot settings.
 Your personal `~/.claude/skills`, written for Claude, are not handed to
 Copilot.
 

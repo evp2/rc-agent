@@ -374,6 +374,55 @@ test("CopilotEngine: the menu lists the project's Skills and Local commands, and
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("CopilotEngine: /model and /effort are the connector's own, and /model switches through its picker", async (t) => {
+  if (!(await signedIn())) return t.skip(SKIP);
+  const dir = workDir();
+  const asked: EngineQuestion[] = [];
+  const session = await loginEngine().open({
+    projectDir: dir,
+    onQuestion: async (q) => {
+      asked.push(q);
+      return { answers: { [q.questions[0].question]: "Auto" } };
+    },
+  });
+  // A failed assertion would otherwise leave the runtime, and the test, running.
+  t.after(() => session.close());
+  const it = session.events[Symbol.asyncIterator]();
+  const [menu] = (await collect(it, (e) => e.type === "menu", 30_000)).filter((e) => e.type === "menu") as Extract<
+    EngineEvent,
+    { type: "menu" }
+  >[];
+  const listed = menu.localCommands.filter((c) => c.name === "model" || c.name === "effort");
+  assert.deepEqual(
+    listed.map((c) => [c.name, c.description]),
+    [
+      ["model", "Choose the model and its effort"],
+      ["effort", "Choose the model's effort"],
+    ],
+    "the connector's own, in place of Copilot's /model",
+  );
+
+  // Every plan offers `auto`, so it is the one switch this test can make anywhere.
+  session.send("/model");
+  const picked = await collect(it, (e) => e.type === "turn_ended");
+  assert.ok(
+    asked[0]?.questions[0].options.some((o) => o.label === "Auto"),
+    `options: ${JSON.stringify(asked[0]?.questions[0].options)}`,
+  );
+  assert.deepEqual(picked.filter((e) => e.type === "status"), [{ type: "status", text: "model set to Auto" }]);
+  assert.equal((picked.at(-1) as Extract<EngineEvent, { type: "turn_ended" }>).outcome, "success");
+
+  session.send("/models auto");
+  const typed = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(typed.filter((e) => e.type === "status"), [{ type: "status", text: "model set to Auto" }]);
+
+  session.send("/effort");
+  const effort = (await collect(it, (e) => e.type === "turn_ended")).at(-1) as Extract<EngineEvent, { type: "turn_ended" }>;
+  assert.equal(effort.outcome, "error");
+  assert.deepEqual(effort.errors, ["Auto has no effort levels to choose from"]);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 type TaskStarted = Extract<EngineEvent, { type: "task_started" }>;
 type TaskSettled = Extract<EngineEvent, { type: "task_settled" }>;
 

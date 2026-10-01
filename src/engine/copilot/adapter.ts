@@ -15,6 +15,7 @@ import {
   SHOW_IMAGE_PATH_DESCRIPTION,
 } from "../showImageTool";
 import type { Engine, EngineEvent, EngineQuestion, EngineSession, EngineUsage, OpenOptions } from "../types";
+import { chooseEffort, chooseModel, type ModelPickerDeps } from "./modelPicker";
 import {
   startCopilotRuntime,
   type CopilotCommand,
@@ -27,6 +28,8 @@ import {
   type CopilotUserInputRequest,
   type CopilotUserInputResponse,
 } from "./runtime";
+
+type QuestionItem = EngineQuestion["questions"][number];
 
 export interface CopilotEngineDeps {
   /** Starts the Copilot runtime. Called at most once per Engine. */
@@ -124,6 +127,8 @@ interface RunningTurn {
   promptPending?: boolean;
   /** Set once the Turn has reported a compaction, which a `/compact`'s own text would only repeat. */
   compacted?: boolean;
+  /** Set while it runs a Local command of the connector's own, which Copilot has no part in. */
+  ownCommand?: boolean;
 }
 
 /** Said against every Command the connector can no longer hand to Copilot. */
@@ -196,8 +201,12 @@ class CopilotEngineSession implements EngineSession {
   private quelling = false;
   private refreshingTasks: Promise<void> | undefined;
   private tasksStale = false;
-  /** Every slash command Copilot can run, by lower-cased name and alias. */
-  private commands = new Map<string, CopilotCommand>();
+  /**
+   * Every slash command there is, by lower-cased name and alias: Copilot's,
+   * once read, and from the start the connector's own, which need nothing of
+   * Copilot's list to run.
+   */
+  private commands = commandsByName(withOwnCommands([]));
   /** Set once Copilot's command list has been read at all. */
   private commandsRead = false;
   /** Set while the command list is re-read for the Command next in line. */
@@ -217,6 +226,13 @@ class CopilotEngineSession implements EngineSession {
   private unmatchedQuestions = 0;
   /** One per Question waiting on the human; a Stop or close withdraws them all. */
   private readonly pendingQuestions = new Set<AbortController>();
+  /** Questions the connector asks itself, each keyed apart from the rest. */
+  private ownQuestions = 0;
+  /**
+   * The model the connector just switched to, whose announcement it leaves
+   * out: the status line it shows already says so.
+   */
+  private switchedTo: string | undefined;
   private dead = false;
   private closed = false;
   private readonly unsubscribe: () => void;
@@ -248,11 +264,10 @@ class CopilotEngineSession implements EngineSession {
       do {
         this.menuStale = false;
         try {
-          const [skills, commands] = await Promise.all([this.session.listSkills(), this.session.listCommands()]);
+          const [skills, listed] = await Promise.all([this.session.listSkills(), this.session.listCommands()]);
           if (this.closed) return;
-          this.commands = new Map(
-            commands.flatMap((c) => [c.name, ...(c.aliases ?? [])].map((name) => [name.toLowerCase(), c] as const)),
-          );
+          const commands = withOwnCommands(listed);
+          this.commands = commandsByName(commands);
           this.commandsRead = true;
           this.outbox.push({
             type: "menu",
@@ -361,17 +376,24 @@ class CopilotEngineSession implements EngineSession {
   async ask(request: CopilotUserInputRequest): Promise<CopilotUserInputResponse> {
     if (this.closed || !this.turn) throw new Error("there is no Turn to ask a question in");
     const choices = request.choices ?? [];
-    const question: EngineQuestion = {
-      toolUseId: this.questionCallAsking(request.question) ?? `${QUESTION_TOOL}-unmatched-${++this.unmatchedQuestions}`,
-      questions: [{ question: request.question, options: choices.map((label) => ({ label })), multiSelect: false }],
-    };
+    const text = await this.putQuestion(
+      this.questionCallAsking(request.question) ?? `${QUESTION_TOOL}-unmatched-${++this.unmatchedQuestions}`,
+      { question: request.question, options: choices.map((label) => ({ label })), multiSelect: false },
+    );
+    return { answer: text, wasFreeform: !choices.includes(text) };
+  }
+
+  /**
+   * Puts one question to the human as a one-question Question, resolving
+   * with the option picked -- or the text typed, which stands in for a pick,
+   * as it does in the phone's picker. Rejects once the Question is withdrawn.
+   */
+  private async putQuestion(toolUseId: string, question: QuestionItem): Promise<string> {
     const withdraw = new AbortController();
     this.pendingQuestions.add(withdraw);
     try {
-      const answer = await this.options.onQuestion(question, withdraw.signal);
-      // A typed answer stands in for a pick, as it does in the phone's picker.
-      const text = answer.response?.trim() || answer.answers[request.question] || "";
-      return { answer: text, wasFreeform: !choices.includes(text) };
+      const answer = await this.options.onQuestion({ toolUseId, questions: [question] }, withdraw.signal);
+      return answer.response?.trim() || answer.answers[question.question] || "";
     } finally {
       this.pendingQuestions.delete(withdraw);
     }
@@ -400,10 +422,12 @@ class CopilotEngineSession implements EngineSession {
     const droppedUnrun = dropped.map((): Unrun => ({ cause: "command", outcome: "stopped" }));
     if (this.turn?.localCommand) {
       // Its call can't be taken back, but its Turn ends here; whatever it
-      // returns is dropped.
+      // returns is dropped. One of the connector's own has nothing of
+      // Copilot's running.
+      const own = this.turn.ownCommand;
       this.unrunAfterTurn.push(...droppedUnrun);
       this.endTurn("stopped");
-      void this.abort();
+      if (!own) void this.abort();
     } else if (this.turn?.promptPending || (!this.turn && (this.delivering || this.steerText !== undefined))) {
       // Handed over but not yet started, there is nothing yet to abort.
       this.unrunAfterTurn.push(...droppedUnrun);
@@ -513,6 +537,10 @@ class CopilotEngineSession implements EngineSession {
     this.startTurn("command");
     const turn = this.turn!;
     turn.localCommand = true;
+    if (this.commands.get(name)?.kind === CONNECTOR_KIND) {
+      this.runOwnCommand(turn, name, input);
+      return;
+    }
     this.session.invokeCommand(name, input).then(
       (result) => this.localCommandReturned(turn, name, result),
       (e) => {
@@ -521,6 +549,57 @@ class CopilotEngineSession implements EngineSession {
         this.endTurn("error");
       },
     );
+  }
+
+  /** Runs one of the connector's own Local commands, ending its Turn with the status line it gives. */
+  private runOwnCommand(turn: RunningTurn, name: string, input: string | undefined): void {
+    turn.ownCommand = true;
+    OWN_COMMANDS.find((c) => c.name === name)!.run(this.pickerDeps(turn), input).then(
+      (text) => {
+        if (this.turn !== turn) return;
+        this.outbox.push({ type: "status", text });
+        this.endTurn("success");
+      },
+      (e) => {
+        if (this.turn !== turn) return;
+        turn.errors.push(copilotMessage(e));
+        this.endTurn("error");
+      },
+    );
+  }
+
+  /**
+   * What the picker needs, for the Turn `turn`. Once that Turn has ended --
+   * stopped while Copilot was still listing its models, say -- the picker
+   * asks nothing more and switches nothing.
+   */
+  private pickerDeps(turn: RunningTurn): ModelPickerDeps {
+    const running = () => {
+      if (this.turn !== turn) throw new Error("the Turn has ended");
+    };
+    return {
+      listModels: () => this.runtime.listModels(),
+      current: () => this.session.currentModel(),
+      switchTo: async (choice) => {
+        running();
+        const before = await this.session.currentModel();
+        running();
+        // Copilot announces only a change of model, and never `auto` on its
+        // own: the model it picks is announced per Turn.
+        const changes = choice.modelId !== before.modelId && choice.modelId !== "auto";
+        this.switchedTo = changes ? choice.modelId : undefined;
+        try {
+          await this.session.switchModel(choice);
+        } catch (e) {
+          this.switchedTo = undefined;
+          throw e;
+        }
+      },
+      ask: async (question) => {
+        running();
+        return this.putQuestion(`connector-question-${++this.ownQuestions}`, question);
+      },
+    };
   }
 
   /**
@@ -706,6 +785,10 @@ class CopilotEngineSession implements EngineSession {
         this.announce(event.data.chosenModel);
         return;
       case "session.model_change":
+        if (event.data.newModel === this.switchedTo) {
+          this.switchedTo = undefined;
+          return;
+        }
         // `auto` is resolved per Turn; the model it picks is announced then.
         if (event.data.newModel !== "auto") this.announce(event.data.newModel);
         return;
@@ -970,17 +1053,68 @@ function skillInfo(skill: CopilotSkill): SkillInfo {
 
 /**
  * The Local commands to offer: Copilot's built-ins and the connector's own,
- * one of each name. Should Copilot come to list a built-in under the name of
- * one of the connector's, the built-in takes its place here; which of the two
- * runs is Copilot's to decide, since a command is invoked by name. Copilot
- * lists no `/clear` to SDK clients today (measured on CLI 1.0.88); its
- * terminal's abandons the session for a new one, and if one reached SDK
- * clients and did the same, the connector would have to follow the new
- * session id as the same Conversation.
+ * one of each name. Of the connector's, `/clear` is registered with Copilot
+ * and runs through it, so should Copilot come to list a built-in `/clear`,
+ * the built-in takes its place here; which of the two runs is Copilot's to
+ * decide, since a command is invoked by name. Copilot lists no `/clear` to
+ * SDK clients today (measured on CLI 1.0.88); its terminal's abandons the
+ * session for a new one, and if one reached SDK clients and did the same, the
+ * connector would have to follow the new session id as the same
+ * Conversation. The ones the connector runs itself always win.
  */
 function menuCommands(commands: CopilotCommand[]): CopilotCommand[] {
   const builtins = new Set(commands.filter((c) => c.kind === "builtin").map((c) => c.name.toLowerCase()));
-  return commands.filter((c) => c.kind === "builtin" || (c.kind === "client" && !builtins.has(c.name.toLowerCase())));
+  return commands.filter(
+    (c) =>
+      c.kind === "builtin" ||
+      c.kind === CONNECTOR_KIND ||
+      (c.kind === "client" && !builtins.has(c.name.toLowerCase())),
+  );
+}
+
+/** The kind of the Local commands the connector runs itself, without calling Copilot. */
+const CONNECTOR_KIND = "connector";
+
+/** A Local command the connector runs itself, resolving with the status line it ends on. */
+type OwnCommand = CopilotCommand & { run: (deps: ModelPickerDeps, input?: string) => Promise<string> };
+
+/**
+ * The Local commands the connector runs itself. Copilot's own `/model`
+ * checks the model it is given and then switches nothing for an SDK client,
+ * with a model named or without (measured on CLI 1.0.88), and Copilot has no
+ * `/effort` at all, so typed it reaches the model as a prompt.
+ */
+const OWN_COMMANDS: OwnCommand[] = [
+  {
+    name: "model",
+    aliases: ["models"],
+    description: "Choose the model and its effort",
+    kind: CONNECTOR_KIND,
+    input: { hint: "[model] [effort]" },
+    run: chooseModel,
+  },
+  {
+    name: "effort",
+    description: "Choose the model's effort",
+    kind: CONNECTOR_KIND,
+    input: { hint: "[level]" },
+    run: chooseEffort,
+  },
+];
+
+function commandNames(command: CopilotCommand): string[] {
+  return [command.name, ...(command.aliases ?? [])].map((name) => name.toLowerCase());
+}
+
+/** Copilot's commands with the connector's own in place of any Copilot lists under one of their names. */
+function withOwnCommands(commands: CopilotCommand[]): CopilotCommand[] {
+  const claimed = new Set(OWN_COMMANDS.flatMap(commandNames));
+  return [...commands.filter((c) => !commandNames(c).some((n) => claimed.has(n))), ...OWN_COMMANDS];
+}
+
+/** Every command by lower-cased name and alias, as a Command is looked up. */
+function commandsByName(commands: CopilotCommand[]): Map<string, CopilotCommand> {
+  return new Map(commands.flatMap((c) => commandNames(c).map((name) => [name, c] as const)));
 }
 
 function commandInfo(command: CopilotCommand): SkillInfo {
