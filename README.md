@@ -464,27 +464,3 @@ All of the following must be true before reporting success:
 
 If any check fails, stop, fix it, and re-run that check before moving on.
 Do not report the setup as complete until every box is checked.
-
-## How it works
-
-1. Registers a session with the relay (`POST /sessions`), which returns a
-   session ID and bearer secret — both are embedded in the phone URL.
-2. Polls `GET /sessions/{id}/commands` for new Commands from the phone and runs
-   them one at a time. A Command that arrives while a Turn is running Steers
-   it: the Turn is cut at its next tool-call boundary and the new Command runs
-   next.
-3. Commands go to an Engine, the connector's one interface over the agent SDK
-   (Claude or Copilot). The Engine keeps one Conversation for the session and
-   resumes it by id after a restart, so the agent keeps full context across
-   Turns.
-4. The Engine's output is mapped to a compact JSON event schema and
-   batch-flushed to `POST /sessions/{id}/events` every ~750 ms for the phone
-   to poll and render. Each Turn's token usage is sent the same way.
-5. Background tasks the agent starts (background shells, subagents) show as
-   cards and in the tray. When one finishes and wakes the agent into a Turn
-   nobody asked for, the phone says why and offers the brake, without a push.
-6. A turn that committed code reports its line counts to
-   `POST /sessions/{id}/contributions`, attributed to `origin`. Measured by
-   diffing the commit the turn started on against the one it ended on, and
-   skipped entirely when the branch moved sideways or the directory is not a
-   git repository. Turns that commit nothing send nothing.
