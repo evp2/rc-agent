@@ -187,6 +187,36 @@ test("CopilotEngine: a Conversation resumes across a runtime restart and remembe
   assert.match(said, /CONTRACT-OTTER-17/);
 });
 
+test("CopilotEngine: /clear empties the Conversation, which keeps its id and forgets earlier Turns", async (t) => {
+  if (!(await signedIn())) return t.skip(SKIP);
+  const dir = workDir();
+  const session = await openOn(loginEngine(), dir);
+  // A failed assertion would otherwise leave the runtime, and the test, running.
+  t.after(() => session.close());
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("Remember this codeword for later: CONTRACT-HERON-42. Reply with just OK.");
+  const opened = await collect(it, (e) => e.type === "turn_ended");
+  const conversation = opened.find((e) => e.type === "conversation");
+
+  session.send("/clear");
+  const cleared = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(
+    cleared.filter((e) => e.type === "status"),
+    [{ type: "status", text: "conversation cleared" }],
+  );
+  assert.equal((cleared.at(-1) as Extract<EngineEvent, { type: "turn_ended" }>).outcome, "success");
+
+  session.send("What codeword did I ask you to remember? Reply with just the codeword, or NONE if I gave you none.");
+  const asked = await collect(it, (e) => e.type === "turn_ended");
+  const said = asked
+    .filter((e) => e.type === "assistant_text")
+    .map((e) => (e as { text: string }).text)
+    .join(" ");
+  assert.doesNotMatch(said, /HERON/);
+  assert.ok(![...cleared, ...asked].some((e) => e.type === "conversation"), `still ${JSON.stringify(conversation)}`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("CopilotEngine: a Conversation Copilot doesn't have opens fresh and is reported as lost", async (t) => {
   if (!(await signedIn())) return t.skip(SKIP);
   const session = await openOn(loginEngine(), workDir(), "00000000-0000-0000-0000-000000000000");
@@ -314,7 +344,7 @@ test("CopilotEngine: the menu lists the project's Skills and Local commands, and
   assert.ok(menu.skills.some((s) => s.name === "hello"), "the project's Skill is on the menu");
   const commands = menu.localCommands.map((c) => c.name);
   assert.ok(commands.includes("compact") && commands.includes("usage"), `Local commands: ${commands.join(", ")}`);
-  assert.ok(!commands.includes("clear"));
+  assert.ok(commands.includes("clear"), "the connector's own /clear is on the menu");
 
   session.send("/hello");
   const skillTurn = await collect(it, (e) => e.type === "turn_ended");

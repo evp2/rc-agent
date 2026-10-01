@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { chooseRuntime, resolveModelSettings, sdkSessionConfig } from "../src/engine/copilot/runtime.ts";
+import { chooseRuntime, clearConversation, resolveModelSettings, sdkSessionConfig } from "../src/engine/copilot/runtime.ts";
 
 function binDirWithCopilot(): string {
   const dir = mkdtempSync(join(tmpdir(), "crc-copilot-bin-"));
@@ -95,4 +95,44 @@ test("a session config carries effort and tier only when there are some", () => 
   assert.equal(config.contextTier, "long_context");
   assert.equal("reasoningEffort" in sdkSessionConfig(base), false);
   assert.equal("contextTier" in sdkSessionConfig(base), false);
+});
+
+/** A Copilot session that holds `events` and answers a rewind with `outcome`, keeping the rewinds asked of it. */
+function rewindableSession(
+  events: { id: string; type: string }[],
+  outcome: { outcome: string; eventsRemoved?: number; error?: string } = { outcome: "success", eventsRemoved: 4 },
+) {
+  const rewinds: unknown[] = [];
+  return {
+    rewinds,
+    getEvents: async () => events,
+    rpc: { history: { rewind: async (params: unknown) => (rewinds.push(params), outcome) } },
+  };
+}
+
+test("clearing a Conversation rewinds it to before its first message, leaving files alone", async () => {
+  const session = rewindableSession([
+    { id: "start", type: "session.start" },
+    { id: "first", type: "user.message" },
+    { id: "reply", type: "assistant.message" },
+    { id: "second", type: "user.message" },
+  ]);
+  await clearConversation(session);
+  assert.deepEqual(session.rewinds, [{ eventId: "first", mode: "conversation" }]);
+});
+
+test("clearing a Conversation with nothing said yet has nothing to rewind", async () => {
+  const session = rewindableSession([{ id: "start", type: "session.start" }]);
+  await clearConversation(session);
+  assert.deepEqual(session.rewinds, []);
+});
+
+test("clearing a Conversation fails with Copilot's reason when the rewind removes nothing", async () => {
+  const busy = rewindableSession([{ id: "first", type: "user.message" }], { outcome: "session-busy" });
+  await assert.rejects(clearConversation(busy), /session-busy/);
+  const failed = rewindableSession([{ id: "first", type: "user.message" }], {
+    outcome: "truncation-failed",
+    error: "journal is read-only",
+  });
+  await assert.rejects(clearConversation(failed), /journal is read-only/);
 });

@@ -257,7 +257,7 @@ class CopilotEngineSession implements EngineSession {
           this.outbox.push({
             type: "menu",
             skills: skills.filter(isMenuSkill).map(skillInfo),
-            localCommands: commands.filter(isMenuCommand).map(commandInfo),
+            localCommands: menuCommands(commands).map(commandInfo),
           });
         } catch (e) {
           console.error("Failed to list Copilot's Skills and commands:", (e as Error).message);
@@ -547,7 +547,9 @@ class CopilotEngineSession implements EngineSession {
         if (!turn.compacted) status(result.text);
         break;
       case "completed":
-        status(result.message);
+        // The connector's own `/clear` completes with nothing to say; the
+        // phone is told what Claude's says.
+        status(result.message ?? (name === "clear" ? "conversation cleared" : undefined));
         break;
       case "add-timeline-entry":
         status(result.entry.text);
@@ -967,14 +969,18 @@ function skillInfo(skill: CopilotSkill): SkillInfo {
 }
 
 /**
- * A built-in command, other than `/clear`. On the phone, `/clear` means what
- * Claude's does -- start the Conversation afresh -- and Copilot has nothing
- * the connector can run to the same effect. Copilot lists no `/clear` to SDK
- * clients today (measured on CLI 1.0.88); this keeps one off the menu should
- * a later version start to.
+ * The Local commands to offer: Copilot's built-ins and the connector's own,
+ * one of each name. Should Copilot come to list a built-in under the name of
+ * one of the connector's, the built-in takes its place here; which of the two
+ * runs is Copilot's to decide, since a command is invoked by name. Copilot
+ * lists no `/clear` to SDK clients today (measured on CLI 1.0.88); its
+ * terminal's abandons the session for a new one, and if one reached SDK
+ * clients and did the same, the connector would have to follow the new
+ * session id as the same Conversation.
  */
-function isMenuCommand(command: CopilotCommand): boolean {
-  return command.kind === "builtin" && command.name.toLowerCase() !== "clear";
+function menuCommands(commands: CopilotCommand[]): CopilotCommand[] {
+  const builtins = new Set(commands.filter((c) => c.kind === "builtin").map((c) => c.name.toLowerCase()));
+  return commands.filter((c) => c.kind === "builtin" || (c.kind === "client" && !builtins.has(c.name.toLowerCase())));
 }
 
 function commandInfo(command: CopilotCommand): SkillInfo {

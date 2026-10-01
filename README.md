@@ -144,8 +144,10 @@ before printing a phone URL, with Copilot's own message.
 
 The "/" menu lists the project's Skills (from `.claude/skills` and
 `.github/skills`, plus your own `~/.copilot/skills`) and Copilot's own Local
-commands. There is no `/clear`, and your personal `~/.claude/skills`, written
-for Claude, are not handed to Copilot.
+commands, plus a `/clear` the connector supplies, since Copilot has none of
+its own: it empties the Conversation, and leaves Background tasks running.
+Your personal `~/.claude/skills`, written for Claude, are not handed to
+Copilot.
 
 Detached shells and background agents are Background tasks: each gets a card
 and a place in the tray, and Kill ends one. Foreground shells, which Copilot

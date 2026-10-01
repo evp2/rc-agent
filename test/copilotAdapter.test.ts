@@ -1207,7 +1207,7 @@ test("CopilotEngine: Stop with a Question pending ends the Turn, withdraws the Q
 
 // --- Menu ----------------------------------------------------------------------
 
-/** What Copilot listed for a project with `.claude/skills/hello` and `.github/skills/ghskill` (CLI 1.0.88), trimmed. */
+/** What Copilot listed for a project with `.claude/skills/hello` and `.github/skills/ghskill` (CLI 1.0.88), trimmed, with the connector's `/clear` registered. */
 function recordedMenu(session: FakeCopilotSession): void {
   session.skills = [
     { name: "ghskill", commandName: "ghskill", description: "A skill in .github/skills.", source: "project", userInvocable: true, enabled: true, path: "/p/.github/skills/ghskill/SKILL.md" },
@@ -1220,6 +1220,8 @@ function recordedMenu(session: FakeCopilotSession): void {
     { name: "compact", description: "Summarize conversation history", kind: "builtin", input: { hint: "focus instructions" } },
     { name: "usage", description: "Display session usage metrics", kind: "builtin" },
     { name: "context", description: "Show context window token usage", kind: "builtin" },
+    // The connector's own, which Copilot lists after its built-ins.
+    { name: "clear", description: "Clear conversation history", kind: "client" },
     { name: "ghskill", description: "A skill in .github/skills.", kind: "skill", input: { hint: "instructions for the skill" } },
     { name: "hello", description: "Says hello back.", kind: "skill", input: { hint: "instructions for the skill" } },
   ];
@@ -1233,7 +1235,7 @@ class MenuRuntime extends FakeCopilotRuntime {
   }
 }
 
-test("CopilotEngine: the menu lists the project's and personal Copilot Skills and Copilot's Local commands, split by where they come from", async () => {
+test("CopilotEngine: the menu lists the project's and personal Copilot Skills and the Local commands, split by where they come from", async () => {
   const session = await engineOn(new MenuRuntime()).open(openOptions());
   const [menu] = only(await collect(session.events[Symbol.asyncIterator](), (e) => e.type === "menu"), "menu");
   assert.deepEqual(menu.skills, [
@@ -1245,20 +1247,23 @@ test("CopilotEngine: the menu lists the project's and personal Copilot Skills an
     { name: "compact", description: "Summarize conversation history", argumentHint: "focus instructions" },
     { name: "usage", description: "Display session usage metrics", argumentHint: "" },
     { name: "context", description: "Show context window token usage", argumentHint: "" },
+    { name: "clear", description: "Clear conversation history", argumentHint: "" },
   ]);
-  assert.ok(!menu.localCommands.some((c) => c.name === "clear"), "Copilot offers SDK clients no /clear");
   await session.close();
 });
 
-test("CopilotEngine: the menu leaves out /clear even should Copilot list one", async () => {
+test("CopilotEngine: a /clear Copilot lists as its own built-in replaces the connector's on the menu", async () => {
   const runtime = new MenuRuntime();
   const session = await engineOn(runtime).open(openOptions());
   const it = session.events[Symbol.asyncIterator]();
   await collect(it, (e) => e.type === "menu");
-  runtime.session.commands.push({ name: "clear", aliases: ["new"], description: "Clear the conversation", kind: "builtin" });
+  runtime.session.commands.unshift({ name: "clear", aliases: ["new"], description: "Clear the conversation", kind: "builtin" });
   runtime.session.emit([event("commands.changed", {})]);
   const [menu] = only(await collect(it, (e) => e.type === "menu"), "menu");
-  assert.deepEqual(menu.localCommands.map((c) => c.name), ["compact", "usage", "context"]);
+  assert.deepEqual(
+    menu.localCommands.filter((c) => c.name === "clear"),
+    [{ name: "clear", description: "Clear the conversation", argumentHint: "" }],
+  );
   await session.close();
 });
 
@@ -1353,6 +1358,43 @@ test("CopilotEngine: a Local command's text output becomes a status line", async
     events.at(-1),
   ]);
   assert.equal(only(events, "turn_ended")[0].outcome, "success");
+  await session.close();
+});
+
+test("CopilotEngine: /clear runs the connector's own command and says the Conversation was cleared", async () => {
+  // Copilot runs the connector's handler inside the command call, which
+  // returns once the rewind is done, with no message of its own.
+  const runtime = commandRuntime({ onInvoke: async () => ({ kind: "completed" }) });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  await collect(it, (e) => e.type === "menu");
+  session.send("/clear");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(runtime.session.invoked, [{ name: "clear" }]);
+  assert.deepEqual(runtime.session.sent, [], "never sent to the model as a prompt");
+  assert.deepEqual(events.slice(0, -1), [
+    { type: "turn_started", cause: "command" },
+    { type: "status", text: "conversation cleared" },
+  ]);
+  assert.equal(only(events, "turn_ended")[0].outcome, "success");
+  await session.close();
+});
+
+test("CopilotEngine: a /clear Copilot couldn't carry out ends its Turn with the reason, and says nothing was cleared", async () => {
+  const runtime = commandRuntime({
+    onInvoke: async () => {
+      throw new Error("Request session.commands.invoke failed with message: Command /clear failed: session-busy");
+    },
+  });
+  const session = await engineOn(runtime).open(openOptions());
+  const it = session.events[Symbol.asyncIterator]();
+  await collect(it, (e) => e.type === "menu");
+  session.send("/clear");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+  assert.deepEqual(only(events, "status"), []);
+  const [ended] = only(events, "turn_ended");
+  assert.equal(ended.outcome, "error");
+  assert.deepEqual(ended.errors, ["Command /clear failed: session-busy"]);
   await session.close();
 });
 

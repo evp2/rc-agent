@@ -4,6 +4,7 @@ import { delimiter, isAbsolute, join, resolve } from "node:path";
 import {
   CopilotClient,
   RuntimeConnection,
+  type CommandDefinition,
   type ContextTier,
   type CopilotSession,
   type ModelInfo,
@@ -195,12 +196,31 @@ class SdkCopilotRuntime implements CopilotRuntime {
 
   async createSession(options: CopilotSessionOptions): Promise<CopilotSessionHandle> {
     const withSettings = { ...options, ...(await this.modelSettings(options.model)) };
-    return new SdkCopilotSession(await this.client.createSession(sdkSessionConfig(withSettings)));
+    return this.openWithClear((config) => this.client.createSession(config), withSettings);
   }
 
   async resumeSession(id: string, options: CopilotSessionOptions): Promise<CopilotSessionHandle> {
     const withSettings = { ...options, ...(await this.modelSettings(options.model)) };
-    return new SdkCopilotSession(await this.client.resumeSession(id, sdkSessionConfig(withSettings)));
+    return this.openWithClear((config) => this.client.resumeSession(id, config), withSettings);
+  }
+
+  /**
+   * Opens a session that has the connector's own `/clear` registered.
+   * Copilot runs the command's handler inside the command call, so by then
+   * the session it clears is there.
+   */
+  private async openWithClear(
+    open: (config: ReturnType<typeof sdkSessionConfig> & { commands: CommandDefinition[] }) => Promise<CopilotSession>,
+    options: CopilotSessionOptions,
+  ): Promise<CopilotSessionHandle> {
+    let session: CopilotSession | undefined;
+    const clear: CommandDefinition = {
+      name: "clear",
+      description: "Clear conversation history",
+      handler: () => clearConversation(session!),
+    };
+    session = await open({ ...sdkSessionConfig(options), commands: [clear] });
+    return new SdkCopilotSession(session);
   }
 
   /**
@@ -267,6 +287,31 @@ export function sdkSessionConfig(options: CopilotSessionOptions) {
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     ...(options.contextTier ? { contextTier: options.contextTier } : {}),
   };
+}
+
+/** The slice of an SDK session that clearing its Conversation needs. */
+type Rewindable = {
+  getEvents(): Promise<{ id: string; type: string }[]>;
+  rpc: { history: { rewind(params: { eventId: string; mode: "conversation" }): Promise<RewindResult> } };
+};
+
+type RewindResult = { outcome: string; eventsRemoved?: number; error?: string };
+
+/**
+ * Empties the Conversation, which is what `/clear` means on the phone, by
+ * rewinding it to before its first message. Copilot offers SDK clients no
+ * `/clear` of its own. Its documented way to clear, `history.clearContext`,
+ * runs only from inside a tool call and seeds the cleared window with a
+ * prompt, so reaching it would take a model call and the model choosing to
+ * make it; a rewind takes neither, and keeps the session id.
+ */
+export async function clearConversation(session: Rewindable): Promise<void> {
+  const first = (await session.getEvents()).find((e) => e.type === "user.message");
+  if (!first) return;
+  const result = await session.rpc.history.rewind({ eventId: first.id, mode: "conversation" });
+  // Copilot counts the events removed only once the Conversation itself is
+  // cut; a later cleanup step can still report failing, harmlessly.
+  if (result.eventsRemoved === undefined) throw new Error(result.error ?? result.outcome);
 }
 
 class SdkCopilotSession implements CopilotSessionHandle {
