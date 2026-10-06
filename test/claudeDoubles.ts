@@ -36,6 +36,8 @@ export function result(
     output_tokens?: number;
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
+    /** The SDK's running per-model totals for the whole query so far, as a real result carries them. */
+    modelUsage?: Record<string, RunningModelTotals>;
   } = {},
 ): SDKMessage {
   return {
@@ -51,7 +53,22 @@ export function result(
       cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 10,
       cache_read_input_tokens: usage.cache_read_input_tokens ?? 5,
     },
+    modelUsage: Object.fromEntries(
+      Object.entries(usage.modelUsage ?? {}).map(([model, m]) => [
+        model,
+        { webSearchRequests: 0, contextWindow: 200_000, maxOutputTokens: 32_000, ...m },
+      ]),
+    ),
   } as unknown as SDKMessage;
+}
+
+/** The fields of one `modelUsage` entry a Usage figure is read from. */
+export interface RunningModelTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  costUSD: number;
 }
 
 export function compactBoundary(): SDKMessage {

@@ -11,6 +11,7 @@ import type {
   EngineEvent,
   EngineImage,
   EngineQuestion,
+  EngineUsage,
   ShowImageOutcome,
 } from "../src/engine/types.ts";
 import {
@@ -482,6 +483,200 @@ test("ClaudeEngine: a Conversation id that changes mid-session is announced agai
 
   const ids = [...first, ...second].filter((e) => e.type === "conversation").map((e) => (e as { id: string }).id);
   assert.deepEqual(ids, ["sdk-1", "sdk-2"]);
+  await session.close();
+});
+
+function usageOf(events: EngineEvent[]): EngineUsage | undefined {
+  return (events.find((e) => e.type === "turn_ended") as Extract<EngineEvent, { type: "turn_ended" }>).usage;
+}
+
+test("ClaudeEngine: a later Turn in the same query reports only what it added, not the query's running total", async () => {
+  const query = reactiveQuery({
+    subTurns: [
+      [
+        init(),
+        result("success", {
+          total_cost_usd: 1,
+          modelUsage: {
+            opus: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 1000, cacheCreationInputTokens: 200, costUSD: 1 },
+          },
+        }),
+      ],
+      [
+        init(),
+        result("success", {
+          total_cost_usd: 1.75,
+          modelUsage: {
+            opus: { inputTokens: 130, outputTokens: 80, cacheReadInputTokens: 3000, cacheCreationInputTokens: 260, costUSD: 1.75 },
+          },
+        }),
+      ],
+    ],
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  const first = await collect(it, (e) => e.type === "turn_ended");
+  session.send("second");
+  const second = await collect(it, (e) => e.type === "turn_ended");
+
+  assert.deepEqual(usageOf(first), {
+    inputTokens: 100,
+    outputTokens: 50,
+    cacheReadTokens: 1000,
+    cacheWriteTokens: 200,
+    costUsd: 1,
+  });
+  assert.deepEqual(usageOf(second), {
+    inputTokens: 30,
+    outputTokens: 30,
+    cacheReadTokens: 2000,
+    cacheWriteTokens: 60,
+    costUsd: 0.75,
+  });
+  await session.close();
+});
+
+test("ClaudeEngine: a Turn's Usage counts every model it called, subagents and compaction included", async () => {
+  const { query } = scriptedQuery([
+    init(),
+    result("success", {
+      total_cost_usd: 1.2,
+      // The main loop's own figure, which leaves the subagent out.
+      input_tokens: 100,
+      output_tokens: 50,
+      modelUsage: {
+        opus: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 1000, cacheCreationInputTokens: 200, costUSD: 1 },
+        haiku: { inputTokens: 40, outputTokens: 20, cacheReadInputTokens: 500, cacheCreationInputTokens: 0, costUSD: 0.2 },
+      },
+    }),
+  ]);
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  const events = await collect(it, (e) => e.type === "turn_ended");
+
+  assert.deepEqual(usageOf(events), {
+    inputTokens: 140,
+    outputTokens: 70,
+    cacheReadTokens: 1500,
+    cacheWriteTokens: 200,
+    costUsd: 1.2,
+  });
+  await session.close();
+});
+
+test("ClaudeEngine: a running total that falls (a /clear restarts it) reports the whole new figure as the Turn's Usage", async () => {
+  const query = reactiveQuery({
+    subTurns: [
+      [
+        init(),
+        result("success", {
+          modelUsage: {
+            opus: { inputTokens: 500, outputTokens: 400, cacheReadInputTokens: 9000, cacheCreationInputTokens: 800, costUSD: 5 },
+          },
+        }),
+      ],
+      [
+        init(),
+        result("success", {
+          modelUsage: {
+            opus: { inputTokens: 20, outputTokens: 30, cacheReadInputTokens: 600, cacheCreationInputTokens: 100, costUSD: 0.5 },
+          },
+        }),
+      ],
+    ],
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await collect(it, (e) => e.type === "turn_ended");
+  session.send("/clear");
+  const afterClear = await collect(it, (e) => e.type === "turn_ended");
+
+  assert.deepEqual(usageOf(afterClear), {
+    inputTokens: 20,
+    outputTokens: 30,
+    cacheReadTokens: 600,
+    cacheWriteTokens: 100,
+    costUsd: 0.5,
+  });
+  await session.close();
+});
+
+test("ClaudeEngine: a Turn that added nothing reports nothing, even when the models come back in another order", async () => {
+  const a = { inputTokens: 10, outputTokens: 10, cacheReadInputTokens: 10, cacheCreationInputTokens: 10, costUSD: 0.1 };
+  const b = { inputTokens: 20, outputTokens: 20, cacheReadInputTokens: 20, cacheCreationInputTokens: 20, costUSD: 0.2 };
+  const c = { inputTokens: 30, outputTokens: 30, cacheReadInputTokens: 30, cacheCreationInputTokens: 30, costUSD: 0.3 };
+  const query = reactiveQuery({
+    subTurns: [
+      // 0.1 + 0.2 + 0.3 sums to 0.6000000000000001 ...
+      [init(), result("success", { modelUsage: { a, b, c } })],
+      // ... but 0.3 + 0.2 + 0.1 to 0.6: a cost that "fell" with nothing restarted.
+      [init(), result("success", { modelUsage: { c, b, a } })],
+    ],
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await collect(it, (e) => e.type === "turn_ended");
+  session.send("/context");
+  const second = await collect(it, (e) => e.type === "turn_ended");
+
+  assert.deepEqual(usageOf(second), {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    costUsd: 0,
+  });
+  await session.close();
+});
+
+test("ClaudeEngine: a fresh query's first Turn reports its whole running total, whatever the last query reached", async () => {
+  const firstQuery = scriptedQuery([
+    init(),
+    result("success", {
+      modelUsage: {
+        opus: { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 1000, cacheCreationInputTokens: 200, costUSD: 1 },
+      },
+    }),
+  ]).query;
+  // Higher on every count than the first query reached, so only starting
+  // again from zero -- not noticing a fall -- reports it whole.
+  const secondQuery = scriptedQuery([
+    init(),
+    result("success", {
+      modelUsage: {
+        opus: { inputTokens: 300, outputTokens: 120, cacheReadInputTokens: 4000, cacheCreationInputTokens: 500, costUSD: 3 },
+      },
+    }),
+  ]).query;
+  let calls = 0;
+  const query: typeof firstQuery = (args) => (calls++ === 0 ? firstQuery : secondQuery)(args);
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("first");
+  await collect(it, (e) => e.type === "turn_ended");
+  // The first query's generator returns a few microtasks after its result;
+  // one macrotask later it has, so the next Command starts a query of its own.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  session.send("second");
+  const second = await collect(it, (e) => e.type === "turn_ended");
+
+  assert.equal(calls, 2, "the second Command started a query of its own");
+  assert.deepEqual(usageOf(second), {
+    inputTokens: 300,
+    outputTokens: 120,
+    cacheReadTokens: 4000,
+    cacheWriteTokens: 500,
+    costUsd: 3,
+  });
   await session.close();
 });
 

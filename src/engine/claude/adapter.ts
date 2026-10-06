@@ -4,6 +4,7 @@ import {
   type CanUseTool,
   type HookInput,
   type McpSdkServerConfigWithInstance,
+  type ModelUsage,
   type Options,
   type Query,
   type SDKMessage,
@@ -137,6 +138,50 @@ function showImageServer(onShowImage: NonNullable<OpenOptions["onShowImage"]>): 
 
 type TurnEndedExtra = Partial<Omit<Extract<EngineEvent, { type: "turn_ended" }>, "type" | "durationMs">>;
 
+const ZERO_USAGE: EngineUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
+
+/** Every model the query called -- main loop, subagents, compaction -- as one figure. */
+function sumModelUsage(modelUsage: Record<string, ModelUsage>): EngineUsage {
+  return Object.values(modelUsage).reduce<EngineUsage>(
+    (sum, m) => ({
+      inputTokens: sum.inputTokens + m.inputTokens,
+      outputTokens: sum.outputTokens + m.outputTokens,
+      cacheReadTokens: sum.cacheReadTokens + m.cacheReadInputTokens,
+      cacheWriteTokens: sum.cacheWriteTokens + m.cacheCreationInputTokens,
+      costUsd: (sum.costUsd ?? 0) + m.costUSD,
+    }),
+    ZERO_USAGE,
+  );
+}
+
+/**
+ * Whether the running total started over since `earlier`: any token count
+ * fell. Read off the token counts only, never cost -- cost is a float summed
+ * in whatever order the models arrive, so it can dip by a rounding error with
+ * nothing restarted, and reading that as a restart would report the query's
+ * whole running total again.
+ */
+function wasRestarted(total: EngineUsage, earlier: EngineUsage): boolean {
+  return (
+    total.inputTokens < earlier.inputTokens ||
+    total.outputTokens < earlier.outputTokens ||
+    total.cacheReadTokens < earlier.cacheReadTokens ||
+    total.cacheWriteTokens < earlier.cacheWriteTokens
+  );
+}
+
+function subtractUsage(total: EngineUsage, earlier: EngineUsage): EngineUsage {
+  return {
+    inputTokens: total.inputTokens - earlier.inputTokens,
+    outputTokens: total.outputTokens - earlier.outputTokens,
+    cacheReadTokens: total.cacheReadTokens - earlier.cacheReadTokens,
+    cacheWriteTokens: total.cacheWriteTokens - earlier.cacheWriteTokens,
+    // The same rounding error can leave a Turn that added nothing a hair
+    // below zero.
+    costUsd: Math.max(0, (total.costUsd ?? 0) - (earlier.costUsd ?? 0)),
+  };
+}
+
 /**
  * Wraps one query()-per-Turn-chain: a fresh `query()` starts a chain, a Steer
  * or a Command sent while that chain's query is still open streams into its
@@ -168,6 +213,13 @@ class ClaudeEngineSession implements EngineSession {
   /** Set once a Turn's `init` has refreshed the menu, after which the startup probe's older reading is dropped. */
   private menuRefreshed = false;
   private chainPromise: Promise<void> = Promise.resolve();
+  /**
+   * The query's running usage as of its last result. The SDK's `modelUsage`
+   * is a running total across every Turn of one query, so a Turn's own Usage
+   * is what it added since then -- summing the totals instead would count
+   * every earlier Turn again.
+   */
+  private queryTotals: EngineUsage = ZERO_USAGE;
 
   constructor(
     private readonly deps: ClaudeEngineDeps,
@@ -247,6 +299,8 @@ class ClaudeEngineSession implements EngineSession {
 
     const activeQuery = this.deps.query({ prompt: input, options: claudeOptions });
     this.activeQueryHandle = activeQuery;
+    // Every query's running total starts again from zero, resumed or not.
+    this.queryTotals = ZERO_USAGE;
     this.chainPromise = this.drain(activeQuery, abortController);
   }
 
@@ -379,13 +433,10 @@ class ClaudeEngineSession implements EngineSession {
         }
 
         if (message.type === "result") {
-          const usage: EngineUsage = {
-            inputTokens: message.usage.input_tokens,
-            outputTokens: message.usage.output_tokens,
-            cacheReadTokens: message.usage.cache_read_input_tokens,
-            cacheWriteTokens: message.usage.cache_creation_input_tokens,
-            costUsd: message.total_cost_usd,
-          };
+          const totals = sumModelUsage(message.modelUsage);
+          // A restarted total (a /clear, or a crash's zeroed result) is all new.
+          const usage = wasRestarted(totals, this.queryTotals) ? totals : subtractUsage(totals, this.queryTotals);
+          this.queryTotals = totals;
           if (message.subtype === "success") {
             const contextPercentage = await this.readContextPercentage(activeQuery);
             endSubturn("success", { usage, contextPercentage });
