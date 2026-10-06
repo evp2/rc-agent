@@ -1,6 +1,5 @@
 import { SessionEndedError, type EventInput, type SkillInfo } from "../relay/client";
 import type { ConnectorState } from "../state";
-import { computeWorktreeList } from "../worktrees";
 import type { SessionContext } from "./context";
 
 /** Best-effort: a state write failure costs resume on the next start, but the session in progress is still perfectly usable -- don't take it down for this. */
@@ -13,28 +12,16 @@ export function persist(ctx: SessionContext, patch: Partial<ConnectorState>): vo
   }
 }
 
-/**
- * Best-effort: a failed publish leaves the phone's menu stale, not broken.
- * The Worktree list rides this same report and is recomputed on every call, since listing git worktrees and reading a
- * handful of local state files is cheap -- a change there (a sibling starting
- * or stopping) publishes on its own even when skills and local commands
- * haven't changed.
- */
+/** Best-effort: a failed publish leaves the phone's menu stale, not broken. */
 export async function publishSkills(
   ctx: SessionContext,
   skills: SkillInfo[],
   localCommands: SkillInfo[],
 ): Promise<void> {
   try {
-    const worktrees = computeWorktreeList(ctx.config.projectDir, ctx.engine.kind);
-    const asJson = JSON.stringify([skills, localCommands, worktrees]);
+    const asJson = JSON.stringify([skills, localCommands]);
     if (asJson === ctx.lastSkillsJson) return;
-    await ctx.client.putSkills(
-      skills,
-      localCommands,
-      ctx.config.inactivityCompact?.afterMinutes,
-      worktrees,
-    );
+    await ctx.client.putSkills(skills, localCommands, ctx.config.inactivityCompact?.afterMinutes);
     ctx.lastSkillsJson = asJson;
   } catch (e) {
     if (e instanceof SessionEndedError) return;

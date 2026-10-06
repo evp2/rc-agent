@@ -64,7 +64,7 @@ export type FakeTurnHandler = (ctx: FakeTurnContext) => Promise<FakeTurnOutcome 
 
 export interface FakeEngineScript {
   kind?: EngineKind;
-  capabilities?: { steer?: boolean; fork?: boolean };
+  capabilities?: { steer?: boolean };
   /** The conversation id this session already has, if any -- what `resume` must match for `open()` to report a resumed (not lost) Conversation. */
   conversationId?: string;
   /** The id a fresh Conversation gets, when there was nothing (matching or otherwise) to resume. Random when omitted. */
@@ -86,8 +86,6 @@ export interface FakeEngineScript {
    * can land a Stop inside it. A Stop there cancels the Steer's Turn.
    */
   beforeSteerConfirm?: (ctx: FakeTurnContext, steeredText: string) => Promise<void>;
-  /** What `forkConversation` resolves to. Defaults to echoing the same id back (a successful carry). */
-  forkConversation?: Engine["forkConversation"];
 }
 
 type QueueEntry = { kind: "command"; text: string; stopped?: boolean } | { kind: "engine" };
@@ -422,11 +420,11 @@ class FakeEngineSessionImpl implements FakeEngineSession {
  */
 export class FakeEngine implements Engine {
   readonly kind: EngineKind;
-  readonly capabilities: { steer: boolean; fork: boolean };
+  readonly capabilities: { steer: boolean };
 
   constructor(private readonly script: FakeEngineScript) {
     this.kind = script.kind ?? "claude";
-    this.capabilities = { steer: script.capabilities?.steer ?? true, fork: script.capabilities?.fork ?? true };
+    this.capabilities = { steer: script.capabilities?.steer ?? true };
   }
 
   async verify(): Promise<void> {
@@ -436,11 +434,6 @@ export class FakeEngine implements Engine {
   async open(options: OpenOptions): Promise<FakeEngineSession> {
     if (this.script.failOpen) throw this.script.failOpen;
     return new FakeEngineSessionImpl(this.script, options);
-  }
-
-  forkConversation(input: { conversationId: string; fromDir: string; toDir: string }): Promise<string | undefined> {
-    if (this.script.forkConversation) return this.script.forkConversation(input);
-    return Promise.resolve(input.conversationId);
   }
 }
 

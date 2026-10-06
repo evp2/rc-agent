@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { RelayClient } from "../src/relay/client.ts";
+import { CONNECTOR_VERSION } from "../src/version.ts";
 
 /**
  * Observed in production: a relay request whose connection hangs (no
@@ -62,6 +63,36 @@ test("postCommand marks itself as the connector, not the phone", async () => {
     assert.equal(headers["X-Crc-Client"], "connector");
     assert.equal(headers["Authorization"], "Bearer secret");
     assert.deepEqual(JSON.parse(captured!.init.body as string), { text: "/compact" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+/**
+ * Pins the whole skills report body against the real RelayClient: the relay
+ * double only sees putSkills' arguments, so a stray field on the wire would
+ * pass every test that goes through it.
+ */
+test("putSkills sends exactly the skills, local commands and the connector's version", async () => {
+  const realFetch = globalThis.fetch;
+  let captured: { url: string; init: RequestInit } | undefined;
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    captured = { url, init: init! };
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const client = await RelayClient.resume("http://relay.test", "sess-1", "secret");
+    const skill = { name: "grill-me", description: "Interview me", argumentHint: "" };
+    await client.putSkills([skill], [], undefined);
+
+    assert.equal(captured?.url, "http://relay.test/sessions/sess-1/skills");
+    assert.equal(captured!.init.method, "PUT");
+    assert.deepEqual(JSON.parse(captured!.init.body as string), {
+      skills: [skill],
+      local_commands: [],
+      connector_version: CONNECTOR_VERSION,
+    });
   } finally {
     globalThis.fetch = realFetch;
   }

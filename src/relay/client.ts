@@ -1,7 +1,5 @@
-import type { ForkErrorCode } from "../fork";
 import type { ProviderConfig } from "../provider";
 import { CONNECTOR_VERSION } from "../version";
-import type { WorktreeEntry } from "../worktrees";
 
 /** One skill the connector discovered, for the phone's "/" menu. */
 export interface SkillInfo {
@@ -27,19 +25,12 @@ export interface AnswerRecord {
   response?: string;
 }
 
-/** A pending request to Fork this Session, as the relay stores and reports it. Single-slot: a repeat request overwrites rather than queues. */
-export interface ForkRequest {
-  name: string;
-  requested_at: string;
-}
-
 /** The shape `GET /sessions/{id}` returns, polled throughout the session's life for out-of-band requests the phone or relay has made against it. */
 export interface SessionSnapshot {
   interrupt_at?: string;
   last_connector_seen_at?: string;
   answer?: AnswerRecord;
   kill_task?: { task_id: string; requested_at: string };
-  fork_request?: ForkRequest;
 }
 
 export type EventType =
@@ -101,16 +92,6 @@ export interface EventInput {
   cache_read_input_tokens?: number;
   /** On a `usage` event, already in the relay's `<host>#<org>/<repo>` Contributions key shape. Absent when the working directory has no git remote. */
   repo?: string;
-  /** Echoes the `fork_request`'s `requested_at`, on a `status` event reporting a Fork's outcome -- lets the client match a result to the request that produced it. */
-  fork_requested_at?: string;
-  /** The Fork's requested name, on a `status` event reporting its outcome. */
-  fork_name?: string;
-  /** The new Session's Control URL, on a `status` event reporting a successful Fork. */
-  fork_control_url?: string;
-  /** git's own error text, unmodified, on a `status` event reporting a failed Fork. */
-  fork_error?: string;
-  /** Why the Fork failed, when it could be classified -- an addition to `fork_error`, never a replacement. */
-  fork_error_code?: ForkErrorCode;
   /** On an `image` event: the id the relay minted when it signed the upload. */
   image_id?: string;
   /** On an `image` event: the Image's MIME type. */
@@ -425,7 +406,6 @@ export class RelayClient {
     skills: SkillInfo[],
     localCommands: SkillInfo[],
     inactivityCompactAfterMinutes: number | undefined,
-    worktrees: WorktreeEntry[],
   ): Promise<void> {
     const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/skills`, {
       method: "PUT",
@@ -440,13 +420,6 @@ export class RelayClient {
         ...(inactivityCompactAfterMinutes !== undefined
           ? { inactivity_compact_after_minutes: inactivityCompactAfterMinutes }
           : {}),
-        worktrees: worktrees.map((w) => ({
-          path: w.path,
-          ...(w.engine ? { engine: w.engine } : {}),
-          self: w.self,
-          live: w.live,
-          ...(w.controlUrl ? { control_url: w.controlUrl } : {}),
-        })),
       }),
     });
     await checkTerminal(res);

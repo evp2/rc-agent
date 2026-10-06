@@ -1872,17 +1872,6 @@ test("CopilotEngine: verify() passes when signed in, and the session reuses the 
   assert.equal(runtime.stopped, true, "closing the session stops the runtime process too");
 });
 
-test("CopilotEngine: Fork is refused, since Copilot can't carry a Conversation into a new worktree yet", async () => {
-  await assert.rejects(
-    engineOn(new FakeCopilotRuntime()).forkConversation({ conversationId: "c", fromDir: "/a", toDir: "/b" }),
-    /isn't available for Copilot/,
-  );
-});
-
-test("CopilotEngine: reports it can't Fork, so a Fork is refused before any worktree is made", () => {
-  assert.equal(engineOn(new FakeCopilotRuntime()).capabilities.fork, false);
-});
-
 test("CopilotEngine: reports it can Steer", () => {
   assert.equal(engineOn(new FakeCopilotRuntime()).capabilities.steer, true);
 });

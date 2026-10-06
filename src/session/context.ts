@@ -6,11 +6,6 @@ import type { EngineStartedTurn } from "./engineTurn";
 import type { InFlight } from "./inFlight";
 import type { ConnectorState } from "../state";
 
-/** What a Fork attempt resolves to on success -- see {@link SessionContext.executeFork}. */
-export interface ForkOutcome {
-  controlUrl: string | undefined;
-}
-
 /**
  * The Command Turn chain currently executing, if any -- a Command's own Turn
  * plus any Turns Steered into it. Shared between {@link runTurn} in turn.ts,
@@ -70,7 +65,7 @@ export interface SessionContext {
   state: ConnectorState;
   /** Last-published skill+local-command lists, as JSON, so a turn whose lists haven't changed since the last publish (the common case) doesn't PUT anything. */
   lastSkillsJson: string | undefined;
-  /** The Engine's Conversation id, once it is resumable -- what a restart resumes and a Fork carries. */
+  /** The Engine's Conversation id, once it is resumable -- what a restart resumes. */
   conversationId: string | undefined;
   eventBuffer: EventInput[];
   running: boolean;
@@ -87,22 +82,6 @@ export interface SessionContext {
    * request isn't re-sent to the SDK on every poll.
    */
   lastHandledKillAt: string | undefined;
-
-  /**
-   * The `requested_at` of the most recent Fork already actioned, so the same
-   * `fork_request` isn't re-run on every poll -- mirrors {@link lastHandledKillAt}.
-   */
-  lastHandledForkAt: string | undefined;
-
-  /**
-   * Carries out a Fork by name: `git worktree add`, a generated config, the
-   * Engine carrying the Conversation over, and a new connector process, returning that
-   * process's Control URL. A field rather than a direct import because the
-   * real implementation spawns a detached OS process
-   * and waits on its state file, which a test must not do; a test hands this
-   * a stub instead.
-   */
-  readonly executeFork: (name: string) => Promise<ForkOutcome>;
 
   /**
    * In-memory only, by design: a Command the current Turn was too late to

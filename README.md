@@ -164,10 +164,6 @@ again: *<shell>* finished" and offers the brake, without a push. Stop, and
 stopping the connector, end any detached shells still running, since Copilot
 would otherwise leave them behind.
 
-Not yet on Copilot: Fork. Tapping Fork on a Copilot session fails straight
-away, with "Forking isn't available for Copilot sessions yet" on the phone, and
-no worktree or branch is made.
-
 ## Run
 
 ```bash
@@ -177,8 +173,6 @@ rc-agent qr               # print the pairing QR (--share for the share link)
 rc-agent qr --relay       # same, but the QR encodes the relay URL instead of the Netlify Control link
 rc-agent stop             # stop it, leaving the session resumable
 rc-agent stop --end       # stop it and end the session (destroys the conversation)
-
-rc-agent fork <name>      # new session in a sibling git worktree, seeded with this conversation
 
 rc-agent run              # foreground, Ctrl-C to stop
 ```

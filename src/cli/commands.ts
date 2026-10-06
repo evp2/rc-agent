@@ -1,9 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import { engineKindFor, type ConnectorConfig } from "../config";
-import { createEngine } from "../engine/create";
 import { ENGINE_KINDS, type EngineKind } from "../engine/types";
-import { runFork } from "../fork";
 import { pairingQrUrl, printPairingQrCode } from "../qr";
 import { RelayClient, SessionEndedError } from "../relay/client";
 import { runConnector } from "../session/loop";
@@ -28,10 +26,10 @@ function printControlUrl(controlUrl: string | undefined): void {
 /**
  * The phone URL, Control link, QR code, and share link -- the tail every
  * "here's your running connector" report ends with, whether the connector
- * was already running, was just started, was just forked, or `rc-agent qr`
- * was asked for it. The QR encodes the Control link unless `relay` asks for
- * the relay's phone URL, and is printed directly under whichever link it
- * encodes, so the text beside it is what a scan opens.
+ * was already running, was just started, or `rc-agent qr` was asked for it.
+ * The QR encodes the Control link unless `relay` asks for the relay's phone
+ * URL, and is printed directly under whichever link it encodes, so the text
+ * beside it is what a scan opens.
  */
 function printConnectionReport(
   state: { phoneUrl: string; controlUrl?: string; staticUrl?: string },
@@ -108,24 +106,6 @@ export async function start(
   }
   console.log(`Connector started for ${config.projectDir} (pid ${state.pid}).`);
   console.log(`Logging to ${logPath(config.projectDir, engine)}`);
-  printConnectionReport(state, relay);
-}
-
-/**
- * Creates a new Session in a new git Worktree of `config.projectDir`'s repo
- * and starts it, printing the same start-up report `rc-agent start` does.
- */
-export async function fork(
-  config: ConnectorConfig,
-  name: string,
-  fromRef: string | undefined,
-  relay: boolean,
-): Promise<void> {
-  const engine = createEngine(config);
-  const conversationId = readState(config.projectDir, engine.kind)?.conversationId;
-  const state = await runFork(config, engine, conversationId, name, fromRef);
-  console.log(`Connector started for ${state.projectDir} (pid ${state.pid}).`);
-  console.log(`Logging to ${logPath(state.projectDir, state.engine)}`);
   printConnectionReport(state, relay);
 }
 

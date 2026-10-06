@@ -8,7 +8,6 @@ import { showImage } from "../src/session/images.ts";
 import { pumpEngineEvents } from "../src/session/pump.ts";
 import { answerQuestion } from "../src/session/watchers.ts";
 import type { ConnectorState } from "../src/state.ts";
-import type { WorktreeEntry } from "../src/worktrees.ts";
 
 /** Records what the ledger reported, so a test can assert on transitions rather than only on the final value. */
 export class FakeRelay {
@@ -93,16 +92,14 @@ export class FakeRelay {
     skills: unknown;
     localCommands: unknown;
     inactivityCompactAfterMinutes: number | undefined;
-    worktrees: WorktreeEntry[];
   }[] = [];
 
   async putSkills(
     skills: unknown,
     localCommands: unknown,
     inactivityCompactAfterMinutes: number | undefined,
-    worktrees: WorktreeEntry[],
   ): Promise<void> {
-    this.putSkillsCalls.push({ skills, localCommands, inactivityCompactAfterMinutes, worktrees });
+    this.putSkillsCalls.push({ skills, localCommands, inactivityCompactAfterMinutes });
   }
 
   async postContribution(input: {
@@ -190,8 +187,6 @@ export async function makeTurnHarness(
     projectDir?: string;
     /** Overrides merged into the fake config -- e.g. `inactivityCompact` for Auto-compact tests. */
     config?: Partial<SessionContext["config"]>;
-    /** Stubs `ctx.executeFork` -- defaults to a no-op success, overridden by Fork tests to assert what it was called with or to simulate a failure. */
-    executeFork?: SessionContext["executeFork"];
   } = {},
 ): Promise<TurnHarness> {
   const relay = new FakeRelay();
@@ -254,8 +249,6 @@ export async function makeTurnHarness(
     sessionEnded: false,
     runningTasks: [],
     lastHandledKillAt: undefined,
-    lastHandledForkAt: undefined,
-    executeFork: opts.executeFork ?? (async () => ({ controlUrl: undefined })),
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,

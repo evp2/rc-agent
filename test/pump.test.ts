@@ -1,8 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
 
 import { hangUntilStopped, sayAndFinish, startBackgroundTaskAndFinish } from "../src/engine/fakeEngine.ts";
@@ -60,10 +56,7 @@ test("the Engine's menu is published to the relay", async () => {
     skills: [{ name: "grill-me", description: "Interview me", argumentHint: "" }],
     localCommands: [{ name: "compact", description: "Compact the conversation", argumentHint: "" }],
   };
-  // The Worktree list rides the same report, so it needs a real repository to list.
-  const repo = mkdtempSync(join(tmpdir(), "crc-pump-repo-"));
-  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repo });
-  const h = await makeTurnHarness({ projectDir: repo, script: { menu } });
+  const h = await makeTurnHarness({ script: { menu } });
 
   await until(() => h.relay.putSkillsCalls.length === 1);
 

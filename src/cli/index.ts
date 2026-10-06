@@ -5,7 +5,7 @@ import { parseArgs } from "node:util";
 import { resolve } from "node:path";
 
 import { loadConfig } from "../config";
-import { fork, qr, runForeground, start, status, stop } from "./commands";
+import { qr, runForeground, start, status, stop } from "./commands";
 
 const USAGE = `rc-agent -- claude-remote-control connector
 
@@ -17,22 +17,17 @@ Usage:
   rc-agent status  [--config <path>]   Report connector and session health
   rc-agent qr      [--config <path>]   Print the pairing URL and QR code (add
                                   --share for the Netlify share link instead)
-  rc-agent fork <name> [--from <ref>] [--config <path>]
-                                  Create a new Session in a new git worktree
-                                  (sibling to this one, branched from <ref> or
-                                  HEAD), seeded with this Session's
-                                  conversation, and start it
   rc-agent run     [--config <path>]   Run in the foreground (Ctrl-C to stop)
 
 With no subcommand, rc-agent runs in the foreground.
 
-The pairing QR that run, start, qr and fork print encodes the Netlify Control
+The pairing QR that run, start and qr print encodes the Netlify Control
 link. Add --relay to encode the relay's phone URL instead.
 `;
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const known = ["start", "stop", "status", "qr", "fork", "run"];
+  const known = ["start", "stop", "status", "qr", "run"];
   const subcommand = argv[0] && !argv[0].startsWith("-") ? argv[0] : "run";
   const rest = subcommand === argv[0] ? argv.slice(1) : argv;
 
@@ -44,16 +39,14 @@ async function main(): Promise<void> {
     throw new Error(`Unknown subcommand '${subcommand}'.\n\n${USAGE}`);
   }
 
-  const { values, positionals } = parseArgs({
+  const { values } = parseArgs({
     args: rest,
     options: {
       config: { type: "string", short: "c", default: "./connector.config.json" },
       end: { type: "boolean", default: false },
       share: { type: "boolean", default: false },
       relay: { type: "boolean", default: false },
-      from: { type: "string" },
     },
-    allowPositionals: subcommand === "fork",
   });
 
   const configPath = resolve(values.config as string);
@@ -71,11 +64,6 @@ async function main(): Promise<void> {
       return status(config);
     case "qr":
       return qr(config, values.share as boolean, relay);
-    case "fork": {
-      const name = positionals[0];
-      if (!name) throw new Error(`'rc-agent fork' requires a name.\n\n${USAGE}`);
-      return fork(config, name, values.from as string | undefined, relay);
-    }
   }
 }
 

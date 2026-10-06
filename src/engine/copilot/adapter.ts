@@ -1172,7 +1172,7 @@ function addUsage(
  */
 export class CopilotEngine implements Engine {
   readonly kind = "copilot" as const;
-  readonly capabilities = { steer: true, fork: false };
+  readonly capabilities = { steer: true };
   private runtime: Promise<CopilotRuntime> | undefined;
 
   constructor(private readonly deps: CopilotEngineDeps) {}
@@ -1247,9 +1247,5 @@ export class CopilotEngine implements Engine {
     }
     const session = await runtime.createSession(sessionOptions);
     return wrap(session, { type: "conversation", id: session.sessionId, resumed: false });
-  }
-
-  async forkConversation(_input: { conversationId: string; fromDir: string; toDir: string }): Promise<string | undefined> {
-    throw new Error("Forking isn't available for Copilot sessions yet.");
   }
 }

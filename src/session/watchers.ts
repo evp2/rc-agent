@@ -1,5 +1,4 @@
 import type { EngineAnswer, EngineQuestion } from "../engine/types";
-import { ForkError } from "../fork";
 import { SessionEndedError, type CommandRecord } from "../relay/client";
 import type { SessionContext } from "./context";
 
@@ -41,76 +40,6 @@ export async function checkKillRequest(ctx: SessionContext): Promise<void> {
 export function watchForKills(ctx: SessionContext): () => void {
   const timer = setInterval(() => {
     void checkKillRequest(ctx);
-  }, INTERRUPT_POLL_INTERVAL_MS);
-  return () => clearInterval(timer);
-}
-
-/**
- * Acts on a `fork_request` newer than the last one this connector already
- * handled, driving {@link SessionContext.executeFork} and reporting the
- * outcome as a `status` event -- `fork_control_url` on success,
- * `fork_error` (whatever `executeFork` threw, unmodified) on failure. Posted
- * directly through `postEvents` rather than buffered into `ctx.eventBuffer`,
- * since a Fork's result is worth a dedicated delivery, not one that waits on
- * the next ordinary flush tick.
- *
- * Runs independently of whether a Turn is currently in flight -- a Fork
- * spawns an entirely separate connector process in a separate Worktree, so
- * it has nothing to wait on here. Exported and free of any interval so a
- * test can drive one check directly, exactly like {@link checkInterrupt}.
- */
-export async function checkForkRequest(ctx: SessionContext): Promise<void> {
-  let session;
-  try {
-    session = await ctx.client.getSession({ heartbeat: true });
-  } catch (e) {
-    if (!(e instanceof SessionEndedError)) {
-      console.error("Fork watcher poll failed:", (e as Error).message);
-    }
-    return;
-  }
-
-  const request = session.fork_request;
-  if (!request || request.requested_at === ctx.lastHandledForkAt) return;
-  ctx.lastHandledForkAt = request.requested_at;
-
-  console.log(`Fork requested: "${request.name}".`);
-  try {
-    const { controlUrl } = await ctx.executeFork(request.name);
-    await ctx.client.postEvents([
-      {
-        type: "status",
-        fork_requested_at: request.requested_at,
-        fork_name: request.name,
-        fork_control_url: controlUrl,
-      },
-    ]);
-  } catch (e) {
-    console.error(`Fork "${request.name}" failed:`, (e as Error).message);
-    await ctx.client
-      .postEvents([
-        {
-          type: "status",
-          fork_requested_at: request.requested_at,
-          fork_name: request.name,
-          fork_error: (e as Error).message,
-          // Spread rather than set: an unclassified failure must post the same
-          // shape it always has, so a relay and phone that predate the code
-          // see nothing new and behave exactly as before.
-          ...(e instanceof ForkError && e.code ? { fork_error_code: e.code } : {}),
-        },
-      ])
-      .catch((postErr) => {
-        if (!(postErr instanceof SessionEndedError)) {
-          console.error("Failed to report the Fork failure:", (postErr as Error).message);
-        }
-      });
-  }
-}
-
-export function watchForForkRequests(ctx: SessionContext): () => void {
-  const timer = setInterval(() => {
-    void checkForkRequest(ctx);
   }, INTERRUPT_POLL_INTERVAL_MS);
   return () => clearInterval(timer);
 }

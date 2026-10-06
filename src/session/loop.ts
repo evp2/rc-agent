@@ -2,9 +2,7 @@ import { PERMISSION_MODE, type ConnectorConfig, type InactivityCompactConfig } f
 import { createEngine } from "../engine/create";
 import { fakeEnginePersona } from "../engine/fakePersonas";
 import type { Engine, EngineKind } from "../engine/types";
-import { runFork } from "../fork";
 import { RelayClient, SessionEndedError } from "../relay/client";
-import { takeForkedConversation } from "../spawn";
 import { isReusableState, readState, writeState, type ConnectorState } from "../state";
 import { persist } from "./commands";
 import type { SessionContext } from "./context";
@@ -14,7 +12,7 @@ import { showImage } from "./images";
 import { InFlight } from "./inFlight";
 import { pumpEngineEvents } from "./pump";
 import { runTurn } from "./turn";
-import { answerQuestion, watchForForkRequests, watchForKills, watchForSteers } from "./watchers";
+import { answerQuestion, watchForKills, watchForSteers } from "./watchers";
 
 const POLL_INTERVAL_MS = 1750;
 const FLUSH_INTERVAL_MS = 750;
@@ -180,17 +178,12 @@ async function acquireSession(config: ConnectorConfig, engine: EngineKind): Prom
  * session is live, so a caller can report the phone URL before the loop ends.
  */
 export async function runConnector(config: ConnectorConfig): Promise<RunHandle> {
-  // Taken before the Engine is built, which copies the environment for the
-  // agent process.
-  const forkedConversation = takeForkedConversation();
   const engine = selectEngine(config);
   // Before a relay session exists: an Engine that can never run should fail
   // here, with its own message, rather than after a phone has paired.
   await engine.verify();
   const { client, phoneUrl, staticUrl, controlUrl, resumed } = await acquireSession(config, engine.kind);
-  // A state file's Conversation wins; failing that, the one a Fork carried
-  // into this brand-new worktree.
-  const conversationId = resumed?.conversationId ?? forkedConversation;
+  const conversationId = resumed?.conversationId;
 
   // Declared before the context so the ledger's dependencies can close over
   // it: the ledger persists and emits through the same paths everything else
@@ -257,11 +250,6 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     sessionEnded: false,
     runningTasks: [],
     lastHandledKillAt: undefined,
-    lastHandledForkAt: undefined,
-    executeFork: async (name) => {
-      const state = await runFork(config, engine, ctx.conversationId, name, undefined);
-      return { controlUrl: state.controlUrl };
-    },
     handBackBuffer: [],
     questionPending: false,
     currentTurn: undefined,
@@ -290,7 +278,6 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   }, INFLIGHT_RECONCILE_INTERVAL_MS);
   const stopWatchingKills = watchForKills(ctx);
   const stopWatchingSteers = watchForSteers(ctx);
-  const stopWatchingForks = watchForForkRequests(ctx);
 
   let shuttingDown = false;
   let resolveDone: () => void = () => undefined;
@@ -312,7 +299,6 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     clearInterval(inFlightReconcileTimer);
     stopWatchingKills();
     stopWatchingSteers();
-    stopWatchingForks();
     // Closing ends the pump, whose last events still make the final flush.
     await ctx.engineSession
       .close()

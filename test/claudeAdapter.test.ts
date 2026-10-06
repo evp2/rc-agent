@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { HookInput, McpSdkServerConfigWithInstance, Options } from "@anthropic-ai/claude-agent-sdk";
@@ -9,7 +6,6 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { ClaudeEngine } from "../src/engine/claude/adapter.ts";
-import { transcriptPath } from "../src/engine/claude/transcript.ts";
 import type {
   EngineAnswer,
   EngineEvent,
@@ -611,7 +607,7 @@ test("ClaudeEngine: a Steer pending when the query ends cleanly still gets its T
   await session.close();
 });
 
-// --- The menu, and Fork's Conversation carry ---------------------------------
+// --- The menu ---------------------------------------------------------------
 
 const probedMenu = {
   skills: [{ name: "probed-skill", description: "from the startup probe", argumentHint: "" }],
@@ -676,45 +672,4 @@ test("ClaudeEngine: a startup probe that fails leaves the menu for the first Tur
   const events: EngineEvent[] = [];
   for await (const e of session.events) events.push(e);
   assert.deepEqual(events, []);
-});
-
-test("ClaudeEngine: forkConversation copies the transcript to the new worktree, to resume there under the same id", async () => {
-  const projectsDir = mkdtempSync(join(tmpdir(), "crc-claude-projects-"));
-  const sourcePath = transcriptPath("/home/dev/repo", "conv-1", projectsDir);
-  mkdirSync(dirname(sourcePath), { recursive: true });
-  writeFileSync(sourcePath, '{"hello":"world"}\n');
-  const engine = new ClaudeEngine({ query: scriptedQuery([]).query, env: {}, claudeProjectsDir: projectsDir });
-
-  const resumeId = await engine.forkConversation({
-    conversationId: "conv-1",
-    fromDir: "/home/dev/repo",
-    toDir: "/home/dev/repo.feature",
-  });
-
-  assert.equal(resumeId, "conv-1");
-  assert.equal(
-    readFileSync(join(projectsDir, "-home-dev-repo-feature", "conv-1.jsonl"), "utf-8"),
-    '{"hello":"world"}\n',
-  );
-});
-
-test("ClaudeEngine: forkConversation with no transcript to copy carries nothing", async () => {
-  const projectsDir = mkdtempSync(join(tmpdir(), "crc-claude-projects-"));
-  const engine = new ClaudeEngine({ query: scriptedQuery([]).query, env: {}, claudeProjectsDir: projectsDir });
-
-  const resumeId = await engine.forkConversation({
-    conversationId: "missing",
-    fromDir: "/home/dev/repo",
-    toDir: "/home/dev/repo.feature",
-  });
-
-  assert.equal(resumeId, undefined);
-  assert.ok(!existsSync(join(projectsDir, "-home-dev-repo-feature")));
-});
-
-test("transcriptPath encodes the worktree path the way Claude Code files transcripts", () => {
-  assert.equal(
-    transcriptPath("/private/tmp/crc-encode-test.v1/sub.dir", "abc-123", "/projects"),
-    "/projects/-private-tmp-crc-encode-test-v1-sub-dir/abc-123.jsonl",
-  );
 });

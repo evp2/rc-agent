@@ -210,17 +210,6 @@ test("FakeEngine: close() does not hang when a Command is queued behind a hangin
   await session.close();
 });
 
-test("FakeEngine: forkConversation defaults to carrying the same id, and is overridable", async () => {
-  const defaultEngine = new FakeEngine({ handlerFor: () => sayAndFinish("hi") });
-  assert.equal(
-    await defaultEngine.forkConversation({ conversationId: "abc", fromDir: "/a", toDir: "/b" }),
-    "abc",
-  );
-
-  const noCarry = new FakeEngine({ handlerFor: () => sayAndFinish("hi"), forkConversation: async () => undefined });
-  assert.equal(await noCarry.forkConversation({ conversationId: "abc", fromDir: "/a", toDir: "/b" }), undefined);
-});
-
 // --- local test helper ------------------------------------------------------
 
 const TIMED_OUT = Symbol("timed out");

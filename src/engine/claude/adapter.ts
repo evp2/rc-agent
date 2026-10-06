@@ -1,6 +1,3 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-
 import {
   createSdkMcpServer,
   tool,
@@ -37,7 +34,6 @@ import type {
 import { buildProviderEnv } from "./providerEnv";
 import { query as defaultSdkQuery } from "./sdk";
 import { probeSkills, selectLocalCommands, selectSkills } from "./skills";
-import { transcriptPath } from "./transcript";
 
 type Menu = { skills: SkillInfo[]; localCommands: SkillInfo[] };
 
@@ -49,8 +45,6 @@ export interface ClaudeEngineDeps {
    * first Turn. Absent means no startup menu: the first Turn's `init` fills it.
    */
   probeMenu?: (projectDir: string) => Promise<Menu>;
-  /** Where Claude Code files transcripts. Defaults to `~/.claude/projects`; tests override it. */
-  claudeProjectsDir?: string;
 }
 
 /** Builds a Claude adapter wired to the real SDK's `query()`, in the provider's environment. */
@@ -595,11 +589,11 @@ class ClaudeEngineSession implements EngineSession {
 /**
  * The Claude adapter: everything the Engine seam hides about the Claude
  * Agent SDK -- message shapes, how a Turn starts and ends, how a Steer is
- * delivered, resume, and Fork's transcript copy.
+ * delivered, and resume.
  */
 export class ClaudeEngine implements Engine {
   readonly kind = "claude" as const;
-  readonly capabilities = { steer: true, fork: true };
+  readonly capabilities = { steer: true };
 
   constructor(private readonly deps: ClaudeEngineDeps) {}
 
@@ -608,15 +602,5 @@ export class ClaudeEngine implements Engine {
 
   async open(options: OpenOptions): Promise<EngineSession> {
     return new ClaudeEngineSession(this.deps, options);
-  }
-
-  /** Claude Code finds a transcript by the directory it runs in, so a copy filed under the new worktree resumes there under the same id. */
-  async forkConversation(input: { conversationId: string; fromDir: string; toDir: string }): Promise<string | undefined> {
-    const sourcePath = transcriptPath(input.fromDir, input.conversationId, this.deps.claudeProjectsDir);
-    if (!existsSync(sourcePath)) return undefined;
-    const destPath = transcriptPath(input.toDir, input.conversationId, this.deps.claudeProjectsDir);
-    mkdirSync(dirname(destPath), { recursive: true });
-    copyFileSync(sourcePath, destPath);
-    return input.conversationId;
   }
 }
