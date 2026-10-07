@@ -14,7 +14,15 @@ import {
   SHOW_IMAGE_DESCRIPTION,
   SHOW_IMAGE_PATH_DESCRIPTION,
 } from "../showImageTool";
-import type { Engine, EngineEvent, EngineQuestion, EngineSession, EngineUsage, OpenOptions } from "../types";
+import {
+  CONNECTOR_QUESTION_ID_PREFIX,
+  type Engine,
+  type EngineEvent,
+  type EngineQuestion,
+  type EngineSession,
+  type EngineUsage,
+  type OpenOptions,
+} from "../types";
 import { chooseEffort, chooseModel, type ModelPickerDeps } from "./modelPicker";
 import {
   startCopilotRuntime,
@@ -597,7 +605,7 @@ class CopilotEngineSession implements EngineSession {
       },
       ask: async (question) => {
         running();
-        return this.putQuestion(`connector-question-${++this.ownQuestions}`, question);
+        return this.putQuestion(`${CONNECTOR_QUESTION_ID_PREFIX}${++this.ownQuestions}`, question);
       },
     };
   }

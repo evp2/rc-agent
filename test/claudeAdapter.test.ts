@@ -258,44 +258,6 @@ test("ClaudeEngine: the Question callback replaces the question tool's tool-call
   await session.close();
 });
 
-test("ClaudeEngine: a Question stopped before it is answered tells the model the human saw it", async () => {
-  const questionInput = {
-    questions: [{ question: "Which approach?", options: [{ label: "A" }, { label: "B" }], multiSelect: false }],
-  };
-  let capturedOptions: Options | undefined;
-  const { query } = scriptedQuery([init()], {
-    onOptions: (options) => {
-      capturedOptions = options;
-    },
-  });
-  const engine = new ClaudeEngine({ query, env: {} });
-  const session = await engine.open({
-    projectDir: "/tmp/x",
-    // What the connector's Question callback does when the phone taps Stop
-    // while the picker is open.
-    onQuestion: async () => {
-      throw new Error("turn stopped");
-    },
-  });
-  const it = session.events[Symbol.asyncIterator]();
-  session.send("ask something");
-  await collect(it, (e) => e.type === "turn_started");
-
-  const permissionResult = await capturedOptions?.canUseTool?.("AskUserQuestion", questionInput, {
-    signal: new AbortController().signal,
-    toolUseID: "toolu_q1",
-    requestId: "req-1",
-  });
-
-  assert.deepEqual(permissionResult, {
-    behavior: "deny",
-    message:
-      "The human was shown this question but stopped the turn without answering it. It did not fail to display; wait for their next message rather than re-asking or guessing.",
-    interrupt: true,
-  });
-  await session.close();
-});
-
 test("ClaudeEngine: an assistant message's AskUserQuestion tool_use produces no tool_use event", async () => {
   const toolUseId = "toolu_q1";
   const { query } = scriptedQuery([

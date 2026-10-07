@@ -5,6 +5,7 @@ import { attributionKey, measureContribution, readPosition, type Position } from
 import type { CurrentTurn, SessionContext, TurnCause, TurnEndedEvent } from "./context";
 import type { TurnClaims } from "./inFlight";
 import { checkInterrupt, watchForInterrupt } from "./watchers";
+import { deliverWithWithdrawnNote } from "./withdrawn";
 
 /**
  * Whether this reading should fire a Context-window warning,
@@ -270,7 +271,9 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
       const firstCause = ctx.engineTurn?.steer(command.text) ? "steer" : "command";
       const chain = new CommandChain(ctx, command, claims, abortController, repo, firstCause);
       ctx.currentTurn = chain;
-      if (firstCause === "command") ctx.engineSession.send(command.text);
+      if (firstCause === "command") {
+        deliverWithWithdrawnNote(ctx, command.text, (text) => ctx.engineSession.send(text));
+      }
       await chain.done;
       // Discarded visibly, as a pending Steer always is under Stop: the
       // brake starting fresh work is not a brake.

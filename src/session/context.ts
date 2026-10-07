@@ -1,5 +1,5 @@
 import type { ConnectorConfig } from "../config";
-import type { Engine, EngineEvent, EngineSession } from "../engine/types";
+import type { Engine, EngineEvent, EngineQuestion, EngineSession } from "../engine/types";
 import type { CommandRecord, EventInput, RelayClient } from "../relay/client";
 import type { createBannerDeduper } from "./engineEvents";
 import type { EngineStartedTurn } from "./engineTurn";
@@ -97,6 +97,9 @@ export interface SessionContext {
    * a Command the stalled Turn cannot read yet.
    */
   questionPending: boolean;
+
+  /** Questions Withdrawn since the Engine last received a Command or Steer. */
+  withdrawnQuestions: EngineQuestion[];
 
   currentTurn: CurrentTurn | undefined;
 

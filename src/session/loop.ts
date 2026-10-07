@@ -252,6 +252,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     lastHandledKillAt: undefined,
     handBackBuffer: [],
     questionPending: false,
+    withdrawnQuestions: [],
     currentTurn: undefined,
     engineTurn: undefined,
     contextWarningActive: false,

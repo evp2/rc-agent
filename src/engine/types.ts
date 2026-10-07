@@ -71,6 +71,9 @@ export interface EngineSession {
  * carry. Claude's `AskUserQuestion` input is this shape natively. Copilot's
  * single-question `ask_user` becomes a one-element `questions` array.
  */
+/** The `toolUseId` prefix of a Question the connector asks itself, while running a Local command. */
+export const CONNECTOR_QUESTION_ID_PREFIX = "connector-question-";
+
 export interface EngineQuestion {
   toolUseId: string;
   questions: {

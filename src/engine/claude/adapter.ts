@@ -329,15 +329,8 @@ class ClaudeEngineSession implements EngineSession {
           updatedInput: { questions: question.questions, answers: answer.answers, response: answer.response },
         };
       } catch {
-        // The usual way here is a Stop tapped while the picker was open. A
-        // bare "not answered" reads to the model like the prompt broke, and it
-        // then tells the human so on the next turn.
-        return {
-          behavior: "deny",
-          message:
-            "The human was shown this question but stopped the turn without answering it. It did not fail to display; wait for their next message rather than re-asking or guessing.",
-          interrupt: true,
-        };
+        // The CLI replaces this message with its own on interrupt; the session's Withdrawn note tells the model instead.
+        return { behavior: "deny", message: "question withdrawn", interrupt: true };
       }
     };
   }

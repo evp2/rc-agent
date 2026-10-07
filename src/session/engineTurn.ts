@@ -3,6 +3,7 @@ import type { SessionContext, TurnEndedEvent } from "./context";
 import { attributionKey } from "./contribution";
 import { reportTurnEnded } from "./turn";
 import { watchForInterrupt } from "./watchers";
+import { deliverWithWithdrawnNote } from "./withdrawn";
 
 type TaskStarted = Extract<EngineEvent, { type: "task_started" }>;
 type TaskSettled = Extract<EngineEvent, { type: "task_settled" }>;
@@ -77,7 +78,7 @@ export class EngineStartedTurn {
     if (this.steered || this.abortController.signal.aborted) return false;
     if (!this.ctx.engine.capabilities.steer || this.ctx.questionPending) return false;
     try {
-      this.ctx.engineSession.steer(text);
+      deliverWithWithdrawnNote(this.ctx, text, (noted) => this.ctx.engineSession.steer(noted));
     } catch {
       // The Turn ended just now: nothing left to Steer.
       return false;

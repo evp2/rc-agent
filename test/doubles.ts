@@ -251,6 +251,7 @@ export async function makeTurnHarness(
     lastHandledKillAt: undefined,
     handBackBuffer: [],
     questionPending: false,
+    withdrawnQuestions: [],
     currentTurn: undefined,
     engineTurn: undefined,
     contextWarningActive: false,

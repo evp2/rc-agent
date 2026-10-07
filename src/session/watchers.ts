@@ -1,6 +1,7 @@
-import type { EngineAnswer, EngineQuestion } from "../engine/types";
+import { CONNECTOR_QUESTION_ID_PREFIX, type EngineAnswer, type EngineQuestion } from "../engine/types";
 import { SessionEndedError, type CommandRecord } from "../relay/client";
 import type { SessionContext } from "./context";
+import { deliverWithWithdrawnNote } from "./withdrawn";
 
 // How often a running turn checks whether the phone has asked it to stop.
 // Bounds how long "Stop" takes to visibly do something.
@@ -93,7 +94,7 @@ export async function checkForSteer(ctx: SessionContext): Promise<void> {
     const claiming = held.steer(first);
     let refused: unknown;
     try {
-      ctx.engineSession.steer(first.text);
+      deliverWithWithdrawnNote(ctx, first.text, (text) => ctx.engineSession.steer(text));
     } catch (e) {
       refused = e;
       held.withdrawSteer();
@@ -237,6 +238,11 @@ export async function answerQuestion(
   ctx.questionPending = true;
   try {
     return await waitForAnswer(ctx, question.toolUseId, signal);
+  } catch (e) {
+    if (signal.aborted && !question.toolUseId.startsWith(CONNECTOR_QUESTION_ID_PREFIX)) {
+      ctx.withdrawnQuestions.push(question);
+    }
+    throw e;
   } finally {
     ctx.questionPending = false;
   }
