@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { isAutoCompactDue, maybeSubmitAutoCompact } from "../src/session/loop.ts";
+import { createServer } from "node:http";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { isAutoCompactDue, maybeSubmitAutoCompact, runConnector } from "../src/session/loop.ts";
 import { SessionEndedError } from "../src/relay/client.ts";
 import { makeTurnHarness } from "./doubles.ts";
 
@@ -32,7 +37,7 @@ test("due again once a real Turn completes after the last Auto-compact", () => {
 });
 
 test("maybeSubmitAutoCompact does nothing when the feature is unconfigured", async () => {
-  const h = makeTurnHarness([]);
+  const h = await makeTurnHarness();
   h.ctx.state.lastRealTurnCompletedAt = minutesAgo(60);
 
   await maybeSubmitAutoCompact(h.ctx);
@@ -41,7 +46,7 @@ test("maybeSubmitAutoCompact does nothing when the feature is unconfigured", asy
 });
 
 test("maybeSubmitAutoCompact submits and persists lastAutoCompactAt once due", async () => {
-  const h = makeTurnHarness([], { config: { inactivityCompact: CFG } });
+  const h = await makeTurnHarness({ config: { inactivityCompact: CFG } });
   h.ctx.state.lastRealTurnCompletedAt = new Date(NOW - 31 * 60_000).toISOString();
 
   await maybeSubmitAutoCompact(h.ctx);
@@ -51,7 +56,7 @@ test("maybeSubmitAutoCompact submits and persists lastAutoCompactAt once due", a
 });
 
 test("maybeSubmitAutoCompact does not persist lastAutoCompactAt when the submission fails", async () => {
-  const h = makeTurnHarness([], { config: { inactivityCompact: CFG } });
+  const h = await makeTurnHarness({ config: { inactivityCompact: CFG } });
   h.ctx.state.lastRealTurnCompletedAt = new Date(NOW - 31 * 60_000).toISOString();
   h.relay.failNextPostCommand = new Error("network blip");
 
@@ -61,9 +66,34 @@ test("maybeSubmitAutoCompact does not persist lastAutoCompactAt when the submiss
 });
 
 test("maybeSubmitAutoCompact swallows a SessionEndedError like every other best-effort relay call", async () => {
-  const h = makeTurnHarness([], { config: { inactivityCompact: CFG } });
+  const h = await makeTurnHarness({ config: { inactivityCompact: CFG } });
   h.ctx.state.lastRealTurnCompletedAt = new Date(NOW - 31 * 60_000).toISOString();
   h.relay.failNextPostCommand = new SessionEndedError();
 
   await assert.doesNotReject(maybeSubmitAutoCompact(h.ctx));
+});
+
+test("an Engine that can't run fails startup before any relay session is made, with the Engine's message", async (t) => {
+  const requests: string[] = [];
+  const relay = createServer((req, res) => {
+    requests.push(`${req.method} ${req.url}`);
+    res.writeHead(500).end();
+  });
+  await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+  t.after(() => relay.close());
+  const { port } = relay.address() as { port: number };
+
+  process.env.CRC_FAKE_ENGINE = "signed-out";
+  t.after(() => delete process.env.CRC_FAKE_ENGINE);
+
+  await assert.rejects(
+    runConnector({
+      relayBaseUrl: `http://127.0.0.1:${port}`,
+      connectorCredential: "c",
+      projectDir: mkdtempSync(join(tmpdir(), "crc-loop-")),
+      provider: { type: "copilot", model: "auto" },
+    }),
+    /Not logged in/,
+  );
+  assert.deepEqual(requests, []);
 });

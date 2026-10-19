@@ -1,12 +1,13 @@
-import type { Options, Query, SDKMessage, SDKUserMessage, SlashCommand } from "@anthropic-ai/claude-agent-sdk";
-
-import { AsyncQueue } from "../src/sdk/asyncQueue.ts";
-import { createSdkMessageMapper } from "../src/sdk/bridge.ts";
-import type { CommandRecord, EventInput, RelayClient } from "../src/relay/client.ts";
+import { FakeEngine, sayAndFinish, type FakeEngineScript, type FakeEngineSession } from "../src/engine/fakeEngine.ts";
+import type { Engine, EngineSession } from "../src/engine/types.ts";
+import type { CommandRecord, EventInput, ImageUpload, RelayClient } from "../src/relay/client.ts";
 import type { SessionContext } from "../src/session/context.ts";
+import { createBannerDeduper } from "../src/session/engineEvents.ts";
 import { InFlight, type InFlightDeps } from "../src/session/inFlight.ts";
+import { showImage } from "../src/session/images.ts";
+import { pumpEngineEvents } from "../src/session/pump.ts";
+import { answerQuestion } from "../src/session/watchers.ts";
 import type { ConnectorState } from "../src/state.ts";
-import type { WorktreeEntry } from "../src/worktrees.ts";
 
 /** Records what the ledger reported, so a test can assert on transitions rather than only on the final value. */
 export class FakeRelay {
@@ -47,9 +48,43 @@ export class FakeRelay {
     return { seq: `auto-${this.postedCommands.length}`, created_at: new Date().toISOString() };
   }
 
+  /** Set to make every postEvents batch carrying an `image` Event reject, as a relay that refuses the Image would. */
+  rejectImageEvents: Error | undefined;
+
   async postEvents(events: EventInput[]): Promise<number> {
+    if (this.rejectImageEvents && events.some((e) => e.type === "image")) throw this.rejectImageEvents;
     this.posted.push(...events);
     return events.length;
+  }
+
+  /** Every upload the relay was asked to sign. */
+  readonly signed: { contentType: string; byteLength: number }[] = [];
+  /** Every upload sent to S3, keyed by the image id its signature carried. */
+  readonly uploaded: { imageId: string; bytes: Uint8Array; contentType: string }[] = [];
+
+  /** Set to make the next signImageUpload reject, as a relay refusing to sign would. */
+  failNextSign: Error | undefined;
+  /** Set to make the next uploadImage reject, as a failed S3 POST would. */
+  failNextUpload: Error | undefined;
+
+  async signImageUpload(contentType: string, byteLength: number): Promise<ImageUpload> {
+    this.signed.push({ contentType, byteLength });
+    if (this.failNextSign) {
+      const e = this.failNextSign;
+      this.failNextSign = undefined;
+      throw e;
+    }
+    const imageId = `img-${this.signed.length}`;
+    return { imageId, url: "https://bucket.s3.test/", fields: { key: `images/sess/${imageId}` } };
+  }
+
+  async uploadImage(upload: ImageUpload, bytes: Uint8Array, contentType: string): Promise<void> {
+    this.uploaded.push({ imageId: upload.imageId, bytes, contentType });
+    if (this.failNextUpload) {
+      const e = this.failNextUpload;
+      this.failNextUpload = undefined;
+      throw e;
+    }
   }
 
   /** Every putSkills call, so a test can assert what the periodic report carried. */
@@ -57,16 +92,14 @@ export class FakeRelay {
     skills: unknown;
     localCommands: unknown;
     inactivityCompactAfterMinutes: number | undefined;
-    worktrees: WorktreeEntry[];
   }[] = [];
 
   async putSkills(
     skills: unknown,
     localCommands: unknown,
     inactivityCompactAfterMinutes: number | undefined,
-    worktrees: WorktreeEntry[],
   ): Promise<void> {
-    this.putSkillsCalls.push({ skills, localCommands, inactivityCompactAfterMinutes, worktrees });
+    this.putSkillsCalls.push({ skills, localCommands, inactivityCompactAfterMinutes });
   }
 
   async postContribution(input: {
@@ -123,167 +156,44 @@ export function cmd(text: string, seq?: string, source?: "phone" | "auto"): Comm
   };
 }
 
-// --- SDK message constructors -------------------------------------------
-// Only the fields the connector actually reads. Cast at the edge rather than
-// building a whole valid SDKMessage, which would bury what each test is
-// varying under a wall of irrelevant structure.
-
-export function init(sessionId = "sdk-1"): SDKMessage {
-  return { type: "system", subtype: "init", session_id: sessionId, skills: [] } as unknown as SDKMessage;
-}
-
-export function assistantText(text: string): SDKMessage {
-  return {
-    type: "assistant",
-    message: { role: "assistant", content: [{ type: "text", text }] },
-  } as unknown as SDKMessage;
-}
-
-export function result(
-  subtype: "success" | "error_during_execution" = "success",
-  usage: {
-    total_cost_usd?: number;
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_creation_input_tokens?: number;
-    cache_read_input_tokens?: number;
-  } = {},
-): SDKMessage {
-  return {
-    type: "result",
-    subtype,
-    duration_ms: 5,
-    total_cost_usd: usage.total_cost_usd ?? 0.001,
-    is_error: subtype !== "success",
-    result: subtype === "success" ? "done" : "failed",
-    usage: {
-      input_tokens: usage.input_tokens ?? 100,
-      output_tokens: usage.output_tokens ?? 50,
-      cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 10,
-      cache_read_input_tokens: usage.cache_read_input_tokens ?? 5,
-    },
-  } as unknown as SDKMessage;
-}
-
-export function compactBoundary(): SDKMessage {
-  return {
-    type: "system",
-    subtype: "compact_boundary",
-    compact_metadata: { trigger: "manual", pre_tokens: 100 },
-  } as unknown as SDKMessage;
-}
-
-/**
- * A Query over a fixed message list. `onStreamInput` fires when a Steer is
- * streamed in, which is what lets a test decide -- deterministically, rather
- * than by racing a timer -- whether the SDK ever answers it with a fresh
- * `init`.
- */
-export function scriptedQuery(
-  messages: SDKMessage[],
-  opts: {
-    commands?: SlashCommand[];
-    onStreamInput?: (text: string, emit: (m: SDKMessage) => void) => void;
-    streamInputThrows?: Error;
-    /** Runs just before each message reaches the Turn, so a test can act at an exact point in the drain rather than racing a timer. */
-    onYield?: (message: SDKMessage) => void | Promise<void>;
-    /** Thrown from the drain after `throwAfter` messages, standing in for a subprocess that died mid-Turn. */
-    throwAfter?: { count: number; error: Error };
-    /** Percentages `getContextUsage()` returns, one per call in order; the last value repeats once exhausted. Defaults to a fixed 42. */
-    contextPercentages?: number[];
-    /** Called synchronously with the `options` a real `query()` call would receive, so a test can reach into `options.hooks` (e.g. to invoke PreCompact) exactly as the real SDK would. */
-    onOptions?: (options: Options) => void;
-  } = {},
-): { query: SessionContext["query"]; streamed: string[] } {
-  const streamed: string[] = [];
-  const query: SessionContext["query"] = ({ options }) => {
-    opts.onOptions?.(options ?? {});
-    const pending = new AsyncQueue<SDKMessage>();
-    for (const m of messages) pending.push(m);
-    pending.close();
-
-    // Anything the persona injects mid-drain jumps ahead of the remaining
-    // scripted messages, matching how a Steer truncates a real Turn.
-    const injected: SDKMessage[] = [];
-    let delivered = 0;
-    const iterator = (async function* () {
-      const deliver = async function* (m: SDKMessage) {
-        if (opts.throwAfter && delivered >= opts.throwAfter.count) throw opts.throwAfter.error;
-        await opts.onYield?.(m);
-        delivered += 1;
-        yield m;
-      };
-      for await (const m of pending) {
-        while (injected.length) yield* deliver(injected.shift()!);
-        yield* deliver(m);
-      }
-      while (injected.length) yield* deliver(injected.shift()!);
-    })();
-
-    const q = {
-      [Symbol.asyncIterator]() {
-        return q;
-      },
-      next: () => iterator.next(),
-      return: (value?: void) => iterator.return(value),
-      throw: (e?: unknown) => iterator.throw(e),
-      supportedCommands: async () => opts.commands ?? [],
-      stopTask: async () => undefined,
-      streamInput: async (stream: AsyncIterable<SDKUserMessage>) => {
-        if (opts.streamInputThrows) throw opts.streamInputThrows;
-        for await (const m of stream) {
-          const content = (m.message as { content?: unknown }).content;
-          const text =
-            typeof content === "string"
-              ? content
-              : ((content as { text?: string }[] | undefined)?.[0]?.text ?? "");
-          streamed.push(text);
-          opts.onStreamInput?.(text, (msg) => injected.push(msg));
-        }
-      },
-      getContextUsage: (() => {
-        let calls = 0;
-        return async () => {
-          const seq = opts.contextPercentages;
-          if (!seq || seq.length === 0) return { percentage: 42 };
-          const percentage = seq[Math.min(calls, seq.length - 1)];
-          calls += 1;
-          return { percentage };
-        };
-      })(),
-    };
-    return q as unknown as Query;
-  };
-  return { query, streamed };
-}
-
 export interface TurnHarness {
   ctx: SessionContext;
   ledger: InFlight;
   relay: FakeRelay;
   written: ConnectorState[];
-  streamed: string[];
+  /** The open Engine session the harness's pump reads -- a FakeEngineSession unless `engine` was overridden. */
+  session: FakeEngineSession;
+  /** Closes the Engine session and waits for the pump to drain what it had left. */
+  close(): Promise<void>;
 }
 
 /**
- * A SessionContext wired to fakes, with no relay, no state file and no
- * subprocess. Everything a Turn touches that leaves the process is a field on
- * the context, which is what makes this possible at all.
+ * A SessionContext driving a fake Engine, with no relay, no state file and no
+ * agent process, and the session's event pump already running. Everything a
+ * Turn touches that leaves the process is a field on the context, which is
+ * what makes this possible at all.
  */
-export function makeTurnHarness(
-  messages: SDKMessage[],
-  opts: Parameters<typeof scriptedQuery>[1] & {
+export async function makeTurnHarness(
+  opts: {
+    /** Each Turn's scripted body -- defaults to a Turn that says "ok" and ends. */
+    handlerFor?: FakeEngineScript["handlerFor"];
+    /** The rest of the fake Engine's script: a resume target, an announcement, a menu, ... */
+    script?: Partial<FakeEngineScript>;
+    /** A real Engine to drive instead of the fake -- for a regression pinned against one adapter's own behaviour. */
+    engine?: Engine;
+    /** What `open()` is asked to resume, as a state file would supply it. */
+    resume?: string;
     /** A real directory for the Turn to run in -- only tests of git-derived behaviour need one. */
     projectDir?: string;
     /** Overrides merged into the fake config -- e.g. `inactivityCompact` for Auto-compact tests. */
     config?: Partial<SessionContext["config"]>;
-    /** Stubs `ctx.executeFork` -- defaults to a no-op success, overridden by Fork tests to assert what it was called with or to simulate a failure. */
-    executeFork?: SessionContext["executeFork"];
   } = {},
-): TurnHarness {
+): Promise<TurnHarness> {
   const relay = new FakeRelay();
   const written: ConnectorState[] = [];
-  const { query, streamed } = scriptedQuery(messages, opts);
+  const projectDir = opts.projectDir ?? "/tmp/project";
+  const engine =
+    opts.engine ?? new FakeEngine({ handlerFor: opts.handlerFor ?? (() => sayAndFinish("ok")), ...opts.script });
 
   let ctx: SessionContext;
   const ledger = new InFlight({
@@ -297,22 +207,29 @@ export function makeTurnHarness(
     },
   });
 
+  const session: EngineSession = await engine.open({
+    projectDir,
+    resume: opts.resume,
+    onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
+    onShowImage: (image, signal) => showImage(ctx, image, signal),
+  });
+
   ctx = {
     client: relay.asClient(),
     config: {
       relayBaseUrl: "http://relay.test",
       connectorCredential: "s",
-      projectDir: opts.projectDir ?? "/tmp/project",
+      projectDir,
       provider: { type: "anthropic" },
       ...opts.config,
     } as SessionContext["config"],
-    providerEnv: {},
-    query,
+    engine,
+    engineSession: session,
+    bannerFor: createBannerDeduper(),
     writeState: (state) => {
       written.push(state);
     },
     inFlight: ledger,
-    mapMessage: createSdkMessageMapper(),
     state: {
       version: 1,
       projectDir: "/tmp/project",
@@ -320,26 +237,46 @@ export function makeTurnHarness(
       sessionId: "sess",
       secret: "sec",
       phoneUrl: "http://relay.test/?s=sess",
+      engine: "claude",
       pid: 1,
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     },
     lastSkillsJson: undefined,
-    sdkSessionId: undefined,
+    conversationId: opts.resume,
     eventBuffer: [],
     running: true,
     sessionEnded: false,
     runningTasks: [],
     lastHandledKillAt: undefined,
-    lastHandledForkAt: undefined,
-    executeFork: opts.executeFork ?? (async () => ({ controlUrl: undefined })),
     handBackBuffer: [],
     questionPending: false,
+    withdrawnQuestions: [],
     currentTurn: undefined,
-    currentQuery: undefined,
+    engineTurn: undefined,
     contextWarningActive: false,
     flushChain: Promise.resolve(),
   };
 
-  return { ctx, ledger, relay, written, streamed };
+  const pumping = pumpEngineEvents(ctx);
+  return {
+    ctx,
+    ledger,
+    relay,
+    written,
+    session: session as FakeEngineSession,
+    async close() {
+      await session.close();
+      await pumping;
+    },
+  };
+}
+
+/** Resolves once `condition` holds, polling every few milliseconds; throws after `timeoutMs` so a broken expectation fails fast rather than hanging. */
+export async function until(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for a condition");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }

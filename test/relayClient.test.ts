@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { RelayClient } from "../src/relay/client.ts";
+import { CONNECTOR_VERSION } from "../src/version.ts";
 
 /**
  * Observed in production: a relay request whose connection hangs (no
@@ -14,9 +15,16 @@ import { RelayClient } from "../src/relay/client.ts";
 test("a hung relay request times out instead of blocking forever", async () => {
   const realFetch = globalThis.fetch;
   // Never resolves or rejects on its own -- the only way out is the signal.
+  // The interval stands in for the stuck socket a real hung fetch holds open:
+  // `AbortSignal.timeout`'s timer doesn't keep the process alive by itself, so
+  // without something that does, Node exits before the timeout ever fires.
   globalThis.fetch = ((_url: string, init?: RequestInit) =>
     new Promise((_resolve, reject) => {
-      init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+      const openSocket = setInterval(() => undefined, 1000);
+      init?.signal?.addEventListener("abort", () => {
+        clearInterval(openSocket);
+        reject(init.signal!.reason);
+      });
     })) as typeof fetch;
 
   try {
@@ -55,6 +63,63 @@ test("postCommand marks itself as the connector, not the phone", async () => {
     assert.equal(headers["X-Crc-Client"], "connector");
     assert.equal(headers["Authorization"], "Bearer secret");
     assert.deepEqual(JSON.parse(captured!.init.body as string), { text: "/compact" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+/**
+ * Pins the whole skills report body against the real RelayClient: the relay
+ * double only sees putSkills' arguments, so a stray field on the wire would
+ * pass every test that goes through it.
+ */
+test("putSkills sends exactly the skills, local commands and the connector's version", async () => {
+  const realFetch = globalThis.fetch;
+  let captured: { url: string; init: RequestInit } | undefined;
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    captured = { url, init: init! };
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const client = await RelayClient.resume("http://relay.test", "sess-1", "secret");
+    const skill = { name: "grill-me", description: "Interview me", argumentHint: "" };
+    await client.putSkills([skill], [], undefined);
+
+    assert.equal(captured?.url, "http://relay.test/sessions/sess-1/skills");
+    assert.equal(captured!.init.method, "PUT");
+    assert.deepEqual(JSON.parse(captured!.init.body as string), {
+      skills: [skill],
+      local_commands: [],
+      connector_version: CONNECTOR_VERSION,
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a relay that rejects the connector credential fails session creation with a credential error", async () => {
+  const realFetch = globalThis.fetch;
+  try {
+    for (const status of [401, 403]) {
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ error: "missing or invalid X-Connector-Credential header" }), {
+          status,
+        })) as typeof fetch;
+
+      await assert.rejects(
+        RelayClient.create("https://relay.test", "testCred0001", {
+          permissionMode: "bypassPermissions",
+          providerType: "anthropic",
+          projectDir: "/tmp/project",
+        }),
+        (e: Error) => {
+          assert.match(e.message, /relay rejected 'connectorCredential'/);
+          assert.doesNotMatch(e.message, /testCred0001/);
+          return true;
+        },
+      );
+    }
   } finally {
     globalThis.fetch = realFetch;
   }

@@ -1,17 +1,18 @@
 import { PERMISSION_MODE, type ConnectorConfig, type InactivityCompactConfig } from "../config";
-import { runFork } from "../fork";
-import { buildProviderEnv } from "../provider";
-import { createSdkMessageMapper } from "../sdk/bridge";
+import { createEngine } from "../engine/create";
+import { fakeEnginePersona } from "../engine/fakePersonas";
+import type { Engine, EngineKind } from "../engine/types";
 import { RelayClient, SessionEndedError } from "../relay/client";
-import { probeSkills } from "../skills";
-import { readState, writeState, type ConnectorState } from "../state";
-import { query } from "../sdk/client";
-import { persist, publishSkills } from "./commands";
+import { isReusableState, readState, writeState, type ConnectorState } from "../state";
+import { persist } from "./commands";
 import type { SessionContext } from "./context";
+import { createBannerDeduper } from "./engineEvents";
 import { flushEvents } from "./events";
+import { showImage } from "./images";
 import { InFlight } from "./inFlight";
+import { pumpEngineEvents } from "./pump";
 import { runTurn } from "./turn";
-import { watchForForkRequests, watchForKills, watchForSteers } from "./watchers";
+import { answerQuestion, watchForKills, watchForSteers } from "./watchers";
 
 const POLL_INTERVAL_MS = 1750;
 const FLUSH_INTERVAL_MS = 750;
@@ -43,9 +44,9 @@ export function isAutoCompactDue(
  * Submits Auto-compact when it's due, through the same endpoint the phone
  * uses so it inherits the ordinary cursor/at-most-once/Steer handling every
  * other Command gets, rather than running as a special case here. Called once
- * per poll-loop tick, only when nothing is currently in flight -- the loop is
- * never mid-`runTurn` at this point, so "not busy" is automatic, not checked
- * explicitly.
+ * per poll-loop tick, when the loop is never mid-`runTurn`; the one thing
+ * that can still be busy then is a Turn the Engine started on its own, which
+ * a `/compact` would otherwise Steer.
  *
  * `lastAutoCompactAt` is persisted only on a confirmed submission, never
  * speculatively: a failed POST must retry on the next tick, not be silently
@@ -53,7 +54,7 @@ export function isAutoCompactDue(
  */
 export async function maybeSubmitAutoCompact(ctx: SessionContext): Promise<void> {
   const cfg = ctx.config.inactivityCompact;
-  if (!cfg || !isAutoCompactDue(ctx.state, cfg)) return;
+  if (!cfg || ctx.engineTurn || !isAutoCompactDue(ctx.state, cfg)) return;
   try {
     await ctx.client.postCommand("/compact");
     persist(ctx, { lastAutoCompactAt: new Date().toISOString() });
@@ -62,6 +63,45 @@ export async function maybeSubmitAutoCompact(ctx: SessionContext): Promise<void>
     if (e instanceof SessionEndedError) return;
     console.error("Failed to submit Auto-compact:", (e as Error).message);
   }
+}
+
+/**
+ * Background tasks left running when a previous process died are gone with
+ * it -- the agent process they were children of no longer exists. Reports
+ * each as interrupted and empties the tray, so nothing sits spinning forever.
+ */
+export function reportTasksInterruptedByRestart(
+  ctx: SessionContext,
+  previous: ConnectorState["runningTasks"],
+): void {
+  if (!previous?.length) return;
+  console.log(`Reporting ${previous.length} background task(s) interrupted by restart.`);
+  for (const t of previous) {
+    ctx.eventBuffer.push({
+      type: "background_task_settled",
+      task_id: t.task_id,
+      tool_use_id: t.tool_use_id,
+      task_status: "interrupted",
+      text: t.description
+        ? `interrupted by connector restart: ${t.description}`
+        : "interrupted by connector restart",
+    });
+  }
+  // The live set is per-process and empty after a restart; say so, so a
+  // reload's replay of the last non-empty set doesn't show stale running work.
+  ctx.eventBuffer.push({ type: "background_tasks_changed", tasks: [] });
+  persist(ctx, { runningTasks: undefined });
+}
+
+/**
+ * The Engine this connector drives. `CRC_FAKE_ENGINE` is set only by the e2e
+ * harness, naming a scripted persona (see engine/fakePersonas.ts) to play
+ * instead of a real, model-backed agent. Unset in every real deployment.
+ */
+function selectEngine(config: ConnectorConfig): Engine {
+  const persona = process.env.CRC_FAKE_ENGINE;
+  if (persona) return fakeEnginePersona(persona, config.projectDir);
+  return createEngine(config);
 }
 
 export interface RunHandle {
@@ -80,24 +120,19 @@ export interface RunHandle {
  * in the state file over minting a new one, so an ordinary restart costs the
  * phone no re-pairing.
  *
- * State belonging to a different relay or project directory is ignored rather
- * than trusted -- a config edit should not silently reattach the connector to a
- * session created under the old settings.
+ * State belonging to a different relay, project directory or Engine is ignored
+ * rather than trusted -- see {@link isReusableState}.
  */
-async function acquireSession(config: ConnectorConfig): Promise<{
+async function acquireSession(config: ConnectorConfig, engine: EngineKind): Promise<{
   client: RelayClient;
   phoneUrl: string;
   staticUrl: string | undefined;
   controlUrl: string | undefined;
   resumed: ConnectorState | undefined;
 }> {
-  const previous = readState(config.projectDir);
-  const reusable =
-    previous &&
-    previous.relayBaseUrl === config.relayBaseUrl &&
-    previous.projectDir === config.projectDir;
+  const previous = readState(config.projectDir, engine);
 
-  if (reusable) {
+  if (isReusableState(previous, config, engine)) {
     try {
       const client = await RelayClient.resume(
         config.relayBaseUrl,
@@ -128,7 +163,7 @@ async function acquireSession(config: ConnectorConfig): Promise<{
     {
       permissionMode: PERMISSION_MODE,
       providerType: config.provider.type,
-      providerModel: config.provider.type === "bedrock" ? config.provider.model : undefined,
+      providerModel: config.provider.type === "anthropic" ? undefined : config.provider.model,
       providerRegion: config.provider.type === "bedrock" ? config.provider.region : undefined,
       projectDir: config.projectDir,
     },
@@ -143,8 +178,12 @@ async function acquireSession(config: ConnectorConfig): Promise<{
  * session is live, so a caller can report the phone URL before the loop ends.
  */
 export async function runConnector(config: ConnectorConfig): Promise<RunHandle> {
-  const providerEnv = buildProviderEnv(config.provider);
-  const { client, phoneUrl, staticUrl, controlUrl, resumed } = await acquireSession(config);
+  const engine = selectEngine(config);
+  // Before a relay session exists: an Engine that can never run should fail
+  // here, with its own message, rather than after a phone has paired.
+  await engine.verify();
+  const { client, phoneUrl, staticUrl, controlUrl, resumed } = await acquireSession(config, engine.kind);
+  const conversationId = resumed?.conversationId;
 
   // Declared before the context so the ledger's dependencies can close over
   // it: the ledger persists and emits through the same paths everything else
@@ -163,16 +202,26 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     { cursor: resumed?.commandCursor },
   );
 
+  // One Engine session for the connector's whole life. Throws here, at
+  // startup, for an auth or licence problem -- never for a Conversation that
+  // can no longer be resumed, which the Engine reports as lost instead.
+  const engineSession = await engine.open({
+    projectDir: config.projectDir,
+    resume: conversationId,
+    onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
+    onShowImage: (image, signal) => showImage(ctx, image, signal),
+  });
+
   ctx = {
     client,
     config,
-    providerEnv,
-    query,
+    engine,
+    engineSession,
     writeState,
     inFlight,
-    // One mapper for the whole process: it remembers the session banner
-    // across turns so it is announced once, not above every reply.
-    mapMessage: createSdkMessageMapper(),
+    // One for the whole process: it remembers the session banner across
+    // Turns so it is announced once, not above every reply.
+    bannerFor: createBannerDeduper(),
     state: {
       version: 1,
       projectDir: config.projectDir,
@@ -183,7 +232,8 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       staticUrl,
       controlUrl,
       commandCursor: resumed?.commandCursor,
-      sdkSessionId: resumed?.sdkSessionId,
+      conversationId,
+      engine: engine.kind,
       inFlight: undefined,
       // Auto-compact's `lastRealTurnCompletedAt`/`lastAutoCompactAt` are
       // omitted on purpose, not forgotten: a restart resets the idle clock so
@@ -194,69 +244,30 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       updatedAt: new Date().toISOString(),
     },
     lastSkillsJson: undefined,
-    sdkSessionId: resumed?.sdkSessionId,
+    conversationId,
     eventBuffer: [],
     running: true,
     sessionEnded: false,
     runningTasks: [],
     lastHandledKillAt: undefined,
-    lastHandledForkAt: undefined,
-    executeFork: async (name) => {
-      const state = await runFork(config, ctx.sdkSessionId, name, undefined);
-      return { controlUrl: state.controlUrl };
-    },
     handBackBuffer: [],
     questionPending: false,
+    withdrawnQuestions: [],
     currentTurn: undefined,
-    currentQuery: undefined,
+    engineTurn: undefined,
     contextWarningActive: false,
     flushChain: Promise.resolve(),
   };
 
   persist(ctx, {});
 
-  // Populates the phone's menu before the first turn ever runs. Spawns a
-  // throwaway query() purely to read the skill list -- see probeSkills for why
-  // this costs no model spend. Not awaited: the phone URL should be handed
-  // back immediately, and an empty menu for the few hundred ms this takes is
-  // harmless.
-  void (async () => {
-    try {
-      const { skills, localCommands } = await probeSkills(config.projectDir, providerEnv);
-      await publishSkills(ctx, skills, localCommands);
-    } catch (e) {
-      console.error("Failed to probe skills at startup:", (e as Error).message);
-    }
-  })();
+  const pumping = pumpEngineEvents(ctx);
 
   // Explains, and corrects the relay for, whatever a previous process died
   // holding.
   await inFlight.resumeFrom(resumed?.inFlight);
 
-  // Background tasks left running when a previous process died are gone with it
-  // -- the CLI subprocess they were children of no longer exists. Report each
-  // as interrupted and empty the tray, so nothing sits spinning forever.
-  // Mirrors the in-flight-turn honesty above.
-  if (resumed?.runningTasks?.length) {
-    console.log(
-      `Reporting ${resumed.runningTasks.length} background task(s) interrupted by restart.`,
-    );
-    for (const t of resumed.runningTasks) {
-      ctx.eventBuffer.push({
-        type: "background_task_settled",
-        task_id: t.task_id,
-        tool_use_id: t.tool_use_id,
-        task_status: "interrupted",
-        text: t.description
-          ? `interrupted by connector restart: ${t.description}`
-          : "interrupted by connector restart",
-      });
-    }
-    // The live set is per-process and empty after a restart; say so, so a
-    // reload's replay of the last non-empty set doesn't show stale running work.
-    ctx.eventBuffer.push({ type: "background_tasks_changed", tasks: [] });
-    persist(ctx, { runningTasks: undefined });
-  }
+  reportTasksInterruptedByRestart(ctx, resumed?.runningTasks);
 
   const flushTimer = setInterval(() => {
     void flushEvents(ctx);
@@ -268,7 +279,6 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
   }, INFLIGHT_RECONCILE_INTERVAL_MS);
   const stopWatchingKills = watchForKills(ctx);
   const stopWatchingSteers = watchForSteers(ctx);
-  const stopWatchingForks = watchForForkRequests(ctx);
 
   let shuttingDown = false;
   let resolveDone: () => void = () => undefined;
@@ -290,7 +300,11 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     clearInterval(inFlightReconcileTimer);
     stopWatchingKills();
     stopWatchingSteers();
-    stopWatchingForks();
+    // Closing ends the pump, whose last events still make the final flush.
+    await ctx.engineSession
+      .close()
+      .catch((e) => console.error("Failed to close the Engine session:", (e as Error).message));
+    await pumping;
     if (!ctx.sessionEnded) await flushEvents(ctx).catch(() => undefined);
     resolveDone();
   }
@@ -313,8 +327,8 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
       }
       if (!ctx.running) break;
 
-      // Nothing is in flight at this point in the loop -- runTurn is always
-      // awaited before control gets back here -- so this is exactly the
+      // No Command is in flight at this point in the loop -- runTurn is
+      // always awaited before control gets back here -- so this is the
       // "idle and not busy" moment Auto-compact's trigger condition needs.
       await maybeSubmitAutoCompact(ctx);
 

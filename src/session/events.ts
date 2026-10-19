@@ -1,4 +1,4 @@
-import { SessionEndedError } from "../relay/client";
+import { SessionEndedError, type EventInput } from "../relay/client";
 import type { SessionContext } from "./context";
 
 // The relay rejects any batch larger than this, so flushes must be chunked --
@@ -42,4 +42,18 @@ async function doFlush(ctx: SessionContext): Promise<void> {
 export function flushEvents(ctx: SessionContext): Promise<void> {
   ctx.flushChain = ctx.flushChain.then(() => doFlush(ctx), () => undefined);
   return ctx.flushChain;
+}
+
+/**
+ * Posts one Event on its own, after everything already buffered, and rejects
+ * if the relay refuses it -- for an Event whose sender must hear that it was
+ * rejected. It never joins the buffer: a batch the relay rejects outright
+ * would be retried forever, holding back every Event behind it.
+ */
+export function postAfterBuffered(ctx: SessionContext, event: EventInput): Promise<void> {
+  const posted = flushEvents(ctx).then(async () => {
+    await ctx.client.postEvents([event]);
+  });
+  ctx.flushChain = posted.catch(() => undefined);
+  return posted;
 }

@@ -32,6 +32,8 @@ async function git(projectDir: string, args: string[]): Promise<string | undefin
       cwd: projectDir,
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: 8 * 1024 * 1024,
+      // A detached connector has no console on Windows, so each git would otherwise flash a window of its own.
+      windowsHide: true,
     });
     return stdout.trim();
   } catch {

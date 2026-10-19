@@ -5,11 +5,14 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import type { EngineKind } from "./engine/types";
 
 /** Bumped only when a field's meaning changes; unknown versions are discarded. */
 const STATE_VERSION = 1;
@@ -58,8 +61,14 @@ export interface ConnectorState {
    * both as "interrupted" would say something false about the queued one.
    */
   inFlight?: { seq: string; text: string; status: "running" | "queued" }[];
-  /** Claude's own session id, resumed across turns. Dropped when rotating. */
-  sdkSessionId?: string;
+  /** The Engine's own id for the Conversation, resumed across restarts. Dropped when rotating. */
+  conversationId?: string;
+  /**
+   * Which Engine held the Conversation. A Conversation id means nothing to a
+   * different Engine, so a state file written by one is never resumed by
+   * another.
+   */
+  engine: EngineKind;
   /**
    * Background tasks the connector last saw running, kept so a restart can
    * report each as `interrupted` rather than leaving the phone's inline card
@@ -78,8 +87,8 @@ export interface ConnectorState {
    * idle clock is measured from here, not from process start, so a session with
    * no activity yet never fires one.
    *
-   * Deliberately *not* carried across a restart, unlike the cursor and the SDK
-   * session id: a fresh process has to see the human do something before it
+   * Deliberately *not* carried across a restart, unlike the cursor and the
+   * Conversation id: a fresh process has to see the human do something before it
    * will submit anything on their behalf. Resuming the countdown instead would
    * let a connector started after a long gap fire a `/compact` into a session
    * nobody has touched yet.
@@ -100,20 +109,29 @@ export interface ConnectorState {
 }
 
 /**
- * State files are keyed by project directory rather than by pid so that a
- * restarted connector finds its own predecessor's session. The hash keeps the
- * name short and filesystem-safe while staying stable across restarts.
+ * Keyed by project directory and Engine rather than by pid, so a restarted
+ * connector finds its predecessor's session and two Engines sharing a
+ * worktree never collide.
  */
-export function stateKey(projectDir: string): string {
-  return createHash("sha256").update(projectDir).digest("hex").slice(0, 12);
+export function stateKey(projectDir: string, engine: EngineKind): string {
+  return shortHash(`${projectDir}\0${engine}`);
 }
 
-export function statePath(projectDir: string): string {
-  return join(STATE_DIR, `${stateKey(projectDir)}.json`);
+function shortHash(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 12);
 }
 
-export function logPath(projectDir: string): string {
-  return join(STATE_DIR, `${stateKey(projectDir)}.log`);
+export function statePath(projectDir: string, engine: EngineKind): string {
+  return join(STATE_DIR, `${stateKey(projectDir, engine)}.json`);
+}
+
+export function logPath(projectDir: string, engine: EngineKind): string {
+  return join(STATE_DIR, `${stateKey(projectDir, engine)}.log`);
+}
+
+/** Where a connector from before per-Engine state kept a worktree's state. */
+function worktreeOnlyStatePath(projectDir: string): string {
+  return join(STATE_DIR, `${shortHash(projectDir)}.json`);
 }
 
 export function ensureStateDir(): void {
@@ -126,17 +144,63 @@ export function ensureStateDir(): void {
  * is never fatal: the connector treats it as "no previous session" and rotates,
  * which costs a re-pair but always starts.
  */
-export function readState(projectDir: string): ConnectorState | undefined {
-  const path = statePath(projectDir);
-  if (!existsSync(path)) return undefined;
+export function readState(projectDir: string, engine: EngineKind): ConnectorState | undefined {
+  const perEngine = statePath(projectDir, engine);
+  const path = existsSync(perEngine) ? perEngine : worktreeOnlyStateFor(projectDir, engine);
+  if (!path) return undefined;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as ConnectorState;
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as LegacyConnectorState;
     if (parsed.version !== STATE_VERSION) return undefined;
     if (!parsed.sessionId || !parsed.secret) return undefined;
-    return parsed;
+    // Files from before the Engine seam name the Conversation `sdkSessionId`
+    // and record no Engine -- every one of them was written by Claude.
+    // Dropping the old key here is what makes the next write use the new one.
+    const { sdkSessionId, ...rest } = parsed;
+    return {
+      ...rest,
+      conversationId: rest.conversationId ?? sdkSessionId,
+      engine: rest.engine ?? "claude",
+    };
   } catch {
     return undefined;
   }
+}
+
+/** Read in place, never moved, so listing siblings can't pull a file out from under an old-version connector. */
+function worktreeOnlyStateFor(projectDir: string, engine: EngineKind): string | undefined {
+  const path = worktreeOnlyStatePath(projectDir);
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as LegacyConnectorState;
+    return (parsed.engine ?? "claude") === engine ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** What an older connector may have left on disk. */
+type LegacyConnectorState = Omit<ConnectorState, "engine"> & {
+  engine?: EngineKind;
+  sdkSessionId?: string;
+};
+
+/**
+ * Whether a restarting connector may resume from `previous`. State belonging
+ * to a different relay, project directory or Engine is ignored rather than
+ * trusted -- a config edit should not silently reattach the connector to a
+ * session, or a Conversation, created under the old settings.
+ */
+export function isReusableState(
+  previous: ConnectorState | undefined,
+  config: { relayBaseUrl: string; projectDir: string },
+  engine: EngineKind,
+): previous is ConnectorState {
+  return (
+    !!previous &&
+    previous.relayBaseUrl === config.relayBaseUrl &&
+    previous.projectDir === config.projectDir &&
+    previous.engine === engine
+  );
 }
 
 /**
@@ -146,16 +210,18 @@ export function readState(projectDir: string): ConnectorState | undefined {
  */
 export function writeState(state: ConnectorState): void {
   ensureStateDir();
-  const path = statePath(state.projectDir);
+  const path = statePath(state.projectDir, state.engine);
   const tmp = `${path}.${process.pid}.tmp`;
   const body = JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2);
   writeFileSync(tmp, `${body}\n`, { mode: 0o600 });
   chmodSync(tmp, 0o600);
   renameSync(tmp, path);
+  const worktreeOnly = worktreeOnlyStateFor(state.projectDir, state.engine);
+  if (worktreeOnly) rmSync(worktreeOnly, { force: true });
 }
 
-export function clearState(projectDir: string): void {
-  const path = statePath(projectDir);
+export function clearState(projectDir: string, engine: EngineKind): void {
+  const path = statePath(projectDir, engine);
   if (existsSync(path)) unlinkSync(path);
 }
 
@@ -175,15 +241,15 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 /**
- * The live connector for a project directory, if there is one.
+ * The live connector on one Engine for a project directory, if there is one.
  *
  * A pid alone can be reused by an unrelated process after a hard reboot, so
  * callers that act on this (`rc-agent stop`) should treat it as advisory. `rc-agent
  * status` corroborates it against the relay's own view of when it last heard
  * from the connector, which no stale pid can fake.
  */
-export function liveConnector(projectDir: string): ConnectorState | undefined {
-  const state = readState(projectDir);
+export function liveConnector(projectDir: string, engine: EngineKind): ConnectorState | undefined {
+  const state = readState(projectDir, engine);
   if (!state) return undefined;
   return isProcessAlive(state.pid) ? state : undefined;
 }

@@ -1,6 +1,5 @@
-import type { ForkErrorCode } from "../fork";
+import type { ProviderConfig } from "../provider";
 import { CONNECTOR_VERSION } from "../version";
-import type { WorktreeEntry } from "../worktrees";
 
 /** One skill the connector discovered, for the phone's "/" menu. */
 export interface SkillInfo {
@@ -26,19 +25,12 @@ export interface AnswerRecord {
   response?: string;
 }
 
-/** A pending request to Fork this Session, as the relay stores and reports it. Single-slot: a repeat request overwrites rather than queues. */
-export interface ForkRequest {
-  name: string;
-  requested_at: string;
-}
-
 /** The shape `GET /sessions/{id}` returns, polled throughout the session's life for out-of-band requests the phone or relay has made against it. */
 export interface SessionSnapshot {
   interrupt_at?: string;
   last_connector_seen_at?: string;
   answer?: AnswerRecord;
   kill_task?: { task_id: string; requested_at: string };
-  fork_request?: ForkRequest;
 }
 
 export type EventType =
@@ -53,7 +45,8 @@ export type EventType =
   | "background_task_started"
   | "background_task_settled"
   | "background_tasks_changed"
-  | "usage";
+  | "usage"
+  | "image";
 
 /** How a Background task ended. `interrupted` is the connector's own outcome for a task a process restart killed, not one the SDK reports. */
 export type TaskStatus = "completed" | "failed" | "stopped" | "interrupted";
@@ -88,9 +81,9 @@ export interface EventInput {
   no_notify?: boolean;
   /** Rounded percent of the model's context window in use, on `turn_complete` and the compact-boundary `status` event. Omitted when the SDK's `getContextUsage()` call failed. */
   context_percentage?: number;
-  /** True on the `turn_complete`/`status` event where `context_percentage` just crossed the configured Context-window-warning threshold (see CONTEXT.md) -- edge-triggered, so only the event that caused the crossing carries it. */
+  /** True on the `turn_complete`/`status` event where `context_percentage` just crossed the configured Context-window-warning threshold -- edge-triggered, so only the event that caused the crossing carries it. */
   context_warning?: boolean;
-  /** True on a `status` event fired just before the SDK compacts the conversation on its own -- a Context-window overflow (see CONTEXT.md and ADR 0024), never set for a connector- or human-issued `/compact`. */
+  /** True on a `status` event fired just before the SDK compacts the conversation on its own -- a Context-window overflow, sent before compaction so the phone can warn that context is about to be summarised away, never set for a connector- or human-issued `/compact`. */
   context_overflow?: boolean;
   /** Token counts off the SDK's result message, carried on every `usage` event alongside `cost_usd`. */
   input_tokens?: number;
@@ -99,21 +92,24 @@ export interface EventInput {
   cache_read_input_tokens?: number;
   /** On a `usage` event, already in the relay's `<host>#<org>/<repo>` Contributions key shape. Absent when the working directory has no git remote. */
   repo?: string;
-  /** Echoes the `fork_request`'s `requested_at`, on a `status` event reporting a Fork's outcome -- lets the client match a result to the request that produced it. */
-  fork_requested_at?: string;
-  /** The Fork's requested name, on a `status` event reporting its outcome. */
-  fork_name?: string;
-  /** The new Session's Control URL, on a `status` event reporting a successful Fork. */
-  fork_control_url?: string;
-  /** git's own error text, unmodified, on a `status` event reporting a failed Fork. */
-  fork_error?: string;
-  /** Why the Fork failed, when it could be classified -- an addition to `fork_error`, never a replacement. */
-  fork_error_code?: ForkErrorCode;
+  /** On an `image` event: the id the relay minted when it signed the upload. */
+  image_id?: string;
+  /** On an `image` event: the Image's MIME type. */
+  content_type?: string;
+  /** On an `image` event: what the Engine wants the human to look at, if it said. */
+  caption?: string;
+}
+
+/** A presigned S3 POST for one Image, as the relay hands it back: where to send it, and the form fields its policy was signed over. */
+export interface ImageUpload {
+  imageId: string;
+  url: string;
+  fields: Record<string, string>;
 }
 
 export interface CreateSessionInput {
   permissionMode: string;
-  providerType: "anthropic" | "bedrock";
+  providerType: ProviderConfig["type"];
   providerModel?: string;
   providerRegion?: string;
   projectDir: string;
@@ -150,6 +146,9 @@ function boundedFetch(
 ): Promise<Response> {
   return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
 }
+
+/** An Image can be up to 10MB, so its upload gets far longer than a JSON call to finish. */
+const IMAGE_UPLOAD_TIMEOUT_MS = 120_000;
 
 /**
  * Thin fetch wrapper around the relay's JSON API. One instance per connector
@@ -207,6 +206,14 @@ export class RelayClient {
       },
       requestTimeoutMs,
     );
+    if (res.status === 401 || res.status === 403) {
+      // The relay answers a rate-limited source IP with the same 401 as a bad credential.
+      throw new Error(
+        `The relay rejected 'connectorCredential' (HTTP ${res.status}). It is wrong, revoked, ` +
+          "or minted for a different relay stack, or this machine is temporarily rate-limited " +
+          "after repeated failures. Check 'connectorCredential' and 'relayBaseUrl' in your config.",
+      );
+    }
     if (!res.ok) {
       throw new Error(`Failed to create session: HTTP ${res.status} ${await res.text()}`);
     }
@@ -336,6 +343,45 @@ export class RelayClient {
   }
 
   /**
+   * Asks the relay to mint an Image id and sign an upload for it. The
+   * signature pins the object key, the content type and a size cap, so S3
+   * itself refuses anything else -- this connector never holds AWS
+   * credentials.
+   *
+   * Throws {@link SessionEndedError} once the relay reports the session gone.
+   */
+  async signImageUpload(contentType: string, byteLength: number): Promise<ImageUpload> {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/images`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.authHeaders() },
+      body: JSON.stringify({ content_type: contentType, byte_length: byteLength }),
+    });
+    await checkTerminal(res);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${await res.text()}`);
+    }
+    const body = (await res.json()) as {
+      image_id: string;
+      upload: { url: string; fields: Record<string, string> };
+    };
+    return { imageId: body.image_id, url: body.upload.url, fields: body.upload.fields };
+  }
+
+  /**
+   * Sends an Image's bytes straight to S3 with the POST the relay signed. The
+   * file must be the form's last part: S3 ignores any field after it.
+   */
+  async uploadImage(upload: ImageUpload, bytes: Uint8Array, contentType: string): Promise<void> {
+    const form = new FormData();
+    for (const [name, value] of Object.entries(upload.fields)) form.append(name, value);
+    form.append("file", new Blob([bytes], { type: contentType }));
+    const res = await boundedFetch(upload.url, { method: "POST", body: form }, IMAGE_UPLOAD_TIMEOUT_MS);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${await res.text()}`);
+    }
+  }
+
+  /**
    * Session metadata. Polled while a turn runs to pick up a stop request from
    * the phone (`interrupt_at`) or a submitted Answer to a pending Question
    * (`answer`).
@@ -368,7 +414,6 @@ export class RelayClient {
     skills: SkillInfo[],
     localCommands: SkillInfo[],
     inactivityCompactAfterMinutes: number | undefined,
-    worktrees: WorktreeEntry[],
   ): Promise<void> {
     const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/skills`, {
       method: "PUT",
@@ -383,12 +428,6 @@ export class RelayClient {
         ...(inactivityCompactAfterMinutes !== undefined
           ? { inactivity_compact_after_minutes: inactivityCompactAfterMinutes }
           : {}),
-        worktrees: worktrees.map((w) => ({
-          path: w.path,
-          self: w.self,
-          live: w.live,
-          ...(w.controlUrl ? { control_url: w.controlUrl } : {}),
-        })),
       }),
     });
     await checkTerminal(res);

@@ -6,3 +6,4 @@ config.json
 # Local integration-test rigs -- they bake in account-specific things
 # (inference profile ARNs, personal checkouts) that don't belong in the repo.
 examples/
+docs/

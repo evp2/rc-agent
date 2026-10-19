@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import type { EngineKind } from "./engine/types";
 import type { ProviderConfig } from "./provider";
 
 /**
@@ -41,11 +42,25 @@ export interface ConnectorConfig {
   inactivityCompact?: InactivityCompactConfig;
   /**
    * The percent of the model's context window in use at which a
-   * Context-window warning fires (see CONTEXT.md). Unlike `inactivityCompact`,
+   * Context-window warning fires. Unlike `inactivityCompact`,
    * this feature has no off switch -- only its threshold is configurable, so
    * this is a plain percent rather than a nested config object.
    */
   contextWarningThresholdPercent?: number;
+}
+
+/**
+ * The Engine a provider runs on. Derived rather than configured separately, so
+ * a config can never name a provider its Engine cannot reach.
+ */
+export function engineKindFor(provider: ProviderConfig): EngineKind {
+  switch (provider.type) {
+    case "anthropic":
+    case "bedrock":
+      return "claude";
+    case "copilot":
+      return "copilot";
+  }
 }
 
 export function loadConfig(path: string): ConnectorConfig {
@@ -60,8 +75,8 @@ export function loadConfig(path: string): ConnectorConfig {
   }
   const c = raw as Record<string, unknown>;
 
-  const relayBaseUrl = requireString(c, "relayBaseUrl");
-  const connectorCredential = requireString(c, "connectorCredential");
+  const relayBaseUrl = requireRelayBaseUrl(c);
+  const connectorCredential = requireConnectorCredential(c, path);
   const projectDir = typeof c.projectDir === "string" && c.projectDir.length > 0
     ? c.projectDir
     : process.cwd();
@@ -89,15 +104,21 @@ export function loadConfig(path: string): ConnectorConfig {
       apiKeyEnv: typeof p.apiKeyEnv === "string" ? p.apiKeyEnv : undefined,
     };
   } else if (providerType === "bedrock") {
-    // Both optional -- buildProviderEnv falls back to the ambient AWS_REGION /
+    // Both optional -- the Claude adapter's provider environment falls back to the ambient AWS_REGION /
     // ANTHROPIC_MODEL, so `{"type":"bedrock"}` alone is a valid config.
     provider = {
       type: "bedrock",
       region: optionalString(p, "region"),
       model: optionalString(p, "model"),
     };
+  } else if (providerType === "copilot") {
+    provider = {
+      type: "copilot",
+      model: optionalString(p, "model") ?? "auto",
+      cliPath: optionalString(p, "cliPath"),
+    };
   } else {
-    throw new Error("'provider.type' must be 'anthropic' or 'bedrock'");
+    throw new Error("'provider.type' must be 'anthropic', 'bedrock' or 'copilot'");
   }
 
   let inactivityCompact: InactivityCompactConfig | undefined;
@@ -149,6 +170,47 @@ function optionalString(
     throw new Error(`'${key}' must be a string if present`);
   }
   return value.length > 0 ? value : undefined;
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function requireRelayBaseUrl(obj: Record<string, unknown>): string {
+  const value = requireString(obj, "relayBaseUrl");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`'relayBaseUrl' is not a valid URL: ${value}`);
+  }
+  const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
+  if (url.protocol !== "https:" && !isLoopbackHttp) {
+    throw new Error(
+      `'relayBaseUrl' must start with https:// (got ${value}); plain http:// is only accepted for localhost.`,
+    );
+  }
+  return value;
+}
+
+/** Mirrors the relay's `generateCredential`; a value of any other shape can never verify, so it is rejected before any request is made. */
+const CONNECTOR_CREDENTIAL_FORMAT = /^[0-9A-Za-z]{12}$/;
+
+function requireConnectorCredential(obj: Record<string, unknown>, path: string): string {
+  const value = obj.connectorCredential;
+  if (value === undefined || value === null || value === "") {
+    throw new Error(
+      `'connectorCredential' is missing from ${path}. The connector will not start without one: ` +
+        "ask whoever runs your relay to mint a Connector credential " +
+        "(`npm run mint-credential -- <label> connector <environment>` in the relay repo) " +
+        "and set it as 'connectorCredential'.",
+    );
+  }
+  if (typeof value !== "string" || !CONNECTOR_CREDENTIAL_FORMAT.test(value)) {
+    throw new Error(
+      `'connectorCredential' in ${path} is not a valid Connector credential: ` +
+        "a minted credential is exactly 12 letters and digits, with no spaces or quotes.",
+    );
+  }
+  return value;
 }
 
 function requireString(obj: Record<string, unknown>, key: string): string {
