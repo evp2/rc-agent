@@ -3,9 +3,11 @@ import { randomUUID } from "node:crypto";
 import { AsyncQueue } from "../asyncQueue";
 import type { SkillInfo } from "../relay/client";
 import type {
+  ArchiveFileOutcome,
   Engine,
   EngineAnswer,
   EngineEvent,
+  EngineFile,
   EngineImage,
   EngineKind,
   EngineQuestion,
@@ -30,6 +32,8 @@ export interface FakeTurnContext {
    * Resolves to the outcome.
    */
   showImage(image: EngineImage): Promise<ShowImageOutcome>;
+  /** Like {@link showImage}, for an `archive_file` call and `onArchiveFile`. */
+  archiveFile(file: EngineFile): Promise<ArchiveFileOutcome>;
   /**
    * Resolves the next time `steer()` is called while this Turn is running,
    * with the steered text. A handler that means to be steerable races this
@@ -131,6 +135,10 @@ class TurnController implements FakeTurnContext {
 
   showImage(image: EngineImage): Promise<ShowImageOutcome> {
     return this.session.showImage(image, this);
+  }
+
+  archiveFile(file: EngineFile): Promise<ArchiveFileOutcome> {
+    return this.session.archiveFile(file, this);
   }
 
   waitForSteer(): Promise<string> {
@@ -236,6 +244,23 @@ class FakeEngineSessionImpl implements FakeEngineSession {
       toolUseId: image.toolUseId,
       text: outcome.shown ? "shown" : outcome.reason,
       isError: !outcome.shown,
+    });
+    return outcome;
+  }
+
+  async archiveFile(file: EngineFile, turn: TurnController): Promise<ArchiveFileOutcome> {
+    const onArchiveFile = this.options.onArchiveFile;
+    if (!onArchiveFile) throw new Error("this session was opened without onArchiveFile");
+    this.outbox.push({ type: "tool_use", toolUseId: file.toolUseId, name: "archive_file", input: { path: file.path } });
+    const abortController = new AbortController();
+    if (turn.stopped) abortController.abort();
+    else void turn.waitForStop().then(() => abortController.abort());
+    const outcome = await onArchiveFile(file, abortController.signal);
+    this.outbox.push({
+      type: "tool_result",
+      toolUseId: file.toolUseId,
+      text: outcome.archived ? "archived" : outcome.reason,
+      isError: !outcome.archived,
     });
     return outcome;
   }

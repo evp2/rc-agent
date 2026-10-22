@@ -8,6 +8,7 @@ import { persist } from "./commands";
 import type { SessionContext } from "./context";
 import { createBannerDeduper } from "./engineEvents";
 import { flushEvents } from "./events";
+import { archiveFile } from "./archivedFiles";
 import { showImage } from "./images";
 import { InFlight } from "./inFlight";
 import { pumpEngineEvents } from "./pump";
@@ -210,6 +211,7 @@ export async function runConnector(config: ConnectorConfig): Promise<RunHandle> 
     resume: conversationId,
     onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
     onShowImage: (image, signal) => showImage(ctx, image, signal),
+    onArchiveFile: (file, signal) => archiveFile(ctx, file, signal),
   });
 
   ctx = {

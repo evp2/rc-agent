@@ -17,6 +17,7 @@ import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
 import type { ClaudeProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
+import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION, archivedText, forwardArchiveFile } from "../archiveFileTool";
 import {
   forwardShowImage,
   IMAGE_SHOWN,
@@ -108,12 +109,30 @@ function stringifyToolResultContent(content: unknown): string | undefined {
 const MCP_SERVER_NAME = "rc-agent";
 
 /**
- * The in-process MCP server carrying `show_image`. The handler only forwards:
- * what happens to the file is the connector's business, behind
- * `onShowImage`.
+ * The in-process MCP server carrying the connector's own tools, or nothing
+ * when the session was opened with none of their callbacks. Each handler only
+ * forwards: what happens to the file is the connector's business.
  */
-function showImageServer(onShowImage: NonNullable<OpenOptions["onShowImage"]>): McpSdkServerConfigWithInstance {
-  const showImage = tool(
+function connectorToolsServer(options: OpenOptions): McpSdkServerConfigWithInstance | undefined {
+  const tools = [
+    ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
+    ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile)] : []),
+  ];
+  return tools.length ? createSdkMcpServer({ name: MCP_SERVER_NAME, tools, alwaysLoad: true }) : undefined;
+}
+
+/**
+ * The CLI sends every MCP call's own tool-use id along in `_meta`, which is
+ * what lets the phone put the result where the call was.
+ */
+function callOf(extra: unknown): { toolUseId: string | undefined; signal: AbortSignal } {
+  const { _meta, signal } = extra as { _meta?: Record<string, unknown>; signal: AbortSignal };
+  const toolUseId = _meta?.["claudecode/toolUseId"];
+  return { toolUseId: typeof toolUseId === "string" && toolUseId ? toolUseId : undefined, signal };
+}
+
+function showImageTool(onShowImage: NonNullable<OpenOptions["onShowImage"]>) {
+  return tool(
     "show_image",
     SHOW_IMAGE_DESCRIPTION,
     {
@@ -121,11 +140,8 @@ function showImageServer(onShowImage: NonNullable<OpenOptions["onShowImage"]>): 
       caption: z.string().optional().describe(SHOW_IMAGE_CAPTION_DESCRIPTION),
     },
     async ({ path, caption }, extra) => {
-      // The CLI sends every MCP call's own tool-use id along in `_meta`,
-      // which is what lets the phone put the picture where the call was.
-      const { _meta, signal } = extra as { _meta?: Record<string, unknown>; signal: AbortSignal };
-      const toolUseId = _meta?.["claudecode/toolUseId"];
-      if (typeof toolUseId !== "string" || !toolUseId) {
+      const { toolUseId, signal } = callOf(extra);
+      if (!toolUseId) {
         // Without it the phone could never place the picture, so it would
         // vanish; better the Engine hears that than believes it was shown.
         return {
@@ -139,7 +155,27 @@ function showImageServer(onShowImage: NonNullable<OpenOptions["onShowImage"]>): 
         : { content: [{ type: "text", text: outcome.reason }], isError: true };
     },
   );
-  return createSdkMcpServer({ name: MCP_SERVER_NAME, tools: [showImage], alwaysLoad: true });
+}
+
+function archiveFileTool(onArchiveFile: NonNullable<OpenOptions["onArchiveFile"]>) {
+  return tool(
+    "archive_file",
+    ARCHIVE_FILE_DESCRIPTION,
+    { path: z.string().describe(ARCHIVE_FILE_PATH_DESCRIPTION) },
+    async ({ path }, extra) => {
+      const { toolUseId, signal } = callOf(extra);
+      if (!toolUseId) {
+        return {
+          content: [{ type: "text", text: "the file couldn't be archived: this call carried no tool-use id" }],
+          isError: true,
+        };
+      }
+      const outcome = await forwardArchiveFile(onArchiveFile, { toolUseId, path }, signal);
+      return outcome.archived
+        ? { content: [{ type: "text", text: archivedText(outcome.filename, outcome.byteLength) }] }
+        : { content: [{ type: "text", text: outcome.reason }], isError: true };
+    },
+  );
 }
 
 type TurnEndedExtra = Partial<Omit<Extract<EngineEvent, { type: "turn_ended" }>, "type" | "durationMs">>;
@@ -286,6 +322,9 @@ class ClaudeEngineSession implements EngineSession {
     const abortController = new AbortController();
     this.activeAbort = abortController;
 
+    // A fresh server per query: an in-process MCP server instance binds to
+    // one transport, and each query brings its own.
+    const connectorTools = connectorToolsServer(this.options);
     const claudeOptions: Options = {
       // Without this the SDK sends a minimal system prompt that never states
       // the working directory, so a model asked for "a file named x.txt" has
@@ -299,11 +338,7 @@ class ClaudeEngineSession implements EngineSession {
       canUseTool: this.makeCanUseTool(),
       ...(this.conversationId ? { resume: this.conversationId } : {}),
       hooks: { PreCompact: [{ hooks: [this.makePreCompactHook()] }] },
-      // A fresh server per query: an in-process MCP server instance binds to
-      // one transport, and each query brings its own.
-      ...(this.options.onShowImage
-        ? { mcpServers: { [MCP_SERVER_NAME]: showImageServer(this.options.onShowImage) } }
-        : {}),
+      ...(connectorTools ? { mcpServers: { [MCP_SERVER_NAME]: connectorTools } } : {}),
     };
 
     const activeQuery = this.deps.query({ prompt: input, options: claudeOptions });

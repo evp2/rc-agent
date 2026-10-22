@@ -1,6 +1,7 @@
 import { FakeEngine, sayAndFinish, type FakeEngineScript, type FakeEngineSession } from "../src/engine/fakeEngine.ts";
 import type { Engine, EngineSession } from "../src/engine/types.ts";
-import type { CommandRecord, EventInput, ImageUpload, RelayClient } from "../src/relay/client.ts";
+import type { CommandRecord, EventInput, FileUpload, ImageUpload, RelayClient } from "../src/relay/client.ts";
+import { archiveFile } from "../src/session/archivedFiles.ts";
 import type { SessionContext } from "../src/session/context.ts";
 import { createBannerDeduper } from "../src/session/engineEvents.ts";
 import { InFlight, type InFlightDeps } from "../src/session/inFlight.ts";
@@ -85,6 +86,21 @@ export class FakeRelay {
       this.failNextUpload = undefined;
       throw e;
     }
+  }
+
+  /** Every Archived file upload the relay was asked to sign. */
+  readonly signedFiles: { filename: string; byteLength: number }[] = [];
+  /** Every Archived file sent to S3, by the path it was streamed from. */
+  readonly uploadedFiles: { fileId: string; path: string }[] = [];
+
+  async signFileUpload(filename: string, byteLength: number): Promise<FileUpload> {
+    this.signedFiles.push({ filename, byteLength });
+    const fileId = `file-${this.signedFiles.length}`;
+    return { fileId, url: "https://bucket.s3.test/", fields: { key: `files/sess/${fileId}` } };
+  }
+
+  async uploadFile(upload: FileUpload, path: string): Promise<void> {
+    this.uploadedFiles.push({ fileId: upload.fileId, path });
   }
 
   /** Every putSkills call, so a test can assert what the periodic report carried. */
@@ -212,6 +228,7 @@ export async function makeTurnHarness(
     resume: opts.resume,
     onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
     onShowImage: (image, signal) => showImage(ctx, image, signal),
+    onArchiveFile: (file, signal) => archiveFile(ctx, file, signal),
   });
 
   ctx = {

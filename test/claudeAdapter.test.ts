@@ -7,6 +7,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { ClaudeEngine } from "../src/engine/claude/adapter.ts";
 import type {
+  ArchiveFileOutcome,
+  EngineFile,
   EngineAnswer,
   EngineEvent,
   EngineImage,
@@ -98,7 +100,7 @@ const harness: EngineGuaranteeHarness = {
       onYield: async (m) => {
         if (m !== calling) return;
         const { toolUseId, path, caption } = SHOW_IMAGE_CALL;
-        const client = await connectToShowImageServer(options);
+        const client = await connectToConnectorToolsServer(options);
         const reply = await client.callTool({
           name: "show_image",
           arguments: { path, caption },
@@ -114,7 +116,7 @@ const harness: EngineGuaranteeHarness = {
 };
 
 /** An MCP client connected to the in-process server the adapter handed the SDK in `options`. */
-async function connectToShowImageServer(options: Options | undefined): Promise<Client> {
+async function connectToConnectorToolsServer(options: Options | undefined): Promise<Client> {
   const servers = Object.values(options?.mcpServers ?? {});
   const server = servers.find((s): s is McpSdkServerConfigWithInstance => s.type === "sdk");
   assert.ok(server, "an in-process MCP server was handed to the SDK");
@@ -305,7 +307,7 @@ async function openWithShowImage(
   session.send("show me");
   await collect(it, (e) => e.type === "turn_started");
 
-  const client = await connectToShowImageServer(capturedOptions);
+  const client = await connectToConnectorToolsServer(capturedOptions);
   return {
     client,
     async close() {
@@ -948,4 +950,68 @@ test("ClaudeEngine: a startup probe that fails leaves the menu for the first Tur
   const events: EngineEvent[] = [];
   for await (const e of session.events) events.push(e);
   assert.deepEqual(events, []);
+});
+
+/** Like {@link openWithShowImage}, for `archive_file` and `onArchiveFile`. */
+async function openWithArchiveFile(
+  onArchiveFile: (file: EngineFile, signal: AbortSignal) => Promise<ArchiveFileOutcome>,
+): Promise<{ client: Client; close(): Promise<void> }> {
+  let capturedOptions: Options | undefined;
+  const { query } = scriptedQuery([init()], {
+    onOptions: (options) => {
+      capturedOptions = options;
+    },
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected(), onArchiveFile });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("archive it");
+  await collect(it, (e) => e.type === "turn_started");
+
+  const client = await connectToConnectorToolsServer(capturedOptions);
+  return {
+    client,
+    async close() {
+      await client.close();
+      await session.close();
+    },
+  };
+}
+
+test("ClaudeEngine: archive_file is registered, and a call reaches onArchiveFile with its tool-use id", async () => {
+  let received: EngineFile | undefined;
+  const { client, close } = await openWithArchiveFile(async (file) => {
+    received = file;
+    return { archived: true, filename: "app.exe", byteLength: 48_234_496 };
+  });
+
+  const { tools } = await client.listTools();
+  assert.deepEqual(tools.map((t) => t.name), ["archive_file"]);
+
+  const result = await client.callTool({
+    name: "archive_file",
+    arguments: { path: "dist/app.exe" },
+    _meta: { "claudecode/toolUseId": "toolu_file" },
+  });
+
+  assert.deepEqual(received, { toolUseId: "toolu_file", path: "dist/app.exe" });
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(result.content, [
+    { type: "text", text: "Archived app.exe (46.0 MB); the human can download it from their transcript." },
+  ]);
+  await close();
+});
+
+test("ClaudeEngine: an archive_file that fails comes back to the Engine as an error carrying the reason", async () => {
+  const { client, close } = await openWithArchiveFile(async () => ({ archived: false, reason: "no file there" }));
+
+  const result = await client.callTool({
+    name: "archive_file",
+    arguments: { path: "dist/app.exe" },
+    _meta: { "claudecode/toolUseId": "toolu_file" },
+  });
+
+  assert.equal(result.isError, true);
+  assert.deepEqual(result.content, [{ type: "text", text: "no file there" }]);
+  await close();
 });

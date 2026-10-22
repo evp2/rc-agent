@@ -45,6 +45,12 @@ export interface OpenOptions {
    * means the Engine offers no `show_image` tool at all.
    */
   onShowImage?(image: EngineImage, signal: AbortSignal): Promise<ShowImageOutcome>;
+  /**
+   * Called when the Engine uses its `archive_file` tool, the same way as
+   * `onShowImage`: the adapter only registers the tool and forwards here.
+   * Absent means the Engine offers no `archive_file` tool at all.
+   */
+  onArchiveFile?(file: EngineFile, signal: AbortSignal): Promise<ArchiveFileOutcome>;
 }
 
 export interface EngineSession {
@@ -94,6 +100,18 @@ export interface EngineImage {
 
 /** Either the Image reached the phone, or the reason it didn't, for the Engine to act on. */
 export type ShowImageOutcome = { shown: true } | { shown: false; reason: string };
+
+/** One `archive_file` call: a file on this machine the Engine chose to hand the human. */
+export interface EngineFile {
+  /** The call's own tool-use id, so the phone can put the file's card where the call was. */
+  toolUseId: string;
+  path: string;
+}
+
+/** Either the Archived file reached the phone, under that name and size, or the reason it didn't. */
+export type ArchiveFileOutcome =
+  | { archived: true; filename: string; byteLength: number }
+  | { archived: false; reason: string };
 
 export interface EngineAnswer {
   answers: Record<string, string>;

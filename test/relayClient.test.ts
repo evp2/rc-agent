@@ -124,3 +124,62 @@ test("a relay that rejects the connector credential fails session creation with 
     globalThis.fetch = realFetch;
   }
 });
+
+/**
+ * An Archived file goes to S3 as the signed form's last part, read from disk
+ * as it is sent. This drives the real client against a real HTTP server, so
+ * the multipart body is the one fetch actually produces.
+ */
+test("uploadFile posts the signed fields, then the file's bytes as the form's last part", async () => {
+  const { createServer } = await import("node:http");
+  const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const dir = mkdtempSync(join(tmpdir(), "upload-"));
+  const path = join(dir, "app.exe");
+  writeFileSync(path, "MZ not really a program");
+  let received: { contentType: string; body: Buffer } | undefined;
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      received = { contentType: req.headers["content-type"] ?? "", body: Buffer.concat(chunks) };
+      res.writeHead(204).end();
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const { port } = server.address() as { port: number };
+
+  try {
+    const client = await withFakeResume();
+    await client.uploadFile(
+      { fileId: "file-1", url: `http://127.0.0.1:${port}/`, fields: { key: "files/sess-1/file-1", Policy: "p" } },
+      path,
+      new AbortController().signal,
+    );
+
+    const form = await new Response(received!.body, {
+      headers: { "content-type": received!.contentType },
+    }).formData();
+    assert.deepEqual([...form.keys()], ["key", "Policy", "file"]);
+    assert.equal(form.get("key"), "files/sess-1/file-1");
+    const file = form.get("file") as File;
+    assert.equal(file.type, "application/octet-stream");
+    assert.equal(await file.text(), "MZ not really a program");
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** A RelayClient resumed against a relay faked just long enough to construct it. */
+async function withFakeResume(): Promise<RelayClient> {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch;
+  try {
+    return await RelayClient.resume("http://relay.test", "sess-1", "secret");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}

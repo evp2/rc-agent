@@ -1,3 +1,5 @@
+import { openAsBlob } from "node:fs";
+
 import type { ProviderConfig } from "../provider";
 import { CONNECTOR_VERSION } from "../version";
 
@@ -46,7 +48,8 @@ export type EventType =
   | "background_task_settled"
   | "background_tasks_changed"
   | "usage"
-  | "image";
+  | "image"
+  | "archived_file";
 
 /** How a Background task ended. `interrupted` is the connector's own outcome for a task a process restart killed, not one the SDK reports. */
 export type TaskStatus = "completed" | "failed" | "stopped" | "interrupted";
@@ -98,11 +101,24 @@ export interface EventInput {
   content_type?: string;
   /** On an `image` event: what the Engine wants the human to look at, if it said. */
   caption?: string;
+  /** On an `archived_file` event: the id the relay minted when it signed the upload. */
+  file_id?: string;
+  /** On an `archived_file` event: the file's own name, without its directory. */
+  filename?: string;
+  /** On an `archived_file` event: the file's size in bytes. */
+  byte_length?: number;
 }
 
 /** A presigned S3 POST for one Image, as the relay hands it back: where to send it, and the form fields its policy was signed over. */
 export interface ImageUpload {
   imageId: string;
+  url: string;
+  fields: Record<string, string>;
+}
+
+/** A presigned S3 POST for one Archived file, shaped like {@link ImageUpload}. */
+export interface FileUpload {
+  fileId: string;
   url: string;
   fields: Record<string, string>;
 }
@@ -149,6 +165,9 @@ function boundedFetch(
 
 /** An Image can be up to 10MB, so its upload gets far longer than a JSON call to finish. */
 const IMAGE_UPLOAD_TIMEOUT_MS = 120_000;
+
+/** Long enough for an Archived file's 500MB cap over a slow home uplink. */
+const FILE_UPLOAD_TIMEOUT_MS = 60 * 60_000;
 
 /**
  * Thin fetch wrapper around the relay's JSON API. One instance per connector
@@ -376,6 +395,49 @@ export class RelayClient {
     for (const [name, value] of Object.entries(upload.fields)) form.append(name, value);
     form.append("file", new Blob([bytes], { type: contentType }));
     const res = await boundedFetch(upload.url, { method: "POST", body: form }, IMAGE_UPLOAD_TIMEOUT_MS);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${await res.text()}`);
+    }
+  }
+
+  /**
+   * Asks the relay to mint an Archived file id and sign an upload for it,
+   * like {@link signImageUpload}. The relay keeps `filename` as the name the
+   * file downloads under.
+   *
+   * Throws {@link SessionEndedError} once the relay reports the session gone.
+   */
+  async signFileUpload(filename: string, byteLength: number): Promise<FileUpload> {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/files`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.authHeaders() },
+      body: JSON.stringify({ filename, byte_length: byteLength }),
+    });
+    await checkTerminal(res);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} ${await res.text()}`);
+    }
+    const body = (await res.json()) as {
+      file_id: string;
+      upload: { url: string; fields: Record<string, string> };
+    };
+    return { fileId: body.file_id, url: body.upload.url, fields: body.upload.fields };
+  }
+
+  /**
+   * Streams the file at `path` straight to S3 with the POST the relay signed.
+   * The Blob is backed by the file on disk and read only as it is sent, so a
+   * 500MB file is never held in memory. `signal` cancels the upload.
+   */
+  async uploadFile(upload: FileUpload, path: string, signal: AbortSignal): Promise<void> {
+    const form = new FormData();
+    for (const [name, value] of Object.entries(upload.fields)) form.append(name, value);
+    form.append("file", await openAsBlob(path, { type: "application/octet-stream" }));
+    const res = await fetch(upload.url, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.any([signal, AbortSignal.timeout(FILE_UPLOAD_TIMEOUT_MS)]),
+    });
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} ${await res.text()}`);
     }
