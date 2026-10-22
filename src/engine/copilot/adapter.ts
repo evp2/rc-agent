@@ -7,6 +7,7 @@ import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
 import type { CopilotProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
+import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION, archivedText, forwardArchiveFile } from "../archiveFileTool";
 import {
   forwardShowImage,
   IMAGE_SHOWN,
@@ -64,17 +65,16 @@ export const approveEverything: PermissionHandler = (request) => {
   return { kind: "approve-once" };
 };
 
+function failure(reason: string): ToolResultObject {
+  return { textResultForLlm: reason, resultType: "failure", error: reason };
+}
+
 /**
  * The `show_image` tool, run in this process when the model calls it. The
  * handler only forwards: what happens to the file is the connector's
  * business, behind `onShowImage`.
  */
 function showImageTool(onShowImage: NonNullable<OpenOptions["onShowImage"]>): Tool {
-  const failure = (reason: string): ToolResultObject => ({
-    textResultForLlm: reason,
-    resultType: "failure",
-    error: reason,
-  });
   return {
     name: "show_image",
     description: SHOW_IMAGE_DESCRIPTION,
@@ -102,6 +102,52 @@ function showImageTool(onShowImage: NonNullable<OpenOptions["onShowImage"]>): To
       return outcome.shown ? { textResultForLlm: IMAGE_SHOWN, resultType: "success" } : failure(outcome.reason);
     },
   };
+}
+
+/** Like {@link showImageTool}, for `archive_file` and `onArchiveFile`. */
+function archiveFileTool(
+  onArchiveFile: NonNullable<OpenOptions["onArchiveFile"]>,
+  stoppable: Set<AbortController>,
+): Tool {
+  return {
+    name: "archive_file",
+    description: ARCHIVE_FILE_DESCRIPTION,
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", description: ARCHIVE_FILE_PATH_DESCRIPTION } },
+      required: ["path"],
+    },
+    skipPermission: true,
+    defer: "never",
+    handler: async (args, invocation): Promise<ToolResultObject> => {
+      const { path } = (args ?? {}) as { path?: unknown };
+      if (typeof path !== "string" || !path) return failure("the file couldn't be archived: no path was given");
+      // The SDK aborts the call's own signal only once Copilot reports the call over, which `session.abort()` doesn't.
+      const stop = new AbortController();
+      stoppable.add(stop);
+      let outcome;
+      try {
+        outcome = await forwardArchiveFile(
+          onArchiveFile,
+          { toolUseId: invocation.toolCallId, path },
+          invocation.signal ? AbortSignal.any([invocation.signal, stop.signal]) : stop.signal,
+        );
+      } finally {
+        stoppable.delete(stop);
+      }
+      return outcome.archived
+        ? { textResultForLlm: archivedText(outcome.filename, outcome.byteLength), resultType: "success" }
+        : failure(outcome.reason);
+    },
+  };
+}
+
+/** The connector's own tools, each offered only when the session was opened with its callback. */
+function connectorTools(options: OpenOptions, stoppable: Set<AbortController>): Tool[] {
+  return [
+    ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
+    ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile, stoppable)] : []),
+  ];
 }
 
 type TurnOutcome = Extract<EngineEvent, { type: "turn_ended" }>["outcome"];
@@ -232,8 +278,6 @@ class CopilotEngineSession implements EngineSession {
   private readonly unaskedQuestionCalls = new Map<string, string | undefined>();
   /** Questions matched to no call, each keyed apart all the same. */
   private unmatchedQuestions = 0;
-  /** One per Question waiting on the human; a Stop or close withdraws them all. */
-  private readonly pendingQuestions = new Set<AbortController>();
   /** Questions the connector asks itself, each keyed apart from the rest. */
   private ownQuestions = 0;
   /**
@@ -250,6 +294,8 @@ class CopilotEngineSession implements EngineSession {
     private readonly session: CopilotSessionHandle,
     private readonly options: OpenOptions,
     conversation: Extract<EngineEvent, { type: "conversation" }>,
+    /** One per Question waiting on the human or `archive_file` call running; a Stop or close aborts them all. */
+    private readonly stoppable: Set<AbortController>,
   ) {
     this.outbox.push(conversation);
     this.unsubscribe = session.on((e) => this.handle(e));
@@ -398,12 +444,12 @@ class CopilotEngineSession implements EngineSession {
    */
   private async putQuestion(toolUseId: string, question: QuestionItem): Promise<string> {
     const withdraw = new AbortController();
-    this.pendingQuestions.add(withdraw);
+    this.stoppable.add(withdraw);
     try {
       const answer = await this.options.onQuestion({ toolUseId, questions: [question] }, withdraw.signal);
       return answer.response?.trim() || answer.answers[question.question] || "";
     } finally {
-      this.pendingQuestions.delete(withdraw);
+      this.stoppable.delete(withdraw);
     }
   }
 
@@ -418,7 +464,7 @@ class CopilotEngineSession implements EngineSession {
   }
 
   stop(): void {
-    this.withdrawQuestions();
+    this.abortStoppable();
     const dropped = this.waiting.splice(0);
     // Reported before the stopped Turn ends, so everything a Stop did is
     // visible before the phone hears that Turn is over.
@@ -482,7 +528,7 @@ class CopilotEngineSession implements EngineSession {
     if (this.closed) return;
     this.closed = true;
     this.unsubscribe();
-    this.withdrawQuestions();
+    this.abortStoppable();
     if (this.turn) this.endTurn("stopped");
     if (!this.dead) await this.cancelBackgroundTasks();
     await this.session.disconnect().catch(() => undefined);
@@ -490,9 +536,9 @@ class CopilotEngineSession implements EngineSession {
     this.outbox.close();
   }
 
-  private withdrawQuestions(): void {
-    for (const withdraw of this.pendingQuestions) withdraw.abort();
-    this.pendingQuestions.clear();
+  private abortStoppable(): void {
+    for (const controller of this.stoppable) controller.abort();
+    this.stoppable.clear();
   }
 
   private deliverNext(commandsReread = false): void {
@@ -1224,18 +1270,20 @@ export class CopilotEngine implements Engine {
     // there is an Engine session to answer it; it only asks inside a Turn,
     // by which time there is.
     let engineSession: CopilotEngineSession | undefined;
+    const stoppable = new Set<AbortController>();
+    const tools = connectorTools(options, stoppable);
     const sessionOptions: CopilotSessionOptions = {
       model: this.deps.model,
       workingDirectory: options.projectDir,
       onPermissionRequest: approveEverything,
       onUserInputRequest: (request) =>
         engineSession ? engineSession.ask(request) : Promise.reject(new Error("the session isn't open yet")),
-      ...(options.onShowImage ? { tools: [showImageTool(options.onShowImage)] } : {}),
+      ...(tools.length ? { tools } : {}),
     };
     // The menu is read before the session is handed over, so the first
     // Command can already be told apart from a Local command.
     const wrap = async (session: CopilotSessionHandle, conversation: Extract<EngineEvent, { type: "conversation" }>) => {
-      engineSession = new CopilotEngineSession(runtime, session, options, conversation);
+      engineSession = new CopilotEngineSession(runtime, session, options, conversation, stoppable);
       await engineSession.refreshMenu();
       return engineSession;
     };

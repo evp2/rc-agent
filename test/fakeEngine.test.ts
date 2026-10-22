@@ -12,13 +12,15 @@ import {
   useToolAndFinish,
   type FakeEngineSession,
 } from "../src/engine/fakeEngine.ts";
+import { archivedText } from "../src/engine/archiveFileTool.ts";
 import { IMAGE_SHOWN } from "../src/engine/showImageTool.ts";
 import type { EngineAnswer, EngineEvent, EngineQuestion } from "../src/engine/types.ts";
 import {
+  ARCHIVE_FILE_CALL,
   runEngineGuaranteeSuite,
   SHOW_IMAGE_CALL,
+  type ConnectorToolResult,
   type EngineGuaranteeHarness,
-  type ShowImageToolResult,
 } from "./engineGuaranteeSuite.ts";
 
 function noQuestionsExpected() {
@@ -58,11 +60,25 @@ const harness: EngineGuaranteeHarness = {
     }),
 
   makeShowImageEngine: () => {
-    let seen: ShowImageToolResult | undefined;
+    let seen: ConnectorToolResult | undefined;
     const engine = new FakeEngine({
       handlerFor: () => async (ctx) => {
         const outcome = await ctx.showImage(SHOW_IMAGE_CALL);
         seen = outcome.shown ? { text: IMAGE_SHOWN, isError: false } : { text: outcome.reason, isError: true };
+        return { outcome: "success" };
+      },
+    });
+    return { engine, toolResult: () => seen };
+  },
+
+  makeArchiveFileEngine: () => {
+    let seen: ConnectorToolResult | undefined;
+    const engine = new FakeEngine({
+      handlerFor: () => async (ctx) => {
+        const outcome = await ctx.archiveFile(ARCHIVE_FILE_CALL);
+        seen = outcome.archived
+          ? { text: archivedText(outcome.filename, outcome.byteLength), isError: false }
+          : { text: outcome.reason, isError: true };
         return { outcome: "success" };
       },
     });

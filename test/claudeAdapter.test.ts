@@ -26,10 +26,11 @@ import {
   taskStarted,
 } from "./claudeDoubles.ts";
 import {
+  ARCHIVE_FILE_CALL,
   runEngineGuaranteeSuite,
   SHOW_IMAGE_CALL,
+  type ConnectorToolResult,
   type EngineGuaranteeHarness,
-  type ShowImageToolResult,
 } from "./engineGuaranteeSuite.ts";
 import { reactiveQuery } from "./engineReactiveQuery.ts";
 
@@ -86,34 +87,45 @@ const harness: EngineGuaranteeHarness = {
       env: {},
     }),
 
-  // The model's call goes to the in-process MCP server the adapter handed
-  // the SDK, over the same protocol the real CLI speaks to it, before the
-  // rest of the Turn reaches the adapter.
   makeShowImageEngine: () => {
-    let seen: ShowImageToolResult | undefined;
-    let options: Options | undefined;
-    const calling = assistantText("let me show you");
-    const { query } = scriptedQuery([init(), calling, assistantText("there it is"), result()], {
-      onOptions: (o) => {
-        options = o;
-      },
-      onYield: async (m) => {
-        if (m !== calling) return;
-        const { toolUseId, path, caption } = SHOW_IMAGE_CALL;
-        const client = await connectToConnectorToolsServer(options);
-        const reply = await client.callTool({
-          name: "show_image",
-          arguments: { path, caption },
-          _meta: { "claudecode/toolUseId": toolUseId },
-        });
-        await client.close();
-        const [first] = reply.content as { type: string; text?: string }[];
-        seen = { text: first?.text ?? "", isError: reply.isError === true };
-      },
-    });
-    return { engine: new ClaudeEngine({ query, env: {} }), toolResult: () => seen };
+    const { toolUseId, path, caption } = SHOW_IMAGE_CALL;
+    return toolCallingEngine("show_image", toolUseId, { path, caption });
+  },
+
+  makeArchiveFileEngine: () => {
+    const { toolUseId, path } = ARCHIVE_FILE_CALL;
+    return toolCallingEngine("archive_file", toolUseId, { path });
   },
 };
+
+/**
+ * The model's call goes to the in-process MCP server the adapter handed the
+ * SDK, over the same protocol the real CLI speaks to it, before the rest of
+ * the Turn reaches the adapter.
+ */
+function toolCallingEngine(
+  name: string,
+  toolUseId: string,
+  args: Record<string, unknown>,
+): { engine: ClaudeEngine; toolResult(): ConnectorToolResult | undefined } {
+  let seen: ConnectorToolResult | undefined;
+  let options: Options | undefined;
+  const calling = assistantText("calling the tool");
+  const { query } = scriptedQuery([init(), calling, assistantText("done"), result()], {
+    onOptions: (o) => {
+      options = o;
+    },
+    onYield: async (m) => {
+      if (m !== calling) return;
+      const client = await connectToConnectorToolsServer(options);
+      const reply = await client.callTool({ name, arguments: args, _meta: { "claudecode/toolUseId": toolUseId } });
+      await client.close();
+      const [first] = reply.content as { type: string; text?: string }[];
+      seen = { text: first?.text ?? "", isError: reply.isError === true };
+    },
+  });
+  return { engine: new ClaudeEngine({ query, env: {} }), toolResult: () => seen };
+}
 
 /** An MCP client connected to the in-process server the adapter handed the SDK in `options`. */
 async function connectToConnectorToolsServer(options: Options | undefined): Promise<Client> {

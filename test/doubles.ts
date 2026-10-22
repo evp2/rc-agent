@@ -52,8 +52,14 @@ export class FakeRelay {
   /** Set to make every postEvents batch carrying an `image` Event reject, as a relay that refuses the Image would. */
   rejectImageEvents: Error | undefined;
 
+  /** Like {@link rejectImageEvents}, for `archived_file` Events. */
+  rejectArchivedFileEvents: Error | undefined;
+
   async postEvents(events: EventInput[]): Promise<number> {
     if (this.rejectImageEvents && events.some((e) => e.type === "image")) throw this.rejectImageEvents;
+    if (this.rejectArchivedFileEvents && events.some((e) => e.type === "archived_file")) {
+      throw this.rejectArchivedFileEvents;
+    }
     this.posted.push(...events);
     return events.length;
   }
@@ -93,14 +99,23 @@ export class FakeRelay {
   /** Every Archived file sent to S3, by the path it was streamed from. */
   readonly uploadedFiles: { fileId: string; path: string }[] = [];
 
+  /** Runs while an Archived file is "uploading", to change the file, fail the upload, or wait on its signal. */
+  duringFileUpload: ((path: string, signal: AbortSignal) => Promise<void>) | undefined;
+
   async signFileUpload(filename: string, byteLength: number): Promise<FileUpload> {
     this.signedFiles.push({ filename, byteLength });
+    if (this.failNextSign) {
+      const e = this.failNextSign;
+      this.failNextSign = undefined;
+      throw e;
+    }
     const fileId = `file-${this.signedFiles.length}`;
     return { fileId, url: "https://bucket.s3.test/", fields: { key: `files/sess/${fileId}` } };
   }
 
-  async uploadFile(upload: FileUpload, path: string): Promise<void> {
+  async uploadFile(upload: FileUpload, path: string, signal: AbortSignal): Promise<void> {
     this.uploadedFiles.push({ fileId: upload.fileId, path });
+    await this.duringFileUpload?.(path, signal);
   }
 
   /** Every putSkills call, so a test can assert what the periodic report carried. */

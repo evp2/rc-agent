@@ -7,9 +7,12 @@ import type { SessionEvent } from "@github/copilot-sdk";
 
 import { approveEverything, CopilotEngine } from "../src/engine/copilot/adapter.ts";
 import type { CopilotRuntime } from "../src/engine/copilot/runtime.ts";
+import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION } from "../src/engine/archiveFileTool.ts";
 import type {
+  ArchiveFileOutcome,
   EngineAnswer,
   EngineEvent,
+  EngineFile,
   EngineImage,
   EngineQuestion,
   ShowImageOutcome,
@@ -24,10 +27,11 @@ import {
   type FakeSessionScript,
 } from "./copilotDoubles.ts";
 import {
+  ARCHIVE_FILE_CALL,
   runEngineGuaranteeSuite,
   SHOW_IMAGE_CALL,
+  type ConnectorToolResult,
   type EngineGuaranteeHarness,
-  type ShowImageToolResult,
 } from "./engineGuaranteeSuite.ts";
 
 function engineOn(runtime: CopilotRuntime, model = "auto"): CopilotEngine {
@@ -108,44 +112,51 @@ const harness: EngineGuaranteeHarness = {
       }),
     ),
 
-  // Copilot starts the call, the SDK runs the registered handler, and only
-  // once it has replied does the call complete and the Turn go on.
   makeShowImageEngine: () => {
-    let seen: ShowImageToolResult | undefined;
     const { toolUseId, path, caption } = SHOW_IMAGE_CALL;
-    const engine = engineOn(
-      new FakeCopilotRuntime({
-        onSend: async (s) => {
-          s.emit([
-            event("user.message", { content: "show me", delivery: "idle" }),
-            event("assistant.turn_start", { turnId: "0" }),
-            event("tool.execution_start", {
-              toolCallId: toolUseId,
-              toolName: "show_image",
-              arguments: { path, caption },
-            }),
-          ]);
-          const reply = await s.callTool("show_image", { path, caption }, toolUseId);
-          seen =
-            "error" in reply
-              ? { text: reply.error, isError: true }
-              : typeof reply.result === "string"
-                ? { text: reply.result, isError: false }
-                : { text: reply.result.textResultForLlm, isError: reply.result.resultType !== "success" };
-          s.emit([
-            event("tool.execution_complete", {
-              toolCallId: toolUseId,
-              success: !seen.isError,
-              result: { content: seen.text },
-            }),
-            ...simpleTurn("there it is").slice(2),
-          ]);
-        },
-      }),
-    );
-    return { engine, toolResult: () => seen };
+    return toolCallingEngine("show_image", toolUseId, { path, caption });
+  },
+
+  makeArchiveFileEngine: () => {
+    const { toolUseId, path } = ARCHIVE_FILE_CALL;
+    return toolCallingEngine("archive_file", toolUseId, { path });
   },
 };
+
+/**
+ * Copilot starts the call, the SDK runs the registered handler, and only
+ * once it has replied does the call complete and the Turn go on.
+ */
+function toolCallingEngine(
+  toolName: string,
+  toolUseId: string,
+  args: Record<string, unknown>,
+): { engine: CopilotEngine; toolResult(): ConnectorToolResult | undefined } {
+  let seen: ConnectorToolResult | undefined;
+  const engine = engineOn(
+    new FakeCopilotRuntime({
+      onSend: async (s) => {
+        s.emit([
+          event("user.message", { content: "go", delivery: "idle" }),
+          event("assistant.turn_start", { turnId: "0" }),
+          event("tool.execution_start", { toolCallId: toolUseId, toolName, arguments: args }),
+        ]);
+        const reply = await s.callTool(toolName, args, toolUseId);
+        seen =
+          "error" in reply
+            ? { text: reply.error, isError: true }
+            : typeof reply.result === "string"
+              ? { text: reply.result, isError: false }
+              : { text: reply.result.textResultForLlm, isError: reply.result.resultType !== "success" };
+        s.emit([
+          event("tool.execution_complete", { toolCallId: toolUseId, success: !seen.isError, result: { content: seen.text } }),
+          ...simpleTurn("done").slice(2),
+        ]);
+      },
+    }),
+  );
+  return { engine, toolResult: () => seen };
+}
 
 runEngineGuaranteeSuite("CopilotEngine", harness);
 
@@ -1972,6 +1983,138 @@ test("CopilotEngine: a session opened without onShowImage offers no show_image t
   const session = await engineOn(runtime).open(openOptions());
 
   assert.ok(!runtime.session.options.tools?.some((t) => t.name === "show_image"));
+  await session.close();
+});
+
+/** Like {@link openWithShowImage}, for `archive_file` and `onArchiveFile`. */
+async function openWithArchiveFile(
+  onArchiveFile: (file: EngineFile, signal: AbortSignal) => Promise<ArchiveFileOutcome>,
+): Promise<{ runtime: FakeCopilotRuntime; close(): Promise<void> }> {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open({ ...openOptions(), onArchiveFile });
+  return { runtime, close: () => session.close() };
+}
+
+test("CopilotEngine: archive_file is registered like Claude's, and a call reaches onArchiveFile with its tool call's id", async () => {
+  const received: { file: EngineFile; signal: AbortSignal }[] = [];
+  const { runtime, close } = await openWithArchiveFile(async (file, signal) => {
+    received.push({ file, signal });
+    return { archived: true, filename: "app.exe", byteLength: 48_234_496 };
+  });
+
+  const tool = runtime.session.options.tools?.find((t) => t.name === "archive_file");
+  assert.ok(tool, "archive_file is offered to the Engine");
+  assert.equal(tool.description, ARCHIVE_FILE_DESCRIPTION);
+  assert.deepEqual(tool.parameters, {
+    type: "object",
+    properties: { path: { type: "string", description: ARCHIVE_FILE_PATH_DESCRIPTION } },
+    required: ["path"],
+  });
+
+  const signal = new AbortController().signal;
+  const reply = await runtime.session.callTool("archive_file", { path: "dist/app.exe" }, "call_file", signal);
+
+  assert.deepEqual(
+    received.map((r) => r.file),
+    [{ toolUseId: "call_file", path: "dist/app.exe" }],
+  );
+  assert.ok("result" in reply && typeof reply.result === "object", `a tool result came back: ${JSON.stringify(reply)}`);
+  assert.equal(reply.result.resultType, "success");
+  assert.equal(
+    reply.result.textResultForLlm,
+    "Archived app.exe (46.0 MB); the human can download it from their transcript.",
+  );
+  await close();
+});
+
+test("CopilotEngine: an archive_file that fails comes back to the Engine as a failure carrying the reason", async () => {
+  const { runtime, close } = await openWithArchiveFile(async () => ({ archived: false, reason: "no file there" }));
+
+  const reply = await runtime.session.callTool("archive_file", { path: "dist/app.exe" }, "call_file");
+
+  assert.ok("result" in reply && typeof reply.result === "object", `a tool result came back: ${JSON.stringify(reply)}`);
+  assert.equal(reply.result.resultType, "failure");
+  assert.equal(reply.result.textResultForLlm, "no file there");
+  assert.equal(reply.result.error, "no file there");
+  await close();
+});
+
+test("CopilotEngine: an archive_file whose onArchiveFile throws comes back as a failure carrying the message", async () => {
+  const { runtime, close } = await openWithArchiveFile(async () => {
+    throw new Error("relay unreachable");
+  });
+
+  const reply = await runtime.session.callTool("archive_file", { path: "dist/app.exe" }, "call_file");
+
+  assert.ok("result" in reply && typeof reply.result === "object", `a tool result came back: ${JSON.stringify(reply)}`);
+  assert.equal(reply.result.resultType, "failure");
+  assert.equal(reply.result.textResultForLlm, "relay unreachable");
+  await close();
+});
+
+/**
+ * The SDK aborts a tool call's own signal only when Copilot reports the call
+ * over or the session disconnects; `session.abort()` itself aborts nothing.
+ * The call's signal here is never aborted, so only the Stop can end it.
+ */
+test("CopilotEngine: a Stop aborts an archive_file in progress without waiting on Copilot", async () => {
+  let received: AbortSignal | undefined;
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => (started = resolve));
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open({
+    ...openOptions(),
+    onArchiveFile: async (_file, signal) => {
+      received = signal;
+      started();
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      return { archived: false, reason: "stopped before the file was archived" };
+    },
+  });
+
+  const reply = runtime.session.callTool("archive_file", { path: "dist/app.exe" }, "call_file");
+  await running;
+  session.stop();
+
+  assert.equal(received?.aborted, true);
+  const settled = await reply;
+  assert.ok("result" in settled && typeof settled.result === "object");
+  assert.equal(settled.result.resultType, "failure");
+  await session.close();
+});
+
+test("CopilotEngine: an archive_file's signal aborts when Copilot ends the call", async () => {
+  let received: AbortSignal | undefined;
+  const { runtime, close } = await openWithArchiveFile(async (_file, signal) => {
+    received = signal;
+    return { archived: true, filename: "app.exe", byteLength: 1 };
+  });
+  const call = new AbortController();
+
+  await runtime.session.callTool("archive_file", { path: "dist/app.exe" }, "call_file", call.signal);
+  call.abort();
+
+  assert.equal(received?.aborted, true);
+  await close();
+});
+
+test("CopilotEngine: a session opened with both callbacks offers both tools", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open({
+    ...openOptions(),
+    onShowImage: async () => ({ shown: true }),
+    onArchiveFile: async () => ({ archived: false, reason: "unused" }),
+  });
+
+  assert.deepEqual(runtime.session.options.tools?.map((t) => t.name), ["show_image", "archive_file"]);
+  await session.close();
+});
+
+test("CopilotEngine: a session opened without onArchiveFile offers no archive_file tool", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open({ ...openOptions(), onShowImage: async () => ({ shown: true }) });
+
+  assert.ok(!runtime.session.options.tools?.some((t) => t.name === "archive_file"));
   await session.close();
 });
 

@@ -229,39 +229,44 @@ class FakeEngineSessionImpl implements FakeEngineSession {
   async showImage(image: EngineImage, turn: TurnController): Promise<ShowImageOutcome> {
     const onShowImage = this.options.onShowImage;
     if (!onShowImage) throw new Error("this session was opened without onShowImage");
-    this.outbox.push({
-      type: "tool_use",
-      toolUseId: image.toolUseId,
-      name: "show_image",
-      input: { path: image.path, ...(image.caption !== undefined ? { caption: image.caption } : {}) },
-    });
-    const abortController = new AbortController();
-    if (turn.stopped) abortController.abort();
-    else void turn.waitForStop().then(() => abortController.abort());
-    const outcome = await onShowImage(image, abortController.signal);
-    this.outbox.push({
-      type: "tool_result",
-      toolUseId: image.toolUseId,
-      text: outcome.shown ? "shown" : outcome.reason,
-      isError: !outcome.shown,
-    });
-    return outcome;
+    return this.runTool(
+      turn,
+      image.toolUseId,
+      "show_image",
+      { path: image.path, ...(image.caption !== undefined ? { caption: image.caption } : {}) },
+      (signal) => onShowImage(image, signal),
+      (outcome) => (outcome.shown ? { text: "shown", isError: false } : { text: outcome.reason, isError: true }),
+    );
   }
 
   async archiveFile(file: EngineFile, turn: TurnController): Promise<ArchiveFileOutcome> {
     const onArchiveFile = this.options.onArchiveFile;
     if (!onArchiveFile) throw new Error("this session was opened without onArchiveFile");
-    this.outbox.push({ type: "tool_use", toolUseId: file.toolUseId, name: "archive_file", input: { path: file.path } });
+    return this.runTool(
+      turn,
+      file.toolUseId,
+      "archive_file",
+      { path: file.path },
+      (signal) => onArchiveFile(file, signal),
+      (outcome) => (outcome.archived ? { text: "archived", isError: false } : { text: outcome.reason, isError: true }),
+    );
+  }
+
+  /** Reports a tool call and its result around `run`, whose signal aborts when the Turn is stopped. */
+  private async runTool<O>(
+    turn: TurnController,
+    toolUseId: string,
+    name: string,
+    input: Record<string, unknown>,
+    run: (signal: AbortSignal) => Promise<O>,
+    result: (outcome: O) => { text: string; isError: boolean },
+  ): Promise<O> {
+    this.outbox.push({ type: "tool_use", toolUseId, name, input });
     const abortController = new AbortController();
     if (turn.stopped) abortController.abort();
     else void turn.waitForStop().then(() => abortController.abort());
-    const outcome = await onArchiveFile(file, abortController.signal);
-    this.outbox.push({
-      type: "tool_result",
-      toolUseId: file.toolUseId,
-      text: outcome.archived ? "archived" : outcome.reason,
-      isError: !outcome.archived,
-    });
+    const outcome = await run(abortController.signal);
+    this.outbox.push({ type: "tool_result", toolUseId, ...result(outcome) });
     return outcome;
   }
 

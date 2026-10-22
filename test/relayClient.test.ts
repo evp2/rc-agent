@@ -173,6 +173,42 @@ test("uploadFile posts the signed fields, then the file's bytes as the form's la
   }
 });
 
+/**
+ * A Blob that reads from disk as it is sent stops reading once the file
+ * changes under it; one built from bytes read up front would still read the
+ * old contents. So a body that still reads after the file changes was
+ * buffered whole.
+ */
+test("uploadFile streams the file from disk rather than reading it whole into memory", async () => {
+  const { appendFileSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+
+  const dir = mkdtempSync(join(tmpdir(), "upload-"));
+  const path = join(dir, "app.exe");
+  writeFileSync(path, "MZ not really a program");
+  const client = await withFakeResume();
+  const realFetch = globalThis.fetch;
+  let sent: Blob | undefined;
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    sent = (init.body as FormData).get("file") as Blob;
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  try {
+    await client.uploadFile(
+      { fileId: "file-1", url: "https://bucket.s3.test/", fields: { key: "files/sess-1/file-1" } },
+      path,
+      new AbortController().signal,
+    );
+    appendFileSync(path, " that grew");
+
+    await assert.rejects(sent!.text(), { name: "NotReadableError" });
+  } finally {
+    globalThis.fetch = realFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 /** A RelayClient resumed against a relay faked just long enough to construct it. */
 async function withFakeResume(): Promise<RelayClient> {
   const realFetch = globalThis.fetch;

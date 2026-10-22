@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { archivedText } from "../src/engine/archiveFileTool.ts";
 import type {
+  ArchiveFileOutcome,
   Engine,
   EngineAnswer,
   EngineEvent,
+  EngineFile,
   EngineImage,
   EngineQuestion,
   ShowImageOutcome,
@@ -18,8 +21,14 @@ export const SHOW_IMAGE_CALL: EngineImage = {
   caption: "the login page",
 };
 
-/** What the SDK was handed back for a `show_image` call, reduced to what every Engine's tool result carries. */
-export interface ShowImageToolResult {
+/** The `archive_file` call every {@link EngineGuaranteeHarness.makeArchiveFileEngine} Turn makes. */
+export const ARCHIVE_FILE_CALL: EngineFile = {
+  toolUseId: "archive-file-1",
+  path: "dist/app.exe",
+};
+
+/** What the SDK was handed back for a connector tool call, reduced to what every Engine's tool result carries. */
+export interface ConnectorToolResult {
   text: string;
   isError: boolean;
 }
@@ -49,19 +58,23 @@ export interface EngineGuaranteeHarness {
    * returned. `toolResult()` is what the SDK got back from it, read once the
    * Turn has ended; undefined if the call never returned.
    */
-  makeShowImageEngine(): { engine: Engine; toolResult(): ShowImageToolResult | undefined };
+  makeShowImageEngine(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
+  /** Like {@link makeShowImageEngine}, for an `archive_file` call as {@link ARCHIVE_FILE_CALL}. */
+  makeArchiveFileEngine(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
 }
 
 function openOptions(
   overrides: {
     resume?: string;
     onShowImage?: (image: EngineImage, signal: AbortSignal) => Promise<ShowImageOutcome>;
+    onArchiveFile?: (file: EngineFile, signal: AbortSignal) => Promise<ArchiveFileOutcome>;
   } = {},
 ): {
   projectDir: string;
   resume?: string;
   onQuestion: (q: EngineQuestion, signal: AbortSignal) => Promise<EngineAnswer>;
   onShowImage?: (image: EngineImage, signal: AbortSignal) => Promise<ShowImageOutcome>;
+  onArchiveFile?: (file: EngineFile, signal: AbortSignal) => Promise<ArchiveFileOutcome>;
 } {
   return {
     projectDir: "/tmp/engine-guarantee-suite",
@@ -233,6 +246,36 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
       assert.equal(result.isError, !outcome.shown);
       if (outcome.shown) assert.equal(result.text, IMAGE_SHOWN, "the success is the shared confirmation");
       else assert.equal(result.text, outcome.reason, "the failure carries the reason");
+      await session.close();
+    });
+  }
+
+  for (const outcome of [
+    { archived: true, filename: "app.exe", byteLength: 2048 },
+    { archived: false, reason: "no file there" },
+  ] satisfies ArchiveFileOutcome[]) {
+    const kind = outcome.archived ? "success" : "failure";
+    test(`${name}: an archive_file call reaches onArchiveFile, and its ${kind} comes back as the tool result`, async () => {
+      const { engine, toolResult } = harness.makeArchiveFileEngine();
+      const received: EngineFile[] = [];
+      const session = await engine.open(
+        openOptions({
+          onArchiveFile: async (file) => {
+            received.push(file);
+            return outcome;
+          },
+        }),
+      );
+      const it = session.events[Symbol.asyncIterator]();
+      session.send("archive it");
+      await readUntil(it, turnEnded);
+      assert.deepEqual(received, [ARCHIVE_FILE_CALL]);
+      const result = toolResult();
+      assert.ok(result, "the call returned a tool result to the SDK");
+      assert.equal(result.isError, !outcome.archived);
+      if (outcome.archived) {
+        assert.equal(result.text, archivedText(outcome.filename, outcome.byteLength), "the success is the shared confirmation");
+      } else assert.equal(result.text, outcome.reason, "the failure carries the reason");
       await session.close();
     });
   }
