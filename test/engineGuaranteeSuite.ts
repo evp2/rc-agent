@@ -51,16 +51,16 @@ export interface EngineGuaranteeHarness {
   /** A Turn that hangs open until Steered, at which point a second (short, self-ending) Turn begins in its place. */
   makeSteerableEngine(): Engine;
   /** A Turn that starts one Background task (id `"bg-1"`) and then hangs open until `stop()` lands. */
-  makeBackgroundTaskEngine(): Engine;
+  makeBackgroundTaskEngine?(): Engine;
   /**
    * A Turn whose model calls `show_image` as {@link SHOW_IMAGE_CALL}, the
    * way the Engine's SDK really would, then finishes once the call has
    * returned. `toolResult()` is what the SDK got back from it, read once the
    * Turn has ended; undefined if the call never returned.
    */
-  makeShowImageEngine(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
+  makeShowImageEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
   /** Like {@link makeShowImageEngine}, for an `archive_file` call as {@link ARCHIVE_FILE_CALL}. */
-  makeArchiveFileEngine(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
+  makeArchiveFileEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
 }
 
 function openOptions(
@@ -211,8 +211,8 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
     await session.close();
   });
 
-  test(`${name}: Stop ends every running Background task`, async () => {
-    const session = await harness.makeBackgroundTaskEngine().open(openOptions());
+  test(`${name}: Stop ends every running Background task`, { skip: !harness.makeBackgroundTaskEngine }, async () => {
+    const session = await harness.makeBackgroundTaskEngine!().open(openOptions());
     const it = session.events[Symbol.asyncIterator]();
     session.send("kick off a background task");
     await readUntil(it, (e) => e.type === "task_started");
@@ -226,8 +226,8 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
 
   for (const outcome of [{ shown: true }, { shown: false, reason: "not a PNG" }] satisfies ShowImageOutcome[]) {
     const kind = outcome.shown ? "success" : "failure";
-    test(`${name}: a show_image call reaches onShowImage, and its ${kind} comes back as the tool result`, async () => {
-      const { engine, toolResult } = harness.makeShowImageEngine();
+    test(`${name}: a show_image call reaches onShowImage, and its ${kind} comes back as the tool result`, { skip: !harness.makeShowImageEngine }, async () => {
+      const { engine, toolResult } = harness.makeShowImageEngine!();
       const received: EngineImage[] = [];
       const session = await engine.open(
         openOptions({
@@ -255,8 +255,8 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
     { archived: false, reason: "no file there" },
   ] satisfies ArchiveFileOutcome[]) {
     const kind = outcome.archived ? "success" : "failure";
-    test(`${name}: an archive_file call reaches onArchiveFile, and its ${kind} comes back as the tool result`, async () => {
-      const { engine, toolResult } = harness.makeArchiveFileEngine();
+    test(`${name}: an archive_file call reaches onArchiveFile, and its ${kind} comes back as the tool result`, { skip: !harness.makeArchiveFileEngine }, async () => {
+      const { engine, toolResult } = harness.makeArchiveFileEngine!();
       const received: EngineFile[] = [];
       const session = await engine.open(
         openOptions({

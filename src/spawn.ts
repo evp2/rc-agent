@@ -29,7 +29,7 @@ export async function spawnDetached(
     );
   }
 
-  const engine = engineKindFor(config.provider);
+  const engine = engineKindFor(config);
   ensureStateDir();
   const log = logPath(config.projectDir, engine);
   const logFd = openSync(log, "a");

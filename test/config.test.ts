@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { engineKindFor, loadConfig } from "../src/config.ts";
+import { createEngine } from "../src/engine/create.ts";
 
 function writeConfig(body: Record<string, unknown>): string {
   const dir = mkdtempSync(join(tmpdir(), "crc-config-"));
@@ -87,18 +88,18 @@ test("a non-numeric contextWarningThresholdPercent is rejected", () => {
 });
 
 test("an anthropic provider means the Claude Engine", () => {
-  assert.equal(engineKindFor(loadConfig(writeConfig(base)).provider), "claude");
+  assert.equal(engineKindFor(loadConfig(writeConfig(base))), "claude");
 });
 
 test("a bedrock provider means the Claude Engine", () => {
   const config = loadConfig(writeConfig({ ...base, provider: { type: "bedrock", region: "us-east-1" } }));
-  assert.equal(engineKindFor(config.provider), "claude");
+  assert.equal(engineKindFor(config), "claude");
 });
 
 test("a copilot provider defaults its model to auto and its CLI to the one on the PATH, and runs on Copilot", () => {
   const config = loadConfig(writeConfig({ ...base, provider: { type: "copilot" } }));
   assert.deepEqual(config.provider, { type: "copilot", model: "auto", cliPath: undefined });
-  assert.equal(engineKindFor(config.provider), "copilot");
+  assert.equal(engineKindFor(config), "copilot");
 });
 
 test("a copilot provider keeps a configured model and CLI path", () => {
@@ -106,6 +107,75 @@ test("a copilot provider keeps a configured model and CLI path", () => {
     writeConfig({ ...base, provider: { type: "copilot", model: "gpt-5.6-luna", cliPath: "/opt/copilot/bin/copilot" } }),
   );
   assert.deepEqual(config.provider, { type: "copilot", model: "gpt-5.6-luna", cliPath: "/opt/copilot/bin/copilot" });
+});
+
+test("a config without an engine leaves it absent", () => {
+  assert.equal(loadConfig(writeConfig(base)).engine, undefined);
+});
+
+test("an explicit engine is kept and decides the Engine", () => {
+  const claude = loadConfig(writeConfig({ ...base, engine: "claude", provider: { type: "bedrock" } }));
+  assert.equal(claude.engine, "claude");
+  assert.equal(engineKindFor(claude), "claude");
+
+  const copilot = loadConfig(writeConfig({ ...base, engine: "copilot", provider: { type: "copilot" } }));
+  assert.equal(copilot.engine, "copilot");
+  assert.equal(engineKindFor(copilot), "copilot");
+});
+
+test("an unknown engine is rejected, naming the ones allowed", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, engine: "made_up" })),
+    { message: "'engine' must be one of: claude, copilot, pi (got \"made_up\")" },
+  );
+});
+
+test("an engine that cannot run on the configured provider is rejected", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, engine: "copilot", provider: { type: "anthropic" } })),
+    { message: "'engine' is \"copilot\", which cannot run on provider.type 'anthropic'; use provider.type 'copilot'" },
+  );
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, engine: "claude", provider: { type: "copilot" } })),
+    { message: "'engine' is \"claude\", which cannot run on provider.type 'copilot'; use provider.type 'anthropic' or 'bedrock'" },
+  );
+});
+
+test("the Engine factory builds the adapter the explicit engine names", () => {
+  const config = loadConfig(writeConfig({ ...base, engine: "copilot", provider: { type: "copilot" } }));
+  assert.equal(createEngine(config).kind, "copilot");
+});
+
+test("a pi engine runs on any of the three providers, and without a model leaves the choice to Pi", () => {
+  for (const type of ["anthropic", "bedrock", "copilot"]) {
+    const config = loadConfig(writeConfig({ ...base, engine: "pi", provider: { type } }));
+    assert.deepEqual(config.provider, { type });
+    assert.equal(engineKindFor(config), "pi");
+    assert.equal(createEngine(config).kind, "pi");
+  }
+});
+
+test("a pi engine keeps a configured model and thinking level", () => {
+  const config = loadConfig(
+    writeConfig({
+      ...base,
+      engine: "pi",
+      provider: { type: "copilot", model: "claude-sonnet-4.5", thinkingLevel: "high" },
+    }),
+  );
+  assert.deepEqual(config.provider, { type: "copilot", model: "claude-sonnet-4.5", thinkingLevel: "high" });
+});
+
+test("a pi engine rejects a thinking level Pi doesn't have, naming the ones it does", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "anthropic", thinkingLevel: "extreme" } })),
+    { message: "'provider.thinkingLevel' must be one of: off, minimal, low, medium, high, xhigh, max (got \"extreme\")" },
+  );
+});
+
+test("the Engine factory falls back to the provider when no engine is configured", () => {
+  assert.equal(createEngine(loadConfig(writeConfig(base))).kind, "claude");
+  assert.equal(createEngine(loadConfig(writeConfig({ ...base, provider: { type: "copilot" } }))).kind, "copilot");
 });
 
 test("a missing connectorCredential is rejected with how to obtain one", () => {

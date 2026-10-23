@@ -15,19 +15,28 @@ try {
 }
 
 await esbuild.build({
-  entryPoints: ["src/cli/index.ts"],
+  entryPoints: { index: "src/cli/index.ts", main: "src/cli/main.ts" },
   bundle: true,
   platform: "node",
   // package.json declares "type": "module", so dist/index.js is loaded as ESM.
   // esbuild's platform:node default is cjs, which would fail at startup.
   format: "esm",
   target: "node22",
-  outfile: "dist/index.js",
+  outdir: "dist",
   // Keep native/platform-specific packages external -- they must be installed
   // alongside the connector via npm install.
-  external: ["@anthropic-ai/claude-agent-sdk", "@github/copilot-sdk", "qrcode-terminal"],
+  // Pi loads its Bedrock SDK through a path esbuild can't follow.
+  external: [
+    "./main.js",
+    "@anthropic-ai/claude-agent-sdk",
+    "@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent",
+    "@github/copilot-sdk",
+    "qrcode-terminal",
+  ],
   banner: { js: "#!/usr/bin/env node" },
   define: { __CONNECTOR_VERSION__: JSON.stringify(connectorVersion) },
 });
 
 chmodSync("dist/index.js", 0o755);
+chmodSync("dist/main.js", 0o755);

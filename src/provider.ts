@@ -19,6 +19,15 @@ export interface CopilotProviderConfig {
   cliPath?: string;
 }
 
+export const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type PiThinkingLevel = (typeof PI_THINKING_LEVELS)[number];
+
+export interface PiProviderConfig {
+  type: ProviderConfig["type"];
+  model?: string;
+  thinkingLevel?: PiThinkingLevel;
+}
+
 /** The providers the Claude Engine runs on. */
 export type ClaudeProviderConfig = AnthropicProviderConfig | BedrockProviderConfig;
 

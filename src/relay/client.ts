@@ -1,5 +1,6 @@
 import { openAsBlob } from "node:fs";
 
+import type { EngineKind } from "../engine/types";
 import type { ProviderConfig } from "../provider";
 import { CONNECTOR_VERSION } from "../version";
 
@@ -126,6 +127,8 @@ export interface FileUpload {
 export interface CreateSessionInput {
   permissionMode: string;
   providerType: ProviderConfig["type"];
+  /** Absent for connectors that predate the field; the relay infers the Engine from the provider. */
+  engine?: EngineKind;
   providerModel?: string;
   providerRegion?: string;
   projectDir: string;
@@ -218,6 +221,7 @@ export class RelayClient {
         body: JSON.stringify({
           permission_mode: input.permissionMode,
           provider_type: input.providerType,
+          engine: input.engine,
           provider_model: input.providerModel,
           provider_region: input.providerRegion,
           project_dir: input.projectDir,

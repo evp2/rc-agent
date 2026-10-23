@@ -43,11 +43,11 @@ function printConnectionReport(
   printShareUrl(state.staticUrl);
 }
 
-const ENGINE_LABEL: Record<EngineKind, string> = { claude: "Claude", copilot: "Copilot" };
+const ENGINE_LABEL: Record<EngineKind, string> = { claude: "Claude", copilot: "Copilot", pi: "Pi" };
 
 /** Mentions a connector on the other Engine working in the same worktree, which the human has to keep off this one's files. */
 function noteOtherEngine(config: ConnectorConfig): void {
-  const own = engineKindFor(config.provider);
+  const own = engineKindFor(config);
   for (const other of ENGINE_KINDS.filter((kind) => kind !== own)) {
     const live = liveConnector(config.projectDir, other);
     if (live) {
@@ -57,7 +57,7 @@ function noteOtherEngine(config: ConnectorConfig): void {
 }
 
 export async function runForeground(config: ConnectorConfig, relay: boolean): Promise<void> {
-  const engine = engineKindFor(config.provider);
+  const engine = engineKindFor(config);
   const existing = liveConnector(config.projectDir, engine);
   if (existing && existing.pid !== process.pid) {
     throw new Error(
@@ -88,7 +88,7 @@ export async function start(
   configPath: string,
   relay: boolean,
 ): Promise<void> {
-  const engine = engineKindFor(config.provider);
+  const engine = engineKindFor(config);
   const existing = liveConnector(config.projectDir, engine);
   if (existing) {
     console.log(`${ENGINE_LABEL[engine]} is already running for ${config.projectDir} (pid ${existing.pid}).`);
@@ -110,7 +110,7 @@ export async function start(
 }
 
 export async function stop(config: ConnectorConfig, end: boolean): Promise<void> {
-  const engine = engineKindFor(config.provider);
+  const engine = engineKindFor(config);
   const state = readState(config.projectDir, engine);
   if (!state) {
     console.log(`No connector state for ${config.projectDir}. Nothing to stop.`);
@@ -162,7 +162,7 @@ export async function stop(config: ConnectorConfig, end: boolean): Promise<void>
  * may be perfectly valid with no process running at all.
  */
 export async function status(config: ConnectorConfig): Promise<void> {
-  const engine = engineKindFor(config.provider);
+  const engine = engineKindFor(config);
   const state = readState(config.projectDir, engine);
   console.log(`version       ${CONNECTOR_VERSION}`);
   console.log(`project dir   ${config.projectDir}`);
@@ -247,7 +247,7 @@ export async function qr(
   showShare: boolean,
   relay: boolean,
 ): Promise<void> {
-  const engine = engineKindFor(config.provider);
+  const engine = engineKindFor(config);
   const state = readState(config.projectDir, engine);
   if (!state) {
     throw new Error(

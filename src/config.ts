@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import type { EngineKind } from "./engine/types";
-import type { ProviderConfig } from "./provider";
+import { ENGINE_KINDS, type EngineKind } from "./engine/types";
+import { PI_THINKING_LEVELS, type PiProviderConfig, type PiThinkingLevel, type ProviderConfig } from "./provider";
 
 /**
  * The connector always runs with permissions bypassed, and this is not
@@ -28,11 +28,10 @@ export const MIN_INACTIVITY_COMPACT_MINUTES = 5;
 /** Applied when `contextWarningThresholdPercent` is absent -- the warning is always on, only its value is configurable. */
 export const DEFAULT_CONTEXT_WARNING_THRESHOLD_PERCENT = 70;
 
-export interface ConnectorConfig {
+interface ConnectorConfigBase {
   relayBaseUrl: string;
   connectorCredential: string;
   projectDir: string;
-  provider: ProviderConfig;
   /**
    * Absent means the feature is off. When set, the connector submits its own
    * `/compact` Command after this many minutes of no real Command completing --
@@ -49,11 +48,38 @@ export interface ConnectorConfig {
   contextWarningThresholdPercent?: number;
 }
 
-/**
- * The Engine a provider runs on. Derived rather than configured separately, so
- * a config can never name a provider its Engine cannot reach.
- */
-export function engineKindFor(provider: ProviderConfig): EngineKind {
+export type ConnectorConfig = ConnectorConfigBase &
+  (
+    | {
+        engine?: Exclude<EngineKind, "pi">;
+        provider: ProviderConfig;
+      }
+    | { engine: "pi"; provider: PiProviderConfig }
+  );
+
+export function relayProvider(config: ConnectorConfig): {
+  providerType: ProviderConfig["type"];
+  providerModel?: string;
+  providerRegion?: string;
+} {
+  if (config.engine === "pi") return { providerType: config.provider.type, providerModel: config.provider.model };
+  switch (config.provider.type) {
+    case "anthropic":
+      return { providerType: "anthropic" };
+    case "bedrock":
+      return { providerType: "bedrock", providerModel: config.provider.model, providerRegion: config.provider.region };
+    case "copilot":
+      return { providerType: "copilot", providerModel: config.provider.model };
+  }
+}
+
+const ENGINE_PROVIDERS: Record<EngineKind, readonly ProviderConfig["type"][]> = {
+  claude: ["anthropic", "bedrock"],
+  copilot: ["copilot"],
+  pi: ["anthropic", "bedrock", "copilot"],
+};
+
+function impliedEngine(provider: ProviderConfig): EngineKind {
   switch (provider.type) {
     case "anthropic":
     case "bedrock":
@@ -61,6 +87,11 @@ export function engineKindFor(provider: ProviderConfig): EngineKind {
     case "copilot":
       return "copilot";
   }
+}
+
+export function engineKindFor(config: ConnectorConfig): EngineKind {
+  if (config.engine) return config.engine;
+  return impliedEngine(config.provider);
 }
 
 export function loadConfig(path: string): ConnectorConfig {
@@ -96,9 +127,22 @@ export function loadConfig(path: string): ConnectorConfig {
   }
   const p = providerRaw as Record<string, unknown>;
   const providerType = requireString(p, "type");
+  if (!(PROVIDER_TYPES as readonly string[]).includes(providerType)) {
+    throw new Error("'provider.type' must be 'anthropic', 'bedrock' or 'copilot'");
+  }
 
-  let provider: ProviderConfig;
-  if (providerType === "anthropic") {
+  const engine = optionalEngine(c, providerType as ProviderConfig["type"]);
+
+  let provider: ProviderConfig | PiProviderConfig;
+  if (engine === "pi") {
+    const model = optionalString(p, "model");
+    const thinkingLevel = optionalThinkingLevel(p);
+    provider = {
+      type: providerType as ProviderConfig["type"],
+      ...(model ? { model } : {}),
+      ...(thinkingLevel ? { thinkingLevel } : {}),
+    };
+  } else if (providerType === "anthropic") {
     provider = {
       type: "anthropic",
       apiKeyEnv: typeof p.apiKeyEnv === "string" ? p.apiKeyEnv : undefined,
@@ -111,14 +155,12 @@ export function loadConfig(path: string): ConnectorConfig {
       region: optionalString(p, "region"),
       model: optionalString(p, "model"),
     };
-  } else if (providerType === "copilot") {
+  } else {
     provider = {
       type: "copilot",
       model: optionalString(p, "model") ?? "auto",
       cliPath: optionalString(p, "cliPath"),
     };
-  } else {
-    throw new Error("'provider.type' must be 'anthropic', 'bedrock' or 'copilot'");
   }
 
   let inactivityCompact: InactivityCompactConfig | undefined;
@@ -153,10 +195,41 @@ export function loadConfig(path: string): ConnectorConfig {
     relayBaseUrl: relayBaseUrl.replace(/\/+$/, ""),
     connectorCredential,
     projectDir: resolve(projectDir),
+    ...(engine ? { engine } : {}),
     provider,
     ...(inactivityCompact ? { inactivityCompact } : {}),
     ...(contextWarningThresholdPercent !== undefined ? { contextWarningThresholdPercent } : {}),
-  };
+  } as ConnectorConfig;
+}
+
+const PROVIDER_TYPES = ["anthropic", "bedrock", "copilot"] as const satisfies readonly ProviderConfig["type"][];
+
+function optionalThinkingLevel(obj: Record<string, unknown>): PiThinkingLevel | undefined {
+  const value = obj.thinkingLevel;
+  if (value === undefined) return undefined;
+  if (!(PI_THINKING_LEVELS as readonly unknown[]).includes(value)) {
+    throw new Error(
+      `'provider.thinkingLevel' must be one of: ${PI_THINKING_LEVELS.join(", ")} (got ${JSON.stringify(value)})`,
+    );
+  }
+  return value as PiThinkingLevel;
+}
+
+function optionalEngine(obj: Record<string, unknown>, providerType: ProviderConfig["type"]): EngineKind | undefined {
+  const value = obj.engine;
+  if (value === undefined) return undefined;
+  if (!(ENGINE_KINDS as readonly unknown[]).includes(value)) {
+    throw new Error(`'engine' must be one of: ${ENGINE_KINDS.join(", ")} (got ${JSON.stringify(value)})`);
+  }
+  const engine = value as EngineKind;
+  const providers = ENGINE_PROVIDERS[engine];
+  if (!providers.includes(providerType)) {
+    throw new Error(
+      `'engine' is "${engine}", which cannot run on provider.type '${providerType}'; ` +
+        `use provider.type ${providers.map((p) => `'${p}'`).join(" or ")}`,
+    );
+  }
+  return engine;
 }
 
 /** Reads an optional string field. An empty string is treated as absent. */

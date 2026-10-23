@@ -1,4 +1,4 @@
-import { PERMISSION_MODE, type ConnectorConfig, type InactivityCompactConfig } from "../config";
+import { PERMISSION_MODE, relayProvider, type ConnectorConfig, type InactivityCompactConfig } from "../config";
 import { createEngine } from "../engine/create";
 import { fakeEnginePersona } from "../engine/fakePersonas";
 import type { Engine, EngineKind } from "../engine/types";
@@ -163,9 +163,8 @@ async function acquireSession(config: ConnectorConfig, engine: EngineKind): Prom
     config.connectorCredential,
     {
       permissionMode: PERMISSION_MODE,
-      providerType: config.provider.type,
-      providerModel: config.provider.type === "anthropic" ? undefined : config.provider.model,
-      providerRegion: config.provider.type === "bedrock" ? config.provider.region : undefined,
+      ...relayProvider(config),
+      engine: config.engine,
       projectDir: config.projectDir,
     },
   );

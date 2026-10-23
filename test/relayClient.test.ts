@@ -125,6 +125,28 @@ test("a relay that rejects the connector credential fails session creation with 
   }
 });
 
+test("session creation sends the configured engine, and omits it when none is configured", async () => {
+  const realFetch = globalThis.fetch;
+  const bodies: Array<Record<string, unknown>> = [];
+  try {
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      return new Response(
+        JSON.stringify({ session_id: "s1", secret: "k", phone_url: "p", netlify_url: "n", control_url: "c" }),
+      );
+    }) as typeof fetch;
+    const input = { permissionMode: "bypassPermissions", providerType: "copilot", projectDir: "/tmp/project" } as const;
+
+    await RelayClient.create("https://relay.test", "testCred0001", { ...input, engine: "copilot" });
+    await RelayClient.create("https://relay.test", "testCred0001", input);
+
+    assert.equal(bodies[0].engine, "copilot");
+    assert.equal("engine" in bodies[1], false);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 /**
  * An Archived file goes to S3 as the signed form's last part, read from disk
  * as it is sent. This drives the real client against a real HTTP server, so

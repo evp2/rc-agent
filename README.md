@@ -4,14 +4,15 @@ Drive a headless coding agent from your phone. The connector runs locally
 next to a real project directory, picks up Commands from the relay, hands them
 to an agent SDK, and streams the output back to your phone. The agent is either
 Claude, through the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-typescript),
-or GitHub Copilot, through the [Copilot SDK](https://github.com/github/copilot-sdk).
+GitHub Copilot, through the [Copilot SDK](https://github.com/github/copilot-sdk),
+or the [Pi coding agent](https://github.com/earendil-works/pi), through its SDK.
 
 ## Prerequisites
 
-**1. Node.js 22+**
+**1. Node.js 22.19+**
 
 ```bash
-node --version   # must be >= 22
+node --version   # must be >= 22.19
 ```
 
 **2. Claude CLI installed and authenticated**
@@ -60,6 +61,33 @@ To check an install end to end, follow [Verify an install](#verify-an-install).
 cp connector.config.example.json connector.config.json
 # Edit: connectorCredential, and optionally projectDir (defaults to cwd)
 ```
+
+The optional top-level `engine` (`"claude"`, `"copilot"` or `"pi"`) names the
+agent that runs the session. Without it, the provider decides: `anthropic` and
+`bedrock` run Claude, `copilot` runs Copilot. An `engine` the provider can't
+run is rejected at startup.
+
+### Pi
+
+`"engine": "pi"` runs the Pi coding agent inside the connector, on any of the
+three providers. It uses your own Pi setup (`~/.pi/agent`, or
+`PI_CODING_AGENT_DIR`): the login `pi` stored, your default model, and your
+session files. Sign in with `pi` and `/login` first. Pi extensions never load
+inside the connector.
+
+```json
+{
+  "engine": "pi",
+  "provider": { "type": "anthropic", "model": "claude-opus-4-5", "thinkingLevel": "medium" }
+}
+```
+
+`model` is a Pi model id on that provider (`pi --list-models`); without it,
+Pi's own default model is used, and it must be on the configured provider.
+`thinkingLevel` is one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
+or `max`; without it, Pi's own default applies. The connector refuses to start,
+before printing a phone URL, when Pi has no model, no credential for it, or a
+model on another provider.
 
 ### Anthropic provider (claude.ai subscription or API key)
 
@@ -202,8 +230,8 @@ check and re-run it before moving to the next step.
 node --version
 ```
 
-**Pass:** printed version is `v22` or higher.
-**Fail:** install Node.js 22+ before continuing. Do not proceed with an older version.
+**Pass:** printed version is `v22.19` or higher.
+**Fail:** install Node.js 22.19+ before continuing. Do not proceed with an older version.
 
 **Running Node 24 in cluster:** set `NODE_USE_ENV_PROXY=1` in the environment
 now, before any later step talks to the relay. Without it, cluster's proxy
@@ -439,7 +467,7 @@ way. Use `rc-agent stop --end` only to deliberately discard the conversation.
 
 All of the following must be true before reporting success:
 
-- [ ] Node.js >= 22
+- [ ] Node.js >= 22.19
 - [ ] The provider's CLI on PATH: `claude` (anthropic) or `copilot` (copilot, unless using `COPILOT_GITHUB_TOKEN`)
 - [ ] Claude CLI authenticated (anthropic), AWS credentials valid (bedrock), **or** Copilot signed in or `COPILOT_GITHUB_TOKEN` set (copilot)
 - [ ] `npm install` succeeded
