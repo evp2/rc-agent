@@ -34,6 +34,7 @@ for (const key of Object.keys(process.env)) {
 }
 
 export const FAUX_MODEL = "faux-model";
+export const FOREIGN_MODEL = "foreign-model";
 
 export function writePiSettings(settings: Record<string, unknown>): void {
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify(settings));
@@ -58,16 +59,19 @@ export function piEngineOn(
     withFaux?: boolean;
     signedIn?: boolean;
     model?: Omit<FauxModelDefinition, "id">;
+    otherModels?: FauxModelDefinition[];
+    foreignProviders?: string[];
     subscription?: boolean;
     homeDir?: string;
+    projectDir?: string;
   } = {},
 ): PiTestEngine {
   const faux = fauxProvider({
     provider: options.piProvider ?? "anthropic",
-    models: [{ id: FAUX_MODEL, ...options.model }],
+    models: [{ id: FAUX_MODEL, ...options.model }, ...(options.otherModels ?? [])],
   });
   faux.setResponses(responses);
-  const projectDir = freshProjectDir();
+  const projectDir = options.projectDir ?? freshProjectDir();
   let runtime: ModelRuntime | undefined;
   const engine = new PiEngine({
     provider: options.provider ?? { type: "anthropic", model: FAUX_MODEL },
@@ -86,6 +90,11 @@ export function piEngineOn(
       runtime = await ModelRuntime.create({ credentials });
       const withFaux = options.withFaux ?? true;
       if (withFaux) runtime.registerNativeProvider(priced(faux.provider, { subscription: options.subscription ?? false }));
+      for (const foreign of options.foreignProviders ?? []) {
+        const other = fauxProvider({ provider: foreign, models: [{ id: FOREIGN_MODEL }] });
+        runtime.registerNativeProvider(other.provider);
+        await runtime.setRuntimeApiKey(other.provider.id, "test-key");
+      }
       if ((options.signedIn ?? withFaux) && !options.subscription) {
         await runtime.setRuntimeApiKey(faux.provider.id, "test-key");
       }

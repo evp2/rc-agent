@@ -6,20 +6,32 @@ import {
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
+  type SessionEntry,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdtemp, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { AsyncQueue } from "../../asyncQueue";
 import { PERMISSION_MODE } from "../../config";
 import type { PiProviderConfig, ProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
-import type { Engine, EngineEvent, EngineSession, EngineUsage, OpenOptions } from "../types";
+import {
+  CONNECTOR_QUESTION_ID_PREFIX,
+  type Engine,
+  type EngineEvent,
+  type EngineQuestion,
+  type EngineSession,
+  type EngineUsage,
+  type OpenOptions,
+} from "../types";
+import { chooseEffort, chooseModel } from "./modelCommands";
 import { connectorTools, QUESTION_TOOL } from "./tools";
 
 const PI_PROVIDERS: Record<ProviderConfig["type"], string> = {
@@ -63,12 +75,17 @@ export class PiEngine implements Engine {
       previous ? SessionManager.open(previous) : SessionManager.create(cwd),
       connectorTools(options),
     );
-    return new PiEngineSession(session, {
-      type: "conversation",
-      id: session.sessionId,
-      resumed: previous !== undefined,
-      ...(options.resume && !previous ? { lostPrevious: true } : {}),
-    });
+    return new PiEngineSession(
+      session,
+      {
+        type: "conversation",
+        id: session.sessionId,
+        resumed: previous !== undefined,
+        ...(options.resume && !previous ? { lostPrevious: true } : {}),
+      },
+      { piProvider: PI_PROVIDERS[this.deps.provider.type], onQuestion: options.onQuestion },
+      options.onArchiveFile,
+    );
   }
 
   // Pi's session creation succeeds with no model or credential and fails only at the first prompt.
@@ -81,8 +98,11 @@ export class PiEngine implements Engine {
     const agentDir = getAgentDir();
     const modelRuntime = await this.createModelRuntime();
     const piProvider = PI_PROVIDERS[provider.type];
+    const branch = sessionManager.getBranch();
+    const chosenAlready = switchedIn(branch, "model_change");
+    const effortChosenAlready = switchedIn(branch, "thinking_level_change");
     let model: PiModel | undefined;
-    if (provider.model) {
+    if (provider.model && !chosenAlready) {
       model = modelRuntime.getModel(piProvider, provider.model);
       if (!model) {
         throw new Error(
@@ -99,7 +119,7 @@ export class PiEngine implements Engine {
       agentDir,
       settingsManager,
       noExtensions: true,
-      additionalSkillPaths: claudeSkills.filter((dir) => existsSync(dir)),
+      additionalSkillPaths: claudeSkills,
     });
     await resourceLoader.reload();
     const { session } = await createAgentSession({
@@ -111,7 +131,7 @@ export class PiEngine implements Engine {
       sessionManager,
       customTools,
       ...(model ? { model } : {}),
-      ...(provider.thinkingLevel ? { thinkingLevel: provider.thinkingLevel } : {}),
+      ...(provider.thinkingLevel && !effortChosenAlready && !chosenAlready ? { thinkingLevel: provider.thinkingLevel } : {}),
     });
     // With no model to pick, Pi leaves a placeholder in place rather than none.
     const chosen = session.model && modelRuntime.getModel(session.model.provider, session.model.id);
@@ -123,6 +143,14 @@ export class PiEngine implements Engine {
     }
     return session;
   }
+}
+
+// Pi writes a model_change and thinking_level_change when it creates a session; only a later one is a switch.
+function switchedIn(branch: SessionEntry[], type: "model_change" | "thinking_level_change"): boolean {
+  const first = branch.findIndex((e) => e.type === type);
+  if (first < 0) return false;
+  const firstMessage = branch.findIndex((e) => e.type === "message");
+  return branch.some((e, i) => e.type === type && i > first) || (firstMessage >= 0 && firstMessage < first);
 }
 
 async function checkRunnable(
@@ -164,6 +192,10 @@ async function checkRunnable(
   }
 }
 
+function messageOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 type TurnOutcome = Extract<EngineEvent, { type: "turn_ended" }>["outcome"];
 
 interface RunningTurn {
@@ -193,10 +225,14 @@ class PiEngineSession implements EngineSession {
   private closed = false;
   private unannounced: Extract<EngineEvent, { type: "conversation" }> | undefined;
   private readonly unsubscribe: () => void;
+  private questions = new AbortController();
+  private ownQuestions = 0;
 
   constructor(
     private readonly session: AgentSession,
     conversation: Extract<EngineEvent, { type: "conversation" }>,
+    private readonly asking: { piProvider: string; onQuestion: OpenOptions["onQuestion"] },
+    private readonly onArchiveFile?: OpenOptions["onArchiveFile"],
   ) {
     if (conversation.resumed) this.outbox.push(conversation);
     else this.unannounced = conversation;
@@ -222,7 +258,7 @@ class PiEngineSession implements EngineSession {
       text,
       queued: this.session.steer(text).then(
         () => undefined,
-        (e: unknown) => (e instanceof Error ? e : new Error(String(e))),
+        (e: unknown) => new Error(messageOf(e)),
       ),
       stopped: false,
     };
@@ -238,6 +274,7 @@ class PiEngineSession implements EngineSession {
     }
     if (this.turn) {
       this.turn.stopRequested = true;
+      this.questions.abort();
       this.stoppedWhileRunning += queued.length;
       void this.session.abort();
     } else {
@@ -250,6 +287,7 @@ class PiEngineSession implements EngineSession {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.questions.abort();
     this.waiting.length = 0;
     this.steering = undefined;
     this.session.clearQueue();
@@ -275,9 +313,18 @@ class PiEngineSession implements EngineSession {
 
   private async run(text: string, cause: "command" | "steer"): Promise<void> {
     const turn = this.startTurn(cause);
-    const compact = /^\/compact(?:\s+([\s\S]*))?$/.exec(text.trim());
+    this.questions = new AbortController();
+    const trimmed = text.trim();
+    const compact = /^\/compact(?:\s+([\s\S]*))?$/.exec(trimmed);
+    const [, word = "", rest = ""] = /^\/(\w+)(?:\s+([\s\S]*))?$/.exec(trimmed) ?? [];
     if (compact) await this.compact(turn, compact[1] || undefined);
-    else if (/^\/clear$/.test(text.trim())) await this.clear(turn);
+    else if (word === "clear" && !rest) await this.clear(turn);
+    else if (word === "model") await this.switchModel(turn, "model", rest);
+    else if (word === "effort") await this.switchModel(turn, "effort", rest);
+    else if (word === "session") this.localStatus(turn, () => sessionStatus(this.session));
+    else if (word === "name") this.localStatus(turn, () => this.name(rest.trim()));
+    else if (word === "reload") await this.reload(turn);
+    else if (word === "export") await this.exportSession(turn);
     else await this.prompt(turn, text);
     const missed = this.steering;
     this.steering = undefined;
@@ -301,7 +348,7 @@ class PiEngineSession implements EngineSession {
     try {
       await this.session.prompt(text);
     } catch (e) {
-      refusal = e instanceof Error ? e.message : String(e);
+      refusal = messageOf(e);
     }
     this.announceOnceOnDisk();
     this.endTurn(turn, refusal ? "error" : "success", refusal);
@@ -317,6 +364,31 @@ class PiEngineSession implements EngineSession {
     }
   }
 
+  private async switchModel(turn: RunningTurn, command: "model" | "effort", input: string): Promise<void> {
+    const { signal } = this.questions;
+    const deps = {
+      session: this.session,
+      piProvider: this.asking.piProvider,
+      ask: async (question: EngineQuestion["questions"][number]) => {
+        const toolUseId = `${CONNECTOR_QUESTION_ID_PREFIX}${++this.ownQuestions}`;
+        const answer = await this.asking.onQuestion({ toolUseId, questions: [question] }, signal);
+        if (signal.aborted) throw new Error("stopped");
+        return answer.response?.trim() || answer.answers[question.question] || "";
+      },
+    };
+    try {
+      const done = await (command === "model" ? chooseModel(deps, input) : chooseEffort(deps, input));
+      if (done.modelChanged && this.session.model) {
+        this.outbox.push({ type: "announce", model: this.session.model.id, permissionMode: PERMISSION_MODE });
+      }
+      this.outbox.push({ type: "status", text: done.status });
+      this.endTurn(turn, "success");
+    } catch (e) {
+      if (turn.stopRequested || signal.aborted) this.endTurn(turn, "stopped");
+      else this.endTurn(turn, "error", messageOf(e));
+    }
+  }
+
   private async clear(turn: RunningTurn): Promise<void> {
     const manager = this.session.sessionManager;
     const first = manager.getBranch().find((e) => e.type === "message" && e.message.role === "user");
@@ -327,10 +399,58 @@ class PiEngineSession implements EngineSession {
         manager.appendCustomEntry("connector-clear");
       }
     } catch (e) {
-      this.endTurn(turn, "error", e instanceof Error ? e.message : String(e));
+      this.endTurn(turn, "error", messageOf(e));
       return;
     }
     this.outbox.push({ type: "status", text: "conversation cleared" });
+    this.endTurn(turn, "success");
+  }
+
+  private async exportSession(turn: RunningTurn): Promise<void> {
+    const fail = (reason: string) => {
+      this.outbox.push({ type: "status", text: reason });
+      this.endTurn(turn, "error", reason);
+    };
+    if (!this.onArchiveFile) return fail("this session can't hand files to the phone");
+    const dir = await mkdtemp(join(tmpdir(), "pi-export-"));
+    let failure: string | undefined;
+    try {
+      const path = await this.session.exportToHtml(join(dir, "session.html"));
+      const outcome = await this.onArchiveFile({ toolUseId: `export-${randomUUID()}`, path }, this.questions.signal);
+      if (!outcome.archived) failure = outcome.reason;
+    } catch (e) {
+      failure = messageOf(e);
+    }
+    await rm(dir, { recursive: true, force: true });
+    if (turn.stopRequested) this.endTurn(turn, "stopped");
+    else if (failure) fail(failure);
+    else this.endTurn(turn, "success");
+  }
+
+  private localStatus(turn: RunningTurn, line: () => string): void {
+    try {
+      this.outbox.push({ type: "status", text: line() });
+      this.endTurn(turn, "success");
+    } catch (e) {
+      this.endTurn(turn, "error", messageOf(e));
+    }
+  }
+
+  private name(name: string): string {
+    if (!name) throw new Error("/name needs a name, e.g. /name Fixing the build");
+    this.session.setSessionName(name);
+    return `session named ${name}`;
+  }
+
+  private async reload(turn: RunningTurn): Promise<void> {
+    try {
+      await this.session.reload();
+    } catch (e) {
+      this.endTurn(turn, "error", messageOf(e));
+      return;
+    }
+    this.outbox.push({ type: "menu", ...menu(this.session) });
+    this.outbox.push({ type: "status", text: "reloaded skills, prompt templates and context files" });
     this.endTurn(turn, "success");
   }
 
@@ -457,6 +577,12 @@ class PiEngineSession implements EngineSession {
 const LOCAL_COMMANDS: SkillInfo[] = [
   { name: "compact", description: "Compact the conversation", argumentHint: "[instructions]" },
   { name: "clear", description: "Clear conversation history", argumentHint: "" },
+  { name: "model", description: "Switch the model", argumentHint: "[model] [effort]" },
+  { name: "effort", description: "Set how hard the model reasons", argumentHint: "[level]" },
+  { name: "session", description: "Show model, messages, tokens and context", argumentHint: "" },
+  { name: "name", description: "Name this session", argumentHint: "<name>" },
+  { name: "reload", description: "Reload skills, prompt templates and context files", argumentHint: "" },
+  { name: "export", description: "Export the session as an HTML file", argumentHint: "" },
 ];
 
 function menu(session: AgentSession): { skills: SkillInfo[]; localCommands: SkillInfo[] } {
@@ -475,6 +601,21 @@ function menu(session: AgentSession): { skills: SkillInfo[]; localCommands: Skil
     ],
     localCommands: LOCAL_COMMANDS,
   };
+}
+
+function sessionStatus(session: AgentSession): string {
+  const stats = session.getSessionStats();
+  const model = session.model;
+  const parts = [
+    `${model ? model.id : "no model"}, effort ${session.thinkingLevel}`,
+    `${stats.totalMessages} messages`,
+    `${stats.tokens.total} tokens`,
+  ];
+  const percent = stats.contextUsage?.percent;
+  parts.push(percent == null ? "context unknown" : `context ${Math.round(percent)}%`);
+  if (model && !session.modelRuntime.isUsingSubscription(model.provider)) parts.push(`$${stats.cost.toFixed(4)}`);
+  parts.push(`conversation ${session.sessionId}`);
+  return parts.join(" · ");
 }
 
 function addUsage(sum: EngineUsage | undefined, usage: Usage): EngineUsage {

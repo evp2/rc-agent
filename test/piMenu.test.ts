@@ -80,7 +80,7 @@ test("PiEngine: the menu lists Pi's Skills and prompt templates, the project's a
   ]);
   assert.deepEqual(
     menu.localCommands.map((c) => c.name),
-    ["compact", "clear"],
+    ["compact", "clear", "model", "effort", "session", "name", "reload", "export"],
   );
 });
 
@@ -240,7 +240,7 @@ test("PiEngine: Auto-compact, once due, compacts the Pi Conversation through the
   await until(() => h.relay.putSkillsCalls.length > 0);
   assert.deepEqual(
     (h.relay.putSkillsCalls[0].localCommands as { name: string }[]).map((c) => c.name),
-    ["compact", "clear"],
+    ["compact", "clear", "model", "effort", "session", "name", "reload", "export"],
   );
   await runTurn(h.ctx, cmd("hello"));
   await runTurn(h.ctx, cmd("and again"));
