@@ -3,6 +3,9 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  createCodemodeExtension,
+  createMcpExtension,
+  createToolSearchExtension,
   DefaultResourceLoader,
   getAgentDir,
   ModelRuntime,
@@ -64,7 +67,7 @@ export class PiEngine implements Engine {
 
   async verify(): Promise<void> {
     const session = await this.startSession(this.deps.projectDir, SessionManager.inMemory(this.deps.projectDir));
-    session.dispose();
+    await endSession(session);
   }
 
   async open(options: OpenOptions): Promise<EngineSession> {
@@ -119,6 +122,7 @@ export class PiEngine implements Engine {
       agentDir,
       settingsManager,
       noExtensions: true,
+      extensionFactories: [createCodemodeExtension({ mode: "on" }), createToolSearchExtension(), createMcpExtension()],
       additionalSkillPaths: claudeSkills,
     });
     await resourceLoader.reload();
@@ -137,11 +141,21 @@ export class PiEngine implements Engine {
     const chosen = session.model && modelRuntime.getModel(session.model.provider, session.model.id);
     try {
       await checkRunnable(chosen, provider, modelRuntime);
+      await session.bindExtensions({});
     } catch (e) {
-      session.dispose();
+      await endSession(session);
       throw e;
     }
     return session;
+  }
+}
+
+// dispose() alone skips session_shutdown, which is what closes the MCP servers' connections and child processes.
+async function endSession(session: AgentSession): Promise<void> {
+  try {
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+  } finally {
+    session.dispose();
   }
 }
 
@@ -293,7 +307,7 @@ class PiEngineSession implements EngineSession {
     this.session.clearQueue();
     await this.session.abort();
     this.unsubscribe();
-    this.session.dispose();
+    await endSession(this.session);
     this.outbox.close();
   }
 
