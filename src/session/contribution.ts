@@ -7,7 +7,7 @@ const exec = promisify(execFile);
 export interface Contribution {
   /** Remote host, e.g. "github.com". Absent together with `repo` when there is no origin to attribute to. */
   host?: string;
-  /** "<org>/<repo>", in the same shape the pod queue uses. */
+  /** "<org>/<repo>". */
   repo?: string;
   added: number;
   deleted: number;
