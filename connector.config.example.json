@@ -3,8 +3,5 @@
   "projectDir": "",
   "provider": {
     "type": "anthropic"
-  },
-  "inactivityCompact": {
-    "afterMinutes": 30
   }
 }

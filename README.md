@@ -352,9 +352,8 @@ Then confirm or adjust:
   prompted Turn would hang. Point it only at a checkout the user is willing to
   let an agent modify without being asked.**
 - `provider` — already set to `{"type":"anthropic"}`; change to the [Bedrock](#bedrock) or [Copilot](#copilot) shape if needed
-- `inactivityCompact` — already set to `{"afterMinutes":30}`, so the connector submits its own
-  `/compact` after 30 minutes with no real Command completing. Remove the field entirely to turn
-  this off, or change `afterMinutes` (5 minutes minimum).
+- `inactivityCompact` — off unless added. Set `{"afterMinutes":30}` to have the connector submit
+  its own `/compact` after 30 minutes with no real Command completing (5 minutes minimum).
 
 `permissionMode` is not a field any more. If an existing config still has one,
 it is ignored and the connector warns at startup; remove it.
