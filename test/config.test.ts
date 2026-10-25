@@ -208,3 +208,22 @@ test("a plain-http relayBaseUrl on loopback is accepted for a locally run relay"
     assert.equal(loadConfig(writeConfig({ ...base, relayBaseUrl })).relayBaseUrl, relayBaseUrl);
   }
 });
+
+test("relayBaseUrl may be omitted, leaving the relay to be looked up", () => {
+  const { relayBaseUrl: _omitted, ...withoutRelay } = base;
+  const config = loadConfig(writeConfig(withoutRelay));
+  assert.equal(config.relayBaseUrl, undefined);
+  assert.equal(config.relayLookupUrl, undefined);
+});
+
+test("relayLookupUrl is accepted and normalised like relayBaseUrl", () => {
+  const config = loadConfig(writeConfig({ ...base, relayLookupUrl: "https://lookup.test/api/" }));
+  assert.equal(config.relayLookupUrl, "https://lookup.test/api");
+});
+
+test("a plain-http relayLookupUrl for a non-local host is rejected", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, relayLookupUrl: "http://lookup.example.com/api" })),
+    /relayLookupUrl.*https/,
+  );
+});

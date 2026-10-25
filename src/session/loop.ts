@@ -1,4 +1,10 @@
-import { PERMISSION_MODE, relayProvider, type ConnectorConfig, type InactivityCompactConfig } from "../config";
+import {
+  PERMISSION_MODE,
+  relayProvider,
+  type ConnectorConfig,
+  type InactivityCompactConfig,
+  type ResolvedConnectorConfig,
+} from "../config";
 import { createEngine } from "../engine/create";
 import { fakeEnginePersona } from "../engine/fakePersonas";
 import type { Engine, EngineKind } from "../engine/types";
@@ -124,7 +130,7 @@ export interface RunHandle {
  * State belonging to a different relay, project directory or Engine is ignored
  * rather than trusted -- see {@link isReusableState}.
  */
-async function acquireSession(config: ConnectorConfig, engine: EngineKind): Promise<{
+async function acquireSession(config: ResolvedConnectorConfig, engine: EngineKind): Promise<{
   client: RelayClient;
   phoneUrl: string;
   staticUrl: string | undefined;
@@ -177,7 +183,7 @@ async function acquireSession(config: ConnectorConfig, engine: EngineKind): Prom
  * Runs the session loop in the foreground until stopped. Returns once the
  * session is live, so a caller can report the phone URL before the loop ends.
  */
-export async function runConnector(config: ConnectorConfig): Promise<RunHandle> {
+export async function runConnector(config: ResolvedConnectorConfig): Promise<RunHandle> {
   const engine = selectEngine(config);
   // Before a relay session exists: an Engine that can never run should fail
   // here, with its own message, rather than after a phone has paired.

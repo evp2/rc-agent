@@ -36,9 +36,12 @@ sign in to the Copilot CLI instead (see [Copilot provider](#copilot) below).
 
 **3. A running relay**
 
-The connector needs a `relayBaseUrl` and a Connector credential minted for it
-by an operator of a deployed `claude-remote-control` relay stack (see the
-relay's README for how a credential is minted and revoked).
+The connector needs a Connector credential minted for it by an operator of a
+deployed `claude-remote-control` relay stack (see the relay's README for how a
+credential is minted and revoked). At startup it asks `https://claude-rc.netlify.app/api`
+where the relay is. To skip that lookup, or to use a relay that endpoint does not
+know about (a local one, say), set `relayBaseUrl` in the config; to ask a different
+lookup endpoint, set `relayLookupUrl`.
 
 ## Install
 
@@ -93,7 +96,6 @@ model on another provider.
 
 ```json
 {
-  "relayBaseUrl": "https://YOUR_RELAY.execute-api.us-east-1.amazonaws.com/test",
   "connectorCredential": "YOUR_CONNECTOR_CREDENTIAL",
   "projectDir": "",
   "provider": {
@@ -365,11 +367,13 @@ grep -E "REPLACE_ME|/path/to/" connector.config.json && echo "NEEDS EDITING" || 
 
 ### Step 8 — Relay reachability
 
-Extract `relayBaseUrl` from the config and hit `GET /` — this should return the
-phone HTML without any auth:
+Take `relayBaseUrl` from the config, or from the lookup endpoint if the config has none,
+and hit `GET /` — this should return the phone HTML without any auth:
 
 ```bash
-RELAY=$(node -e "const c=JSON.parse(require('fs').readFileSync('connector.config.json','utf8')); process.stdout.write(c.relayBaseUrl)")
+RELAY=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).relayBaseUrl ?? ''")
+CREDENTIAL=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).connectorCredential")
+[ -n "$RELAY" ] || RELAY=$(curl -sf -X POST -H "X-Connector-Credential: $CREDENTIAL" https://claude-rc.netlify.app/api | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).relayBaseUrl")
 curl -sf "${RELAY}/" -o /dev/null -w "HTTP %{http_code}\n"
 ```
 
@@ -385,8 +389,9 @@ are working, without starting the SDK or needing a phone.
 Extract config values with node (works cross-platform, no jq required):
 
 ```bash
-RELAY=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).relayBaseUrl")
+RELAY=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).relayBaseUrl ?? ''")
 CREDENTIAL=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).connectorCredential")
+[ -n "$RELAY" ] || RELAY=$(curl -sf -X POST -H "X-Connector-Credential: $CREDENTIAL" https://claude-rc.netlify.app/api | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).relayBaseUrl")
 PROJECT=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).projectDir")
 PROVIDER=$(node -p "JSON.parse(require('fs').readFileSync('connector.config.json','utf8')).provider.type")
 ```
@@ -474,7 +479,7 @@ All of the following must be true before reporting success:
 - [ ] `npm run typecheck` clean
 - [ ] `npm run build` succeeded; `dist/index.js` is executable with shebang
 - [ ] `connector.config.json` exists with no placeholder values
-- [ ] `GET <relayBaseUrl>/` returns HTTP 200
+- [ ] `GET <relay address>/` returns HTTP 200
 - [ ] `POST /sessions` with correct connectorCredential returns a session JSON
 - [ ] `POST /sessions/{id}/end` returns HTTP 200
 - [ ] `rc-agent start` prints a phone URL; `rc-agent status` shows the process running and

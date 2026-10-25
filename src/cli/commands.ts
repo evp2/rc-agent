@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import { engineKindFor, type ConnectorConfig } from "../config";
+import { resolveRelayBaseUrl } from "../relayLookup";
 import { ENGINE_KINDS, type EngineKind } from "../engine/types";
 import { pairingQrUrl, printPairingQrCode } from "../qr";
 import { RelayClient, SessionEndedError } from "../relay/client";
@@ -67,7 +68,8 @@ export async function runForeground(config: ConnectorConfig, relay: boolean): Pr
   }
 
   noteOtherEngine(config);
-  const handle = await runConnector(config);
+  const relayBaseUrl = await resolveRelayBaseUrl(config);
+  const handle = await runConnector({ ...config, relayBaseUrl });
   console.log(
     `Session ${handle.sessionId} ${handle.resumed ? "resumed" : "created"} for ${config.projectDir}`,
   );

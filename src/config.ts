@@ -29,7 +29,10 @@ export const MIN_INACTIVITY_COMPACT_MINUTES = 5;
 export const DEFAULT_CONTEXT_WARNING_THRESHOLD_PERCENT = 70;
 
 interface ConnectorConfigBase {
-  relayBaseUrl: string;
+  /** Absent means the connector asks the Relay lookup endpoint where the Relay is. */
+  relayBaseUrl?: string;
+  /** Replaces the built-in Relay lookup endpoint. */
+  relayLookupUrl?: string;
   connectorCredential: string;
   projectDir: string;
   /**
@@ -56,6 +59,9 @@ export type ConnectorConfig = ConnectorConfigBase &
       }
     | { engine: "pi"; provider: PiProviderConfig }
   );
+
+/** A config whose Relay address is known, whether it was configured or looked up. */
+export type ResolvedConnectorConfig = ConnectorConfig & { relayBaseUrl: string };
 
 export function relayProvider(config: ConnectorConfig): {
   providerType: ProviderConfig["type"];
@@ -106,7 +112,8 @@ export function loadConfig(path: string): ConnectorConfig {
   }
   const c = raw as Record<string, unknown>;
 
-  const relayBaseUrl = requireRelayBaseUrl(c);
+  const relayBaseUrl = optionalUrl(c, "relayBaseUrl");
+  const relayLookupUrl = optionalUrl(c, "relayLookupUrl");
   const connectorCredential = requireConnectorCredential(c, path);
   const projectDir = typeof c.projectDir === "string" && c.projectDir.length > 0
     ? c.projectDir
@@ -192,7 +199,8 @@ export function loadConfig(path: string): ConnectorConfig {
   }
 
   return {
-    relayBaseUrl: relayBaseUrl.replace(/\/+$/, ""),
+    ...(relayBaseUrl ? { relayBaseUrl } : {}),
+    ...(relayLookupUrl ? { relayLookupUrl } : {}),
     connectorCredential,
     projectDir: resolve(projectDir),
     ...(engine ? { engine } : {}),
@@ -247,21 +255,25 @@ function optionalString(
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
-function requireRelayBaseUrl(obj: Record<string, unknown>): string {
-  const value = requireString(obj, "relayBaseUrl");
+export function validateRelayUrl(value: string, label: string): string {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    throw new Error(`'relayBaseUrl' is not a valid URL: ${value}`);
+    throw new Error(`'${label}' is not a valid URL: ${value}`);
   }
   const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
   if (url.protocol !== "https:" && !isLoopbackHttp) {
     throw new Error(
-      `'relayBaseUrl' must start with https:// (got ${value}); plain http:// is only accepted for localhost.`,
+      `'${label}' must start with https:// (got ${value}); plain http:// is only accepted for localhost.`,
     );
   }
-  return value;
+  return value.replace(/\/+$/, "");
+}
+
+function optionalUrl(obj: Record<string, unknown>, key: string): string | undefined {
+  const value = optionalString(obj, key);
+  return value === undefined ? undefined : validateRelayUrl(value, key);
 }
 
 /** Mirrors the relay's `generateCredential`; a value of any other shape can never verify, so it is rejected before any request is made. */
