@@ -37,6 +37,7 @@ import {
 import { type FinishedTask, TaskRegistry } from "./backgroundTasks";
 import { chooseEffort, chooseModel } from "./modelCommands";
 import type { SubagentCommand } from "./subagent";
+import { refreshAwsProfileFiles } from "./awsProfile";
 import { connectorTools, QUESTION_TOOL } from "./tools";
 
 const PI_PROVIDERS: Record<ProviderConfig["type"], string> = {
@@ -447,6 +448,7 @@ class PiEngineSession implements EngineSession {
     turn.endsOnSettle = true;
     let refusal: string | undefined;
     try {
+      if (this.asking.piProvider === PI_PROVIDERS.bedrock) await refreshAwsProfileFiles();
       await this.session.prompt(text);
     } catch (e) {
       refusal = messageOf(e);

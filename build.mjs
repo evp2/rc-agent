@@ -25,13 +25,15 @@ await esbuild.build({
   outdir: "dist",
   // Keep native/platform-specific packages external -- they must be installed
   // alongside the connector via npm install.
-  // Pi loads its Bedrock SDK through a path esbuild can't follow.
+  // Pi loads its Bedrock SDK through a path esbuild can't follow. @smithy/core is external so the
+  // bundle shares Pi's copy and its credential file cache; a bundled copy would refresh a different one.
   external: [
     "./main.js",
     "@anthropic-ai/claude-agent-sdk",
     "@earendil-works/pi-ai",
     "@earendil-works/pi-coding-agent",
     "@github/copilot-sdk",
+    "@smithy/core",
     "qrcode-terminal",
   ],
   banner: { js: "#!/usr/bin/env node" },
