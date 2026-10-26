@@ -23,6 +23,7 @@ import {
   initWithSkills,
   result,
   scriptedQuery,
+  taskNotification,
   taskStarted,
 } from "./claudeDoubles.ts";
 import {
@@ -78,10 +79,21 @@ const harness: EngineGuaranteeHarness = {
       env: {},
     }),
 
+  killsBackgroundTasks: true,
   makeBackgroundTaskEngine: () =>
     new ClaudeEngine({
       query: reactiveQuery({
         subTurns: [[init(), assistantText("starting"), taskStarted("bg-1")]],
+        hangAfterLast: true,
+      }),
+      env: {},
+    }),
+
+  makeWakingBackgroundTaskEngine: () =>
+    new ClaudeEngine({
+      query: reactiveQuery({
+        subTurns: [[init(), assistantText("starting"), taskStarted("bg-1"), result()]],
+        selfStarted: [taskNotification("bg-1"), init(), assistantText("it finished"), result()],
         hangAfterLast: true,
       }),
       env: {},

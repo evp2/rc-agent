@@ -34,7 +34,9 @@ import {
   type EngineUsage,
   type OpenOptions,
 } from "../types";
+import { type FinishedTask, TaskRegistry } from "./backgroundTasks";
 import { chooseEffort, chooseModel } from "./modelCommands";
+import type { SubagentCommand } from "./subagent";
 import { connectorTools, QUESTION_TOOL } from "./tools";
 
 const PI_PROVIDERS: Record<ProviderConfig["type"], string> = {
@@ -47,6 +49,7 @@ export interface PiEngineDeps {
   provider: PiProviderConfig;
   projectDir: string;
   homeDir?: string;
+  subagentCommand?: SubagentCommand;
   createModelRuntime?: () => Promise<ModelRuntime>;
 }
 
@@ -73,12 +76,28 @@ export class PiEngine implements Engine {
   async open(options: OpenOptions): Promise<EngineSession> {
     const cwd = options.projectDir;
     const previous = options.resume ? SessionManager.findById(cwd, options.resume) : undefined;
+    let opened: PiEngineSession | undefined;
+    let piSession: AgentSession | undefined;
+    const tasks = new TaskRegistry(
+      cwd,
+      (event) => opened?.report(event),
+      (task) => opened?.finished(task),
+      {
+        ...(this.deps.subagentCommand ? { command: this.deps.subagentCommand } : {}),
+        settings: () => {
+          const model = piSession?.model;
+          if (!model) throw new Error("the session has no model");
+          return { model: `${model.provider}/${model.id}`, thinking: piSession!.thinkingLevel };
+        },
+      },
+    );
     const session = await this.startSession(
       cwd,
       previous ? SessionManager.open(previous) : SessionManager.create(cwd),
-      connectorTools(options),
+      connectorTools(options, tasks),
     );
-    return new PiEngineSession(
+    piSession = session;
+    opened = new PiEngineSession(
       session,
       {
         type: "conversation",
@@ -87,8 +106,10 @@ export class PiEngine implements Engine {
         ...(options.resume && !previous ? { lostPrevious: true } : {}),
       },
       { piProvider: PI_PROVIDERS[this.deps.provider.type], onQuestion: options.onQuestion },
+      tasks,
       options.onArchiveFile,
     );
+    return opened;
   }
 
   // Pi's session creation succeeds with no model or credential and fails only at the first prompt.
@@ -216,6 +237,8 @@ interface RunningTurn {
   startedAt: number;
   promptStarted: boolean;
   ended: boolean;
+  wrapped: boolean;
+  endsOnSettle: boolean;
   /** Re-applied at agent_start, in case the Stop landed before there was a run to abort. */
   stopRequested: boolean;
   /** Cleared by a later successful call, so a retried call is not the Turn's error. */
@@ -241,11 +264,15 @@ class PiEngineSession implements EngineSession {
   private readonly unsubscribe: () => void;
   private questions = new AbortController();
   private ownQuestions = 0;
+  private unclaimedUsage: EngineUsage | undefined;
+  private compacting = false;
+  private readonly deferredWakes: FinishedTask[] = [];
 
   constructor(
     private readonly session: AgentSession,
     conversation: Extract<EngineEvent, { type: "conversation" }>,
     private readonly asking: { piProvider: string; onQuestion: OpenOptions["onQuestion"] },
+    private readonly tasks: TaskRegistry,
     private readonly onArchiveFile?: OpenOptions["onArchiveFile"],
   ) {
     if (conversation.resumed) this.outbox.push(conversation);
@@ -294,13 +321,61 @@ class PiEngineSession implements EngineSession {
     } else {
       for (const _ of queued) this.reportUnrun("command", "stopped");
     }
+    this.tasks.stopAll();
   }
 
-  async killTask(): Promise<void> {}
+  async killTask(taskId: string): Promise<void> {
+    this.tasks.kill(taskId);
+  }
+
+  report(event: EngineEvent): void {
+    this.outbox.push(event);
+  }
+
+  finished(task: FinishedTask): void {
+    if (this.closed) return;
+    if (task.usage) this.addChildUsage(task.usage, task.delivery === "run");
+    if (task.delivery === "run") this.wake(task);
+    else if (task.delivery === "note") this.leaveNote(task);
+  }
+
+  private addChildUsage(usage: Usage, wakes: boolean): void {
+    const provider = this.session.model?.provider;
+    const turn = this.turn;
+    if (turn && !turn.ended) turn.usage = this.addBilled(turn.usage, usage, provider);
+    else if (wakes) this.unclaimedUsage = this.addBilled(this.unclaimedUsage, usage, provider);
+  }
+
+  private leaveNote(task: FinishedTask): void {
+    this.session
+      .sendCustomMessage(this.taskMessage(task), { deliverAs: "nextTurn" })
+      .catch((e: unknown) => this.outbox.push({ type: "status", text: `could not note the stopped task: ${messageOf(e)}` }));
+  }
+
+  private taskMessage(task: FinishedTask) {
+    return {
+      customType: "background-task",
+      content: `Background task ${task.taskId} (${task.description}) ${task.status}: ${task.summary}`,
+      display: true,
+    };
+  }
+
+  private wake(task: FinishedTask): void {
+    if (this.compacting) {
+      this.deferredWakes.push(task);
+      return;
+    }
+    const message = this.taskMessage(task);
+    const joinsRun = this.session.isStreaming;
+    this.session
+      .sendCustomMessage(message, joinsRun ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: true })
+      .catch((e: unknown) => this.outbox.push({ type: "status", text: `could not wake the model: ${messageOf(e)}` }));
+  }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.tasks.close();
     this.questions.abort();
     this.waiting.length = 0;
     this.steering = undefined;
@@ -311,22 +386,25 @@ class PiEngineSession implements EngineSession {
     this.outbox.close();
   }
 
-  private startTurn(cause: "command" | "steer"): RunningTurn {
+  private startTurn(cause: "command" | "steer" | "engine", wrapped: boolean): RunningTurn {
     const turn: RunningTurn = {
       startedAt: Date.now(),
       promptStarted: false,
       ended: false,
+      wrapped,
+      endsOnSettle: false,
       stopRequested: false,
       modelError: undefined,
-      usage: undefined,
+      usage: this.unclaimedUsage,
     };
+    this.unclaimedUsage = undefined;
     this.turn = turn;
     this.outbox.push({ type: "turn_started", cause });
     return turn;
   }
 
   private async run(text: string, cause: "command" | "steer"): Promise<void> {
-    const turn = this.startTurn(cause);
+    const turn = this.startTurn(cause, true);
     this.questions = new AbortController();
     const trimmed = text.trim();
     const compact = /^\/compact(?:\s+([\s\S]*))?$/.exec(trimmed);
@@ -340,6 +418,13 @@ class PiEngineSession implements EngineSession {
     else if (word === "reload") await this.reload(turn);
     else if (word === "export") await this.exportSession(turn);
     else await this.prompt(turn, text);
+    const current = this.turn;
+    if (current && !current.ended && !current.wrapped) return;
+    await this.afterTurn();
+  }
+
+  private async afterTurn(): Promise<void> {
+    if (this.turn && !this.turn.ended) return;
     const missed = this.steering;
     this.steering = undefined;
     const missedRefusal = missed && (await missed.queued);
@@ -355,9 +440,11 @@ class PiEngineSession implements EngineSession {
     }
     const next = this.waiting.shift();
     if (next !== undefined) void this.run(next, "command");
+    else for (const task of this.deferredWakes.splice(0)) this.wake(task);
   }
 
   private async prompt(turn: RunningTurn, text: string): Promise<void> {
+    turn.endsOnSettle = true;
     let refusal: string | undefined;
     try {
       await this.session.prompt(text);
@@ -370,11 +457,14 @@ class PiEngineSession implements EngineSession {
 
   // Pi's /compact is its terminal's own; prompt() would send it to the model as text.
   private async compact(turn: RunningTurn, instructions: string | undefined): Promise<void> {
+    this.compacting = true;
     try {
       await this.session.compact(instructions);
       this.endTurn(turn, "success");
     } catch {
       this.endTurn(turn, turn.stopRequested ? "stopped" : "error");
+    } finally {
+      this.compacting = false;
     }
   }
 
@@ -510,8 +600,13 @@ class PiEngineSession implements EngineSession {
   }
 
   private handle(event: AgentSessionEvent): void {
-    const turn = this.turn;
-    if (!turn || turn.ended) return;
+    let turn = this.turn;
+    if (!turn || turn.ended) {
+      if (event.type !== "agent_start" || this.closed) return;
+      turn = this.startTurn("engine", false);
+      turn.promptStarted = true;
+      turn.endsOnSettle = true;
+    }
     // Pi writes a message to disk only after emitting its message_end.
     this.announceOnceOnDisk();
     switch (event.type) {
@@ -527,7 +622,9 @@ class PiEngineSession implements EngineSession {
         }
         this.steering = undefined;
         this.endTurn(turn, turn.modelError ? "error" : "success", turn.modelError);
-        this.startTurn("steer").promptStarted = true;
+        const next = this.startTurn("steer", turn.wrapped);
+        next.promptStarted = true;
+        next.endsOnSettle = true;
         return;
 
       case "message_end": {
@@ -579,10 +676,12 @@ class PiEngineSession implements EngineSession {
       }
 
       case "agent_settled":
+        if (!turn.endsOnSettle) return;
         // An aborted model call ends with stopReason "error", so only the settle tells a Stop from a failure.
         if (event.aborted) this.endTurn(turn, "stopped");
         else if (turn.modelError) this.endTurn(turn, "error", turn.modelError);
         else this.endTurn(turn, "success");
+        if (!turn.wrapped) setImmediate(() => void this.afterTurn());
         return;
     }
   }

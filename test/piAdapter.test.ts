@@ -13,7 +13,7 @@ import {
   SHOW_IMAGE_CALL,
   type EngineGuaranteeHarness,
 } from "./engineGuaranteeSuite.ts";
-import { answeringByPrompt, callingTools, FAUX_MODEL, piEngineOn, untilAborted, writePiSettings } from "./piDoubles.ts";
+import { answeringByPrompt, callingTools, FAUX_MODEL, piEngineOn, startingShell, untilAborted, writePiSettings } from "./piDoubles.ts";
 
 after(() => writePiSettings({}));
 
@@ -35,6 +35,11 @@ const harness: EngineGuaranteeHarness = {
     ]);
     return releasedBySteer(engine, steered);
   },
+  killsBackgroundTasks: true,
+  makeBackgroundTaskEngine: () => piEngineOn([startingShell("sleep 30"), untilAborted]).engine,
+  makeWakingBackgroundTaskEngine: () =>
+    piEngineOn([startingShell("sleep 0.3"), fauxAssistantMessage("started it"), fauxAssistantMessage("it finished")])
+      .engine,
   makeShowImageEngine: () => {
     const { toolUseId: id, path, caption } = SHOW_IMAGE_CALL;
     const model = callingTools([{ name: "show_image", args: { path, caption: caption! }, id }]);
@@ -266,13 +271,6 @@ test("PiEngine: Stop right after a Steer ends the Turn and the Steer with it, an
     "the Steer is reported as stopped, so whoever sent it hears how it ended",
   );
   assert.deepEqual(model.prompts, ["after"], "the Steer was not prepended to the next Command");
-  await session.close();
-});
-
-test("PiEngine: Pi has no Background tasks, so killTask does nothing", async () => {
-  const pi = piEngineOn([]);
-  const session = await pi.engine.open(openOptions(pi.projectDir));
-  await session.killTask("anything");
   await session.close();
 });
 

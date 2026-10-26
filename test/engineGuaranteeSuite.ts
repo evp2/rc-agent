@@ -52,6 +52,8 @@ export interface EngineGuaranteeHarness {
   makeSteerableEngine(): Engine;
   /** A Turn that starts one Background task (id `"bg-1"`) and then hangs open until `stop()` lands. */
   makeBackgroundTaskEngine?(): Engine;
+  killsBackgroundTasks?: boolean;
+  makeWakingBackgroundTaskEngine?(): Engine;
   /**
    * A Turn whose model calls `show_image` as {@link SHOW_IMAGE_CALL}, the
    * way the Engine's SDK really would, then finishes once the call has
@@ -221,6 +223,74 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
     const settled = events.find((e) => e.type === "task_settled");
     assert.ok(settled, "the Background task was reported settled once Stop landed");
     assert.equal((settled as Extract<EngineEvent, { type: "task_settled" }>).status, "stopped");
+    await session.close();
+  });
+
+  test(`${name}: Kill ends one Background task and the Turn keeps running`, { skip: !harness.killsBackgroundTasks }, async () => {
+    const session = await harness.makeBackgroundTaskEngine!().open(openOptions());
+    const it = session.events[Symbol.asyncIterator]();
+    session.send("kick off a background task");
+    const [started] = (await readUntil(it, (e) => e.type === "task_started")).slice(-1) as [
+      Extract<EngineEvent, { type: "task_started" }>,
+    ];
+    await session.killTask(started.taskId);
+    const killed = await readUntil(it, (e) => e.type === "task_settled");
+    const settled = killed.at(-1) as Extract<EngineEvent, { type: "task_settled" }>;
+    assert.equal(settled.taskId, started.taskId);
+    assert.equal(settled.status, "stopped");
+    assert.equal(killed.some(turnEnded), false, "the Turn was still running when the task settled");
+    session.stop();
+    const rest = await readUntil(it, turnEnded);
+    assert.equal(rest.filter((e) => e.type === "task_settled").length, 0, "the task settled once only");
+    assert.equal(rest.filter(turnEnded)[0].outcome, "stopped", "the Turn had been running until Stop");
+    await session.close();
+  });
+
+  test(`${name}: Kill of an unknown or already settled task id does nothing`, { skip: !harness.killsBackgroundTasks }, async () => {
+    const session = await harness.makeBackgroundTaskEngine!().open(openOptions());
+    const it = session.events[Symbol.asyncIterator]();
+    session.send("kick off a background task");
+    const started = (await readUntil(it, (e) => e.type === "task_started")).at(-1) as Extract<
+      EngineEvent,
+      { type: "task_started" }
+    >;
+    await session.killTask("no-such-task");
+    await session.killTask(started.taskId);
+    await readUntil(it, (e) => e.type === "task_settled");
+    await session.killTask(started.taskId);
+    session.stop();
+    const rest = await readUntil(it, turnEnded);
+    assert.equal(rest.filter((e) => e.type === "task_settled").length, 0, "nothing settled a second time");
+    assert.equal(rest.filter(turnEnded)[0].outcome, "stopped");
+    await session.close();
+  });
+
+  test(`${name}: Stop settles every live Background task stopped before the Turn's end, once`, { skip: !harness.killsBackgroundTasks }, async () => {
+    const session = await harness.makeBackgroundTaskEngine!().open(openOptions());
+    const it = session.events[Symbol.asyncIterator]();
+    session.send("kick off a background task");
+    await readUntil(it, (e) => e.type === "task_started");
+    session.stop();
+    const events = await readUntil(it, turnEnded);
+    const settles = events.filter((e) => e.type === "task_settled");
+    assert.equal(settles.length, 1);
+    assert.equal((settles[0] as Extract<EngineEvent, { type: "task_settled" }>).status, "stopped");
+    assert.ok(events.indexOf(settles[0]) < events.findIndex(turnEnded), "settled before the Turn's end");
+    await session.close();
+  });
+
+  test(`${name}: a Background task finishing after the Turn opens a Turn caused by the Engine, paired start to end`, { skip: !harness.makeWakingBackgroundTaskEngine }, async () => {
+    const session = await harness.makeWakingBackgroundTaskEngine!().open(openOptions());
+    const it = session.events[Symbol.asyncIterator]();
+    session.send("start something and finish");
+    const first = await readUntil(it, turnEnded);
+    assert.equal(first.filter(turnStarted).length, 1);
+    const woken = await readUntil(it, turnEnded);
+    const starts = woken.filter(turnStarted);
+    assert.equal(starts.length, 1, "exactly one Turn started by itself");
+    assert.equal(starts[0].cause, "engine");
+    assert.equal(woken.filter(turnEnded).length, 1);
+    assert.ok(woken.findIndex(turnStarted) < woken.findIndex(turnEnded));
     await session.close();
   });
 

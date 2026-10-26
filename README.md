@@ -92,6 +92,18 @@ or `max`; without it, Pi's own default applies. The connector refuses to start,
 before printing a phone URL, when Pi has no model, no credential for it, or a
 model on another provider.
 
+Pi has no background shell or subagent of its own, so the connector gives the
+model a `bash_background` tool and a `subagent` tool. A command or subagent it
+starts is a Background task: it gets a card and a place in the tray, Kill ends
+it, and when it finishes the model picks the conversation back up on its own,
+without a push. A `subagent` call waits for the answer unless the model asks
+for it in the background. A subagent is a separate `pi` process in the same
+directory on the session's model, with Pi's file and shell tools only: no
+questions, images, codemode, MCP or saved session, and its tool calls stay off
+the phone. Its token usage counts toward the Turn that receives its result. At
+most four tasks run at once, shells and subagents together. Stop, and stopping
+the connector, end any still running.
+
 ### Anthropic provider (claude.ai subscription or API key)
 
 ```json

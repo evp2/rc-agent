@@ -2,6 +2,7 @@ import type { Options, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/c
 
 import { AsyncQueue, takeOne } from "../src/asyncQueue.ts";
 import type { ClaudeEngineDeps } from "../src/engine/claude/adapter.ts";
+import { taskNotification } from "./claudeDoubles.ts";
 
 export interface ReactiveScript {
   /**
@@ -13,6 +14,7 @@ export interface ReactiveScript {
    * short by the next thing that arrives (a Steer) or by an abort (a Stop).
    */
   subTurns: SDKMessage[][];
+  selfStarted?: SDKMessage[];
   /** After the last group finishes, hang until the abort signal fires -- models a still-open query with a Background task keeping it alive. */
   hangAfterLast?: boolean;
 }
@@ -27,6 +29,8 @@ export interface ReactiveScript {
 export function reactiveQuery(script: ReactiveScript): ClaudeEngineDeps["query"] {
   return ({ prompt, options }: { prompt: string | AsyncIterable<SDKUserMessage>; options?: Options }): Query => {
     const signal = options?.abortController?.signal;
+    const liveTasks = new Set<string>();
+    const stoppedTasks = new AsyncQueue<SDKMessage>();
 
     const gen = (async function* (): AsyncGenerator<SDKMessage, void> {
       let mailbox: AsyncQueue<SDKUserMessage> | undefined;
@@ -39,17 +43,33 @@ export function reactiveQuery(script: ReactiveScript): ClaudeEngineDeps["query"]
         })();
       }
 
+      const track = (m: SDKMessage): SDKMessage => {
+        if (m.type === "system" && m.subtype === "task_started") liveTasks.add(m.task_id);
+        if (m.type === "system" && m.subtype === "task_notification") liveTasks.delete(m.task_id);
+        return m;
+      };
+
       let cursor = 0;
       for (;;) {
         const group = script.subTurns[cursor] ?? [];
-        for (const m of group) yield m;
+        for (const m of group) yield track(m);
         cursor += 1;
         if (cursor >= script.subTurns.length) {
+          if (script.selfStarted) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            for (const m of script.selfStarted) yield track(m);
+          }
           if (script.hangAfterLast) {
-            await new Promise<void>((resolve) => {
+            const aborted = new Promise<void>((resolve) => {
               if (!signal || signal.aborted) return resolve();
               signal.addEventListener("abort", () => resolve(), { once: true });
             });
+            const stopped = stoppedTasks[Symbol.asyncIterator]();
+            for (;;) {
+              const next = await Promise.race([aborted.then(() => undefined), stopped.next()]);
+              if (!next || next.done) break;
+              yield track(next.value);
+            }
           }
           return;
         }
@@ -67,7 +87,9 @@ export function reactiveQuery(script: ReactiveScript): ClaudeEngineDeps["query"]
       return: (v?: void) => gen.return(v),
       throw: (e?: unknown) => gen.throw(e),
       supportedCommands: async () => [],
-      stopTask: async () => undefined,
+      stopTask: async (taskId: string) => {
+        if (liveTasks.has(taskId)) stoppedTasks.push(taskNotification(taskId, "stopped"));
+      },
       getContextUsage: async () => ({ percentage: 42 }),
     } as unknown as Query;
   };

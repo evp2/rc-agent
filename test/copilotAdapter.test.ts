@@ -95,6 +95,7 @@ const harness: EngineGuaranteeHarness = {
       }),
     ),
 
+  killsBackgroundTasks: true,
   makeBackgroundTaskEngine: () =>
     engineOn(
       new FakeCopilotRuntime({
@@ -111,6 +112,19 @@ const harness: EngineGuaranteeHarness = {
         },
       }),
     ),
+
+  makeWakingBackgroundTaskEngine: () => {
+    const { turn, wakeUp } = backgroundComplete();
+    return engineOn(
+      new FakeCopilotRuntime({
+        onSend: (s) => {
+          s.tasks = recordedTasks();
+          s.emit(turn);
+          setTimeout(() => s.emit(wakeUp), 20);
+        },
+      }),
+    );
+  },
 
   makeShowImageEngine: () => {
     const { toolUseId, path, caption } = SHOW_IMAGE_CALL;

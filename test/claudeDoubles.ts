@@ -89,6 +89,18 @@ export function taskStarted(taskId = "task-1"): SDKMessage {
   } as unknown as SDKMessage;
 }
 
+export function taskNotification(taskId = "task-1", status: "completed" | "failed" | "stopped" = "completed"): SDKMessage {
+  return {
+    type: "system",
+    subtype: "task_notification",
+    task_id: taskId,
+    tool_use_id: "tool-1",
+    status,
+    summary: "a long-running background task",
+    output_file: "",
+  } as unknown as SDKMessage;
+}
+
 /**
  * A Query over a fixed message list. `onStreamInput` fires when a Steer is
  * streamed in, which is what lets a test decide -- deterministically, rather

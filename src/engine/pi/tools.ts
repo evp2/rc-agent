@@ -10,6 +10,7 @@ import {
   SHOW_IMAGE_PATH_DESCRIPTION,
 } from "../showImageTool";
 import type { EngineAnswer, EngineQuestion, OpenOptions } from "../types";
+import type { TaskRegistry } from "./backgroundTasks";
 
 export const QUESTION_TOOL = "ask_user_question";
 
@@ -101,9 +102,64 @@ function archiveFileTool(onArchiveFile: NonNullable<OpenOptions["onArchiveFile"]
   });
 }
 
-export function connectorTools(options: OpenOptions): ToolDefinition[] {
+const BASH_BACKGROUND_DESCRIPTION =
+  "Run a shell command in the background and return at once with a task id. Use it for a dev server, a long " +
+  "build or any command you do not need to wait for. The command keeps running after this turn ends; when it " +
+  "exits you are woken with its exit status and the last of its output. At most four background tasks run at a time.";
+
+function bashBackgroundTool(tasks: TaskRegistry): ToolDefinition {
+  return defineTool({
+    name: "bash_background",
+    label: "Background shell",
+    description: BASH_BACKGROUND_DESCRIPTION,
+    parameters: Type.Object({
+      command: Type.String({ description: "The shell command to run." }),
+      description: Type.Optional(Type.String({ description: "A few words saying what the command is for." })),
+    }),
+    execute: async (toolCallId, { command, description }) => {
+      const started = tasks.startShell(toolCallId, command, description);
+      if (!started.ok) return text(started.reason, true);
+      return text(`Started background task ${started.taskId}. You will be woken with the result when it finishes.`);
+    },
+  });
+}
+
+const SUBAGENT_DESCRIPTION =
+  "Hand a self-contained job to a subagent: a separate agent with its own context that works in the same project " +
+  "and has the file and shell tools, but cannot ask the human questions. Give it everything it needs in the prompt, " +
+  "since it sees nothing of this conversation. By default the call waits and returns the subagent's final answer. " +
+  "With background true it returns a task id at once, runs while you carry on, and wakes you with its answer when " +
+  "it finishes. At most four background tasks run at a time.";
+
+function subagentTool(tasks: TaskRegistry): ToolDefinition {
+  return defineTool({
+    name: "subagent",
+    label: "Subagent",
+    description: SUBAGENT_DESCRIPTION,
+    parameters: Type.Object({
+      prompt: Type.String({ description: "The full instructions for the subagent." }),
+      description: Type.String({ description: "A few words saying what the subagent is for." }),
+      background: Type.Optional(
+        Type.Boolean({ description: "Return a task id at once instead of waiting for the answer. Defaults to false." }),
+      ),
+    }),
+    execute: async (toolCallId, { prompt, description, background }) => {
+      const started = tasks.startSubagent(toolCallId, prompt, description, !background);
+      if (!started.ok) return text(started.reason, true);
+      if (background) return text(`Started background task ${started.taskId}. You will be woken with the result when it finishes.`);
+      const done = await started.finished;
+      return done.status === "completed"
+        ? text(done.summary)
+        : text(`Subagent ${done.taskId} ${done.status}: ${done.summary}`, true);
+    },
+  });
+}
+
+export function connectorTools(options: OpenOptions, tasks: TaskRegistry): ToolDefinition[] {
   return [
     questionTool(options.onQuestion),
+    bashBackgroundTool(tasks),
+    subagentTool(tasks),
     ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
     ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile)] : []),
   ];

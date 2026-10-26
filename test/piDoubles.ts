@@ -19,6 +19,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
+import { fileURLToPath } from "node:url";
+
 import { PiEngine } from "../src/engine/pi/adapter.ts";
 import type { PiProviderConfig } from "../src/provider.ts";
 
@@ -32,6 +34,8 @@ for (const key of Object.keys(process.env)) {
     delete process.env[key];
   }
 }
+
+const FAKE_PI = fileURLToPath(new URL("./fixtures/fakePi.mjs", import.meta.url));
 
 export const FAUX_MODEL = "faux-model";
 export const FOREIGN_MODEL = "foreign-model";
@@ -64,6 +68,7 @@ export function piEngineOn(
     subscription?: boolean;
     homeDir?: string;
     projectDir?: string;
+    realChild?: boolean;
   } = {},
 ): PiTestEngine {
   const faux = fauxProvider({
@@ -77,6 +82,7 @@ export function piEngineOn(
     provider: options.provider ?? { type: "anthropic", model: FAUX_MODEL },
     projectDir,
     homeDir: options.homeDir ?? freshProjectDir(),
+    ...(options.realChild ? {} : { subagentCommand: { command: process.execPath, args: [FAKE_PI] } }),
     createModelRuntime: async () => {
       const credentials = new InMemoryCredentialStore();
       if (options.subscription) {
@@ -206,4 +212,39 @@ function priced(provider: Provider, { subscription }: { subscription: boolean })
     stream: (model, context, options) => withCost(model, provider.stream(model, context, options)),
     streamSimple: (model, context, options) => withCost(model, provider.streamSimple(model, context, options)),
   };
+}
+
+export function startingShell(command: string, id = "call-bg", description?: string): FauxResponseStep {
+  return fauxAssistantMessage(
+    fauxToolCall("bash_background", { command, ...(description ? { description } : {}) }, { id }),
+    { stopReason: "toolUse" },
+  );
+}
+
+export interface ChildPlan {
+  say?: string;
+  delayMs?: number;
+  hang?: boolean;
+  ignoreTerm?: boolean;
+  inner?: boolean;
+  exit?: number;
+  stderr?: string;
+  record?: string;
+  usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+}
+
+export function subagentCall(plan: ChildPlan, options: { id?: string; description?: string; background?: boolean } = {}) {
+  return fauxToolCall(
+    "subagent",
+    {
+      prompt: JSON.stringify(plan),
+      description: options.description ?? "a subagent",
+      ...(options.background === undefined ? {} : { background: options.background }),
+    },
+    { id: options.id ?? "call-sub" },
+  );
+}
+
+export function startingSubagent(plan: ChildPlan, options: { id?: string; description?: string; background?: boolean } = {}): FauxResponseStep {
+  return fauxAssistantMessage(subagentCall(plan, options), { stopReason: "toolUse" });
 }
