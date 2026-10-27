@@ -2,7 +2,14 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { ENGINE_KINDS, type EngineKind } from "./engine/types";
-import { PI_THINKING_LEVELS, type PiProviderConfig, type PiThinkingLevel, type ProviderConfig } from "./provider";
+import {
+  PI_THINKING_LEVELS,
+  type PiProviderConfig,
+  type PiThinkingLevel,
+  type ProviderConfig,
+  type SubagentProfile,
+  type SubagentProfiles,
+} from "./provider";
 
 /**
  * The connector always runs with permissions bypassed, and this is not
@@ -140,14 +147,20 @@ export function loadConfig(path: string): ConnectorConfig {
 
   const engine = optionalEngine(c, providerType as ProviderConfig["type"]);
 
+  if (engine !== "pi" && p.subagents !== undefined) {
+    throw new Error("'provider.subagents' is only supported by the pi engine");
+  }
+
   let provider: ProviderConfig | PiProviderConfig;
   if (engine === "pi") {
     const model = optionalString(p, "model");
     const thinkingLevel = optionalThinkingLevel(p);
+    const subagents = optionalSubagents(p);
     provider = {
       type: providerType as ProviderConfig["type"],
       ...(model ? { model } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
+      ...(subagents ? { subagents } : {}),
     };
   } else if (providerType === "anthropic") {
     provider = {
@@ -212,15 +225,68 @@ export function loadConfig(path: string): ConnectorConfig {
 
 const PROVIDER_TYPES = ["anthropic", "bedrock", "copilot"] as const satisfies readonly ProviderConfig["type"][];
 
-function optionalThinkingLevel(obj: Record<string, unknown>): PiThinkingLevel | undefined {
+function optionalThinkingLevel(obj: Record<string, unknown>, path = "provider.thinkingLevel"): PiThinkingLevel | undefined {
   const value = obj.thinkingLevel;
   if (value === undefined) return undefined;
   if (!(PI_THINKING_LEVELS as readonly unknown[]).includes(value)) {
     throw new Error(
-      `'provider.thinkingLevel' must be one of: ${PI_THINKING_LEVELS.join(", ")} (got ${JSON.stringify(value)})`,
+      `'${path}' must be one of: ${PI_THINKING_LEVELS.join(", ")} (got ${JSON.stringify(value)})`,
     );
   }
   return value as PiThinkingLevel;
+}
+
+function optionalSubagents(provider: Record<string, unknown>): SubagentProfiles | undefined {
+  const raw = provider.subagents;
+  if (raw === undefined) return undefined;
+  const subagents = requireObject(raw, "provider.subagents");
+  rejectUnknownKeys(subagents, ["default", "profiles"], "provider.subagents");
+  const result: SubagentProfiles = {};
+  if (subagents.default !== undefined) {
+    result.default = parseProfile(subagents.default, "provider.subagents.default");
+  }
+  if (subagents.profiles !== undefined) {
+    const profiles = requireObject(subagents.profiles, "provider.subagents.profiles");
+    if ("default" in profiles) {
+      throw new Error(
+        "'provider.subagents.profiles' can't have a profile named 'default'; set 'provider.subagents.default' instead",
+      );
+    }
+    result.profiles = Object.fromEntries(
+      Object.entries(profiles).map(([name, value]) => [
+        name,
+        parseProfile(value, `provider.subagents.profiles.${name}`),
+      ]),
+    );
+  }
+  return result;
+}
+
+function parseProfile(raw: unknown, path: string): SubagentProfile {
+  const obj = requireObject(raw, path);
+  rejectUnknownKeys(obj, ["model", "thinkingLevel", "description"], path);
+  const model = optionalString(obj, "model");
+  const description = optionalString(obj, "description");
+  const thinkingLevel = optionalThinkingLevel(obj, `${path}.thinkingLevel`);
+  return {
+    ...(model ? { model } : {}),
+    ...(thinkingLevel ? { thinkingLevel } : {}),
+    ...(description ? { description } : {}),
+  };
+}
+
+function requireObject(value: unknown, path: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`'${path}' must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function rejectUnknownKeys(obj: Record<string, unknown>, allowed: string[], path: string): void {
+  const unknown = Object.keys(obj).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) {
+    throw new Error(`'${path}' has unknown ${unknown.length > 1 ? "keys" : "key"}: ${unknown.join(", ")}`);
+  }
 }
 
 function optionalEngine(obj: Record<string, unknown>, providerType: ProviderConfig["type"]): EngineKind | undefined {

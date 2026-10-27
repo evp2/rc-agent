@@ -9,9 +9,11 @@ import { fauxAssistantMessage, type FauxResponseStep, type JsonObject, type Usag
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import type { EngineAnswer, EngineEvent, EngineUsage } from "../src/engine/types.ts";
+import type { PiProviderConfig } from "../src/provider.ts";
 import {
   callingTools,
   type ChildPlan,
+  FOREIGN_MODEL,
   piEngineOn,
   startingShell,
   startingSubagent,
@@ -424,6 +426,105 @@ test("PiEngine: the child gets the session's directory, model and credentials-be
   await session.close();
 });
 
+async function childFlags(provider: PiProviderConfig, profile?: string): Promise<(name: string) => string | undefined> {
+  const record = recordFile();
+  const { session, it } = await openSession(
+    [startingSubagent({ say: "ok", record }, { profile }), fauxAssistantMessage("fine")],
+    { provider, otherModels: [{ id: "cheap-model" }, { id: "careful-model" }] },
+  );
+  session.send("go");
+  await readUntil(it, isTurnEnd);
+  await session.close();
+  const child = recorded(record)!;
+  return (name) => child.argv[child.argv.indexOf(name) + 1];
+}
+
+const PARENT = { type: "anthropic", model: "faux-model" } as const;
+
+test("PiEngine: a subagent that names no profile gets the default profile's model and thinking level", async () => {
+  const flag = await childFlags({
+    ...PARENT,
+    subagents: { default: { model: "anthropic/cheap-model", thinkingLevel: "low" } },
+  });
+  assert.equal(flag("--model"), "anthropic/cheap-model");
+  assert.equal(flag("--thinking"), "low");
+});
+
+test("PiEngine: a subagent that names a profile gets that profile, not the default", async () => {
+  const flag = await childFlags(
+    {
+      ...PARENT,
+      subagents: {
+        default: { model: "anthropic/cheap-model", thinkingLevel: "low" },
+        profiles: { review: { model: "anthropic/careful-model", thinkingLevel: "high" } },
+      },
+    },
+    "review",
+  );
+  assert.equal(flag("--model"), "anthropic/careful-model");
+  assert.equal(flag("--thinking"), "high");
+});
+
+test("PiEngine: a profile that sets only a thinking level keeps the session's model", async () => {
+  const flag = await childFlags({ ...PARENT, subagents: { default: { thinkingLevel: "minimal" } } });
+  assert.equal(flag("--model"), "anthropic/faux-model");
+  assert.equal(flag("--thinking"), "minimal");
+});
+
+test("PiEngine: naming a profile that isn't configured is a tool error listing the ones that are, and starts no child", async () => {
+  const record = recordFile();
+  const { session, it } = await openSession(
+    [startingSubagent({ say: "ok", record }, { profile: "nope" }), fauxAssistantMessage("fine")],
+    { provider: { ...PARENT, subagents: { profiles: { review: {}, quick: {} } } } },
+  );
+  session.send("go");
+  const events = await readUntil(it, isTurnEnd);
+  const result = only(events, "tool_result");
+  assert.equal(result.isError, true);
+  assert.match(result.text ?? "", /no subagent profile 'nope'.*review.*quick/);
+  assert.equal(recorded(record), undefined);
+  await session.close();
+});
+
+async function subagentToolSeenByModel(provider: PiProviderConfig) {
+  interface DeclaredTool {
+    name: string;
+    description: string;
+    parameters: { properties: Record<string, unknown> };
+  }
+  let seen: DeclaredTool | undefined;
+  const { session, it } = await openSession(
+    [
+      (context) => {
+        const declared = (context.messages[0] as unknown as { toolsAdded: DeclaredTool[] }).toolsAdded;
+        seen = declared.find((tool) => tool.name === "subagent");
+        return fauxAssistantMessage("fine");
+      },
+    ],
+    { provider },
+  );
+  session.send("go");
+  await readUntil(it, isTurnEnd);
+  await session.close();
+  assert.ok(seen, "the model was offered the subagent tool");
+  return seen;
+}
+
+test("PiEngine: with no profiles configured the subagent tool has no profile parameter", async () => {
+  const tool = await subagentToolSeenByModel(PARENT);
+  assert.equal("profile" in tool.parameters.properties, false);
+});
+
+test("PiEngine: with profiles configured the subagent tool lists each one by name and description", async () => {
+  const tool = await subagentToolSeenByModel({
+    ...PARENT,
+    subagents: { profiles: { review: { description: "Careful code review" }, quick: {} } },
+  });
+  assert.ok("profile" in tool.parameters.properties);
+  assert.match(tool.description, /review: Careful code review/);
+  assert.match(tool.description, /quick/);
+});
+
 test("PiEngine: a real pi child accepts the connector's flags and leaves the session list alone", { timeout: 30_000 }, async () => {
   const sessions = join(process.env.PI_CODING_AGENT_DIR!, "sessions");
   const count = () => (existsSync(sessions) ? readdirSync(sessions, { recursive: true }).filter((f) => String(f).endsWith(".jsonl")).length : 0);
@@ -450,6 +551,21 @@ test("PiEngine: the child's usage is added to the Turn that waited for it", asyn
   const events = await readUntil(it, isTurnEnd);
   assertUsage(only(events, "turn_ended").usage, expectedUsage(parentUsage(pi.projectDir, conversationId(events))));
   await session.close();
+});
+
+test("PiEngine: a child on a metered provider keeps its dollar figure when the session itself is on a subscription login", async () => {
+  const { session, it } = await openSession(
+    [startingSubagent({ say: "done", usage: CHILD_USAGE }, { profile: "metered" }), fauxAssistantMessage("fine")],
+    {
+      subscription: true,
+      foreignProviders: ["amazon-bedrock"],
+      provider: { ...PARENT, subagents: { profiles: { metered: { model: `amazon-bedrock/${FOREIGN_MODEL}` } } } },
+    },
+  );
+  session.send("go");
+  const usage = only(await readUntil(it, isTurnEnd), "turn_ended").usage;
+  await session.close();
+  assert.equal(usage?.costUsd, CHILD_USAGE.cost);
 });
 
 test("PiEngine: a background child's usage goes to the Turn open when it settles", async () => {

@@ -233,18 +233,25 @@ export interface ChildPlan {
   usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
 }
 
-export function subagentCall(plan: ChildPlan, options: { id?: string; description?: string; background?: boolean } = {}) {
+export function subagentCall(
+  plan: ChildPlan,
+  options: { id?: string; description?: string; background?: boolean; profile?: string } = {},
+) {
   return fauxToolCall(
     "subagent",
     {
       prompt: JSON.stringify(plan),
       description: options.description ?? "a subagent",
       ...(options.background === undefined ? {} : { background: options.background }),
+      ...(options.profile === undefined ? {} : { profile: options.profile }),
     },
     { id: options.id ?? "call-sub" },
   );
 }
 
-export function startingSubagent(plan: ChildPlan, options: { id?: string; description?: string; background?: boolean } = {}): FauxResponseStep {
+export function startingSubagent(
+  plan: ChildPlan,
+  options: { id?: string; description?: string; background?: boolean; profile?: string } = {},
+): FauxResponseStep {
   return fauxAssistantMessage(subagentCall(plan, options), { stopReason: "toolUse" });
 }

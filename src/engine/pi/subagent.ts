@@ -3,6 +3,8 @@ import { fileURLToPath } from "node:url";
 
 import type { Usage } from "@earendil-works/pi-ai";
 
+import type { SubagentProfiles } from "../../provider";
+
 export interface SubagentCommand {
   command: string;
   args: string[];
@@ -14,6 +16,19 @@ export interface SubagentSettings {
 }
 
 const RESULT_CHARS = 8000;
+
+export function subagentSettings(
+  parent: SubagentSettings,
+  profiles: SubagentProfiles | undefined,
+  profile?: string,
+): SubagentSettings | { error: string } {
+  const chosen = profile === undefined ? profiles?.default : profiles?.profiles?.[profile];
+  if (profile !== undefined && !chosen) {
+    const names = Object.keys(profiles?.profiles ?? {});
+    return { error: `There is no subagent profile '${profile}'. Available: ${names.join(", ") || "none"}.` };
+  }
+  return { model: chosen?.model ?? parent.model, thinking: chosen?.thinkingLevel ?? parent.thinking };
+}
 
 export function installedPi(): SubagentCommand {
   const entry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));

@@ -98,11 +98,37 @@ starts is a Background task: it gets a card and a place in the tray, Kill ends
 it, and when it finishes the model picks the conversation back up on its own,
 without a push. A `subagent` call waits for the answer unless the model asks
 for it in the background. A subagent is a separate `pi` process in the same
-directory on the session's model, with Pi's file and shell tools only: no
+directory on the session's model and thinking level unless you configure a
+subagent profile (below), with Pi's file and shell tools only: no
 questions, images, codemode, MCP or saved session, and its tool calls stay off
 the phone. Its token usage counts toward the Turn that receives its result. At
 most four tasks run at once, shells and subagents together. Stop, and stopping
 the connector, end any still running.
+
+#### Subagent profiles
+
+A profile picks the model and thinking level a subagent runs on. Without one,
+a subagent inherits the session's current model and thinking level.
+
+```json
+"provider": {
+  "type": "anthropic",
+  "subagents": {
+    "default": { "model": "anthropic/claude-haiku-5-5", "thinkingLevel": "low" },
+    "profiles": {
+      "review": { "model": "anthropic/claude-opus-5-5", "thinkingLevel": "high", "description": "Careful code review" }
+    }
+  }
+}
+```
+
+A subagent that names no profile uses `default`. The `subagent` tool only
+offers a `profile` argument when `profiles` is configured, listing each name and
+its `description`. A profile's `model` is written `provider/id` as
+`pi --list-models` shows it, and may be on any provider the relay accepts; a
+field a profile leaves out is inherited from the session. Every configured model
+is checked when the connector starts, like `provider.model`. A configured model
+stays fixed when you switch the session's model with `/model`.
 
 ### Anthropic provider (claude.ai subscription or API key)
 

@@ -10,6 +10,7 @@ import {
   SHOW_IMAGE_PATH_DESCRIPTION,
 } from "../showImageTool";
 import type { EngineAnswer, EngineQuestion, OpenOptions } from "../types";
+import type { SubagentProfile, SubagentProfiles } from "../../provider";
 import type { TaskRegistry } from "./backgroundTasks";
 
 export const QUESTION_TOOL = "ask_user_question";
@@ -131,20 +132,27 @@ const SUBAGENT_DESCRIPTION =
   "With background true it returns a task id at once, runs while you carry on, and wakes you with its answer when " +
   "it finishes. At most four background tasks run at a time.";
 
-function subagentTool(tasks: TaskRegistry): ToolDefinition {
+function profileDescription(profiles: Record<string, SubagentProfile>): string {
+  const lines = Object.entries(profiles).map(([name, profile]) => `- ${name}${profile.description ? `: ${profile.description}` : ""}`);
+  return `Subagent profiles you can name with \`profile\`; leave it out for the default:\n${lines.join("\n")}`;
+}
+
+function subagentTool(tasks: TaskRegistry, profiles: Record<string, SubagentProfile> | undefined): ToolDefinition {
+  const named = profiles && Object.keys(profiles).length > 0 ? profiles : undefined;
   return defineTool({
     name: "subagent",
     label: "Subagent",
-    description: SUBAGENT_DESCRIPTION,
+    description: named ? `${SUBAGENT_DESCRIPTION}\n\n${profileDescription(named)}` : SUBAGENT_DESCRIPTION,
     parameters: Type.Object({
       prompt: Type.String({ description: "The full instructions for the subagent." }),
       description: Type.String({ description: "A few words saying what the subagent is for." }),
       background: Type.Optional(
         Type.Boolean({ description: "Return a task id at once instead of waiting for the answer. Defaults to false." }),
       ),
+      ...(named ? { profile: Type.Optional(Type.String({ description: "The name of the subagent profile to run it with." })) } : {}),
     }),
-    execute: async (toolCallId, { prompt, description, background }) => {
-      const started = tasks.startSubagent(toolCallId, prompt, description, !background);
+    execute: async (toolCallId, { prompt, description, background, profile }) => {
+      const started = tasks.startSubagent(toolCallId, prompt, description, !background, profile as string | undefined);
       if (!started.ok) return text(started.reason, true);
       if (background) return text(`Started background task ${started.taskId}. You will be woken with the result when it finishes.`);
       const done = await started.finished;
@@ -155,11 +163,11 @@ function subagentTool(tasks: TaskRegistry): ToolDefinition {
   });
 }
 
-export function connectorTools(options: OpenOptions, tasks: TaskRegistry): ToolDefinition[] {
+export function connectorTools(options: OpenOptions, tasks: TaskRegistry, profiles?: SubagentProfiles): ToolDefinition[] {
   return [
     questionTool(options.onQuestion),
     bashBackgroundTool(tasks),
-    subagentTool(tasks),
+    subagentTool(tasks, profiles?.profiles),
     ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
     ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile)] : []),
   ];

@@ -22,10 +22,23 @@ export interface CopilotProviderConfig {
 export const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type PiThinkingLevel = (typeof PI_THINKING_LEVELS)[number];
 
+export interface SubagentProfile {
+  /** Pi's `provider/id` form, as `pi --model` takes it. Absent inherits the session's current model. */
+  model?: string;
+  thinkingLevel?: PiThinkingLevel;
+  description?: string;
+}
+
+export interface SubagentProfiles {
+  default?: SubagentProfile;
+  profiles?: Record<string, SubagentProfile>;
+}
+
 export interface PiProviderConfig {
   type: ProviderConfig["type"];
   model?: string;
   thinkingLevel?: PiThinkingLevel;
+  subagents?: SubagentProfiles;
 }
 
 /** The providers the Claude Engine runs on. */

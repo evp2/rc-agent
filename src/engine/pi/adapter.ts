@@ -36,7 +36,7 @@ import {
 } from "../types";
 import { type FinishedTask, TaskRegistry } from "./backgroundTasks";
 import { chooseEffort, chooseModel } from "./modelCommands";
-import type { SubagentCommand } from "./subagent";
+import { type SubagentCommand, subagentSettings } from "./subagent";
 import { refreshAwsProfileFiles } from "./awsProfile";
 import { connectorTools, QUESTION_TOOL } from "./tools";
 
@@ -85,17 +85,18 @@ export class PiEngine implements Engine {
       (task) => opened?.finished(task),
       {
         ...(this.deps.subagentCommand ? { command: this.deps.subagentCommand } : {}),
-        settings: () => {
+        settings: (profile) => {
           const model = piSession?.model;
           if (!model) throw new Error("the session has no model");
-          return { model: `${model.provider}/${model.id}`, thinking: piSession!.thinkingLevel };
+          const parent = { model: `${model.provider}/${model.id}`, thinking: piSession!.thinkingLevel };
+          return subagentSettings(parent, this.deps.provider.subagents, profile);
         },
       },
     );
     const session = await this.startSession(
       cwd,
       previous ? SessionManager.open(previous) : SessionManager.create(cwd),
-      connectorTools(options, tasks),
+      connectorTools(options, tasks, this.deps.provider.subagents),
     );
     piSession = session;
     opened = new PiEngineSession(
@@ -163,6 +164,7 @@ export class PiEngine implements Engine {
     const chosen = session.model && modelRuntime.getModel(session.model.provider, session.model.id);
     try {
       await checkRunnable(chosen, provider, modelRuntime);
+      await checkSubagentModels(provider, modelRuntime);
       await session.bindExtensions({});
     } catch (e) {
       await endSession(session);
@@ -218,13 +220,48 @@ async function checkRunnable(
         `Set provider.type to '${relayProvider}', or provider.model to a model on ${piProvider}.`,
     );
   }
-  const signedIn =
-    modelRuntime.hasConfiguredAuth(model.provider) || (await modelRuntime.checkAuth(model.provider)) !== undefined;
+  await checkSignedIn(model.provider, modelRuntime);
+}
+
+async function checkSignedIn(piProvider: string, modelRuntime: ModelRuntime): Promise<void> {
+  const signedIn = modelRuntime.hasConfiguredAuth(piProvider) || (await modelRuntime.checkAuth(piProvider)) !== undefined;
   if (!signedIn) {
     throw new Error(
-      `Pi has no credential for '${model.provider}'. Sign in with \`pi\`, then /login ${model.provider}, ` +
+      `Pi has no credential for '${piProvider}'. Sign in with \`pi\`, then /login ${piProvider}, ` +
         "or set the provider's API key in the environment.",
     );
+  }
+}
+
+async function checkSubagentModels(provider: PiProviderConfig, modelRuntime: ModelRuntime): Promise<void> {
+  const { subagents } = provider;
+  const configured: [string, string | undefined][] = [
+    ["provider.subagents.default", subagents?.default?.model],
+    ...Object.entries(subagents?.profiles ?? {}).map(
+      ([name, profile]): [string, string | undefined] => [`provider.subagents.profiles.${name}`, profile.model],
+    ),
+  ];
+  for (const [path, name] of configured) {
+    if (!name) continue;
+    const slash = name.indexOf("/");
+    if (slash <= 0 || slash === name.length - 1) {
+      throw new Error(`${path}.model '${name}' must be written as provider/id, as \`pi --list-models\` shows it.`);
+    }
+    const piProvider = name.slice(0, slash);
+    if (!Object.values(PI_PROVIDERS).includes(piProvider)) {
+      throw new Error(
+        `${path}.model '${name}' is on provider '${piProvider}', which the relay doesn't accept ` +
+          `(only ${Object.values(PI_PROVIDERS).join(", ")}).`,
+      );
+    }
+    if (!modelRuntime.getModel(piProvider, name.slice(slash + 1))) {
+      throw new Error(`${path}.model '${name}' is not a Pi model. Set it to one that \`pi --list-models\` lists.`);
+    }
+    try {
+      await checkSignedIn(piProvider, modelRuntime);
+    } catch (e) {
+      throw new Error(`${path}.model: ${messageOf(e)}`);
+    }
   }
 }
 
@@ -335,13 +372,13 @@ class PiEngineSession implements EngineSession {
 
   finished(task: FinishedTask): void {
     if (this.closed) return;
-    if (task.usage) this.addChildUsage(task.usage, task.delivery === "run");
+    if (task.usage) this.addChildUsage(task.usage, task.delivery === "run", task.piProvider);
     if (task.delivery === "run") this.wake(task);
     else if (task.delivery === "note") this.leaveNote(task);
   }
 
-  private addChildUsage(usage: Usage, wakes: boolean): void {
-    const provider = this.session.model?.provider;
+  private addChildUsage(usage: Usage, wakes: boolean, childProvider?: string): void {
+    const provider = childProvider ?? this.session.model?.provider;
     const turn = this.turn;
     if (turn && !turn.ended) turn.usage = this.addBilled(turn.usage, usage, provider);
     else if (wakes) this.unclaimedUsage = this.addBilled(this.unclaimedUsage, usage, provider);

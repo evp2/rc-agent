@@ -227,3 +227,56 @@ test("a plain-http relayLookupUrl for a non-local host is rejected", () => {
     /relayLookupUrl.*https/,
   );
 });
+
+test("a pi engine keeps subagent profiles: a default and named ones", () => {
+  const subagents = {
+    default: { model: "anthropic/claude-haiku-5-5", thinkingLevel: "low" },
+    profiles: { review: { model: "anthropic/claude-opus-5-5", thinkingLevel: "high", description: "Careful code review" } },
+  };
+  const config = loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "anthropic", subagents } }));
+  assert.deepEqual(config.provider, { type: "anthropic", subagents });
+});
+
+test("subagent profiles reject a misspelt key, naming it and where it was", () => {
+  assert.throws(
+    () =>
+      loadConfig(
+        writeConfig({ ...base, engine: "pi", provider: { type: "anthropic", subagents: { profiles: { fast: { modle: "x" } } } } }),
+      ),
+    { message: "'provider.subagents.profiles.fast' has unknown key: modle" },
+  );
+});
+
+test("a subagent profile rejects a thinking level Pi doesn't have, naming the profile", () => {
+  assert.throws(
+    () =>
+      loadConfig(
+        writeConfig({
+          ...base,
+          engine: "pi",
+          provider: { type: "anthropic", subagents: { default: { thinkingLevel: "extreme" } } },
+        }),
+      ),
+    {
+      message:
+        "'provider.subagents.default.thinkingLevel' must be one of: off, minimal, low, medium, high, xhigh, max (got \"extreme\")",
+    },
+  );
+});
+
+test("subagent profiles are rejected on an engine that isn't pi", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, provider: { type: "anthropic", subagents: { default: { model: "x" } } } })),
+    { message: "'provider.subagents' is only supported by the pi engine" },
+  );
+});
+
+test("a subagent profile can't be named default, since that name is the profile used when none is named", () => {
+  assert.throws(
+    () =>
+      loadConfig(
+        writeConfig({ ...base, engine: "pi", provider: { type: "anthropic", subagents: { profiles: { default: {} } } } }),
+      ),
+    { message: "'provider.subagents.profiles' can't have a profile named 'default'; set 'provider.subagents.default' instead" },
+  );
+});

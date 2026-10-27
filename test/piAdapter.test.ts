@@ -13,7 +13,8 @@ import {
   SHOW_IMAGE_CALL,
   type EngineGuaranteeHarness,
 } from "./engineGuaranteeSuite.ts";
-import { answeringByPrompt, callingTools, FAUX_MODEL, piEngineOn, startingShell, untilAborted, writePiSettings } from "./piDoubles.ts";
+import type { PiProviderConfig } from "../src/provider.ts";
+import { answeringByPrompt, callingTools, FAUX_MODEL, FOREIGN_MODEL, piEngineOn, startingShell, untilAborted, writePiSettings } from "./piDoubles.ts";
 
 after(() => writePiSettings({}));
 
@@ -433,6 +434,45 @@ test("PiEngine: with no model configured, Pi's own default is used", async () =>
 test("PiEngine: open() refuses just as verify() does, since Pi's own session creation would not", async () => {
   const pi = piEngineOn([], { provider: { type: "copilot", model: "claude-sonnet-4.6" }, withFaux: false });
   await assert.rejects(pi.engine.open(openOptions(pi.projectDir)), /credential.*github-copilot/is);
+});
+
+const WITH_SUBAGENT_MODEL = (model: string): PiProviderConfig => ({
+  type: "anthropic",
+  model: FAUX_MODEL,
+  subagents: { profiles: { review: { model } } },
+});
+
+test("PiEngine: verify() passes when every subagent profile's model is one Pi has, with a credential", async () => {
+  const pi = piEngineOn([], {
+    provider: WITH_SUBAGENT_MODEL(`amazon-bedrock/${FOREIGN_MODEL}`),
+    foreignProviders: ["amazon-bedrock"],
+  });
+  await pi.engine.verify();
+});
+
+test("PiEngine: verify() refuses a subagent model Pi doesn't know, naming the profile", async () => {
+  const pi = piEngineOn([], { provider: WITH_SUBAGENT_MODEL("anthropic/no-such-model") });
+  await assert.rejects(pi.engine.verify(), /provider\.subagents\.profiles\.review.*'anthropic\/no-such-model'.*pi --list-models/is);
+});
+
+test("PiEngine: verify() refuses a subagent model not written as provider/id", async () => {
+  const pi = piEngineOn([], { provider: WITH_SUBAGENT_MODEL(FAUX_MODEL) });
+  await assert.rejects(pi.engine.verify(), /provider\.subagents\.profiles\.review.*provider\/id/is);
+});
+
+test("PiEngine: verify() refuses a subagent model on a provider the relay doesn't accept", async () => {
+  const pi = piEngineOn([], { provider: WITH_SUBAGENT_MODEL(`openai/${FOREIGN_MODEL}`), foreignProviders: ["openai"] });
+  await assert.rejects(pi.engine.verify(), /provider\.subagents\.profiles\.review.*'openai'.*relay doesn't accept/is);
+});
+
+test("PiEngine: verify() refuses a subagent model with no credential, saying how to sign in", async () => {
+  const pi = piEngineOn([], { provider: WITH_SUBAGENT_MODEL("github-copilot/claude-sonnet-4.6") });
+  await assert.rejects(pi.engine.verify(), /provider\.subagents\.profiles\.review.*credential.*github-copilot.*\/login/is);
+});
+
+test("PiEngine: open() refuses a bad subagent model just as verify() does", async () => {
+  const pi = piEngineOn([], { provider: WITH_SUBAGENT_MODEL("anthropic/no-such-model") });
+  await assert.rejects(pi.engine.open(openOptions(pi.projectDir)), /provider\.subagents\.profiles\.review/);
 });
 
 const PICK_A_DB: EngineQuestion["questions"] = [

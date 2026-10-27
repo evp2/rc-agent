@@ -19,6 +19,8 @@ export interface FinishedTask {
   status: "completed" | "failed" | "stopped";
   summary: string;
   usage?: Usage;
+  /** The Pi provider a subagent's calls were billed on. */
+  piProvider?: string;
   /** "none" for a foreground call, which returns its result as the tool result, and for a Stop; "note" for a Kill of a shell task. */
   delivery: "run" | "note" | "none";
 }
@@ -27,7 +29,7 @@ export type StartedTask = { ok: true; taskId: string; finished: Promise<Finished
 
 export interface SubagentLauncher {
   command?: SubagentCommand;
-  settings(): SubagentSettings;
+  settings(profile?: string): SubagentSettings | { error: string };
 }
 
 interface Task {
@@ -44,6 +46,7 @@ interface Task {
   killTimer?: NodeJS.Timeout;
   output: string;
   stream?: ChildStream;
+  piProvider?: string;
   finish(task: FinishedTask): void;
 }
 
@@ -129,9 +132,11 @@ export class TaskRegistry {
     });
   }
 
-  startSubagent(toolUseId: string, prompt: string, description: string, foreground: boolean): StartedTask {
+  startSubagent(toolUseId: string, prompt: string, description: string, foreground: boolean, profile?: string): StartedTask {
     if (!this.subagents) return { ok: false, reason: "subagents are not available in this session" };
     const launcher = this.subagents;
+    const settings = launcher.settings(profile);
+    if ("error" in settings) return { ok: false, reason: settings.error };
     const base = launcher.command ?? installedPi();
     return this.start({
       toolUseId,
@@ -139,8 +144,9 @@ export class TaskRegistry {
       foreground,
       description: description.trim() || describe(prompt),
       command: base.command,
-      args: subagentArgs(base, launcher.settings()),
+      args: subagentArgs(base, settings),
       stdin: prompt,
+      piProvider: settings.model.slice(0, settings.model.indexOf("/")),
     });
   }
 
@@ -175,6 +181,7 @@ export class TaskRegistry {
     command: string;
     args: string[];
     stdin?: string;
+    piProvider?: string;
   }): StartedTask {
     if (this.closed) return { ok: false, reason: "the session is closed" };
     if (this.occupying.size >= MAX_BACKGROUND_TASKS) {
@@ -206,6 +213,7 @@ export class TaskRegistry {
       released: false,
       output: "",
       ...(spec.taskType === "subagent" ? { stream: new ChildStream() } : {}),
+      ...(spec.piProvider ? { piProvider: spec.piProvider } : {}),
       finish,
     };
     this.tasks.set(task.taskId, task);
@@ -302,6 +310,7 @@ export class TaskRegistry {
       status,
       summary,
       ...(task.stream ? { usage: task.stream.usage } : {}),
+      ...(task.piProvider ? { piProvider: task.piProvider } : {}),
       delivery: task.foreground ? "none" : delivery,
     };
     task.finish(finished);
