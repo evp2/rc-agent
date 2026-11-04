@@ -1,6 +1,8 @@
 node_modules/
 dist/
 connector.config.json
+connector.*.config.json
+!connector.config.example.json
 config.json
 .claude/
 # Local integration-test rigs -- they bake in account-specific things

@@ -59,6 +59,7 @@ export function selectLocalCommands(
 function probeOptions(
   cwd: string,
   env: Record<string, string | undefined>,
+  claudeExecutable: string | undefined,
   abortController: AbortController,
 ): Options {
   return {
@@ -66,6 +67,7 @@ function probeOptions(
     allowDangerouslySkipPermissions: true,
     cwd,
     env,
+    ...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
     abortController,
   };
 }
@@ -93,10 +95,11 @@ export async function probeSkills(
   query: typeof realQuery,
   cwd: string,
   env: Record<string, string | undefined>,
+  claudeExecutable?: string,
 ): Promise<{ skills: SkillInfo[]; localCommands: SkillInfo[] }> {
   const [commands, initSkillNames] = await Promise.all([
-    readSupportedCommands(query, cwd, env),
-    readInitSkillNames(query, cwd, env),
+    readSupportedCommands(query, cwd, env, claudeExecutable),
+    readInitSkillNames(query, cwd, env, claudeExecutable),
   ]);
   return {
     skills: selectSkills(commands, initSkillNames),
@@ -108,9 +111,10 @@ async function readSupportedCommands(
   query: typeof realQuery,
   cwd: string,
   env: Record<string, string | undefined>,
+  claudeExecutable: string | undefined,
 ): Promise<SlashCommand[]> {
   const abortController = new AbortController();
-  const q = query({ prompt: neverYields(), options: probeOptions(cwd, env, abortController) });
+  const q = query({ prompt: neverYields(), options: probeOptions(cwd, env, claudeExecutable, abortController) });
   try {
     return await q.supportedCommands();
   } finally {
@@ -127,11 +131,12 @@ async function readInitSkillNames(
   query: typeof realQuery,
   cwd: string,
   env: Record<string, string | undefined>,
+  claudeExecutable: string | undefined,
 ): Promise<string[]> {
   const abortController = new AbortController();
   const q = query({
     prompt: "(connector startup probe -- do not act on this)",
-    options: probeOptions(cwd, env, abortController),
+    options: probeOptions(cwd, env, claudeExecutable, abortController),
   });
   try {
     for await (const message of q) {

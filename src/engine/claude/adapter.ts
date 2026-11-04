@@ -42,6 +42,8 @@ type Menu = { skills: SkillInfo[]; localCommands: SkillInfo[] };
 export interface ClaudeEngineDeps {
   query: typeof realQuery;
   env: NodeJS.ProcessEnv;
+  /** Absent means the Claude Code executable bundled with the Agent SDK. */
+  claudeExecutable?: string;
   /**
    * Reads the menu once when a session opens, so the phone has one before the
    * first Turn. Absent means no startup menu: the first Turn's `init` fills it.
@@ -52,12 +54,14 @@ export interface ClaudeEngineDeps {
 }
 
 /** Builds a Claude adapter wired to the real SDK's `query()`, in the provider's environment. */
-export function createClaudeEngine(provider: ClaudeProviderConfig): Engine {
+export function createClaudeEngine(provider: ClaudeProviderConfig, query: typeof realQuery = defaultSdkQuery): Engine {
   const env = buildProviderEnv(provider);
+  const { claudeExecutable } = provider;
   return new ClaudeEngine({
-    query: defaultSdkQuery,
+    query,
     env,
-    probeMenu: (projectDir) => probeSkills(defaultSdkQuery, projectDir, env),
+    claudeExecutable,
+    probeMenu: (projectDir) => probeSkills(query, projectDir, env, claudeExecutable),
     sessionExists,
   });
 }
@@ -334,6 +338,7 @@ class ClaudeEngineSession implements EngineSession {
       allowDangerouslySkipPermissions: true,
       cwd: this.options.projectDir,
       env: this.deps.env,
+      ...(this.deps.claudeExecutable ? { pathToClaudeCodeExecutable: this.deps.claudeExecutable } : {}),
       abortController,
       canUseTool: this.makeCanUseTool(),
       ...(this.conversationId ? { resume: this.conversationId } : {}),

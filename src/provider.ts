@@ -1,9 +1,14 @@
-export interface AnthropicProviderConfig {
+interface ClaudeEngineSettings {
+  /** The Claude Code executable to run. Absent means the one bundled with the Agent SDK. */
+  claudeExecutable?: string;
+}
+
+export interface AnthropicProviderConfig extends ClaudeEngineSettings {
   type: "anthropic";
   apiKeyEnv?: string;
 }
 
-export interface BedrockProviderConfig {
+export interface BedrockProviderConfig extends ClaudeEngineSettings {
   type: "bedrock";
   /** Optional -- falls back to the ambient AWS_REGION/AWS_DEFAULT_REGION. */
   region?: string;

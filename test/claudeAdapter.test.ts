@@ -5,7 +5,8 @@ import type { HookInput, McpSdkServerConfigWithInstance, Options, SDKMessage } f
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
-import { ClaudeEngine } from "../src/engine/claude/adapter.ts";
+import { ClaudeEngine, createClaudeEngine } from "../src/engine/claude/adapter.ts";
+import type { ClaudeProviderConfig } from "../src/provider.ts";
 import type {
   ArchiveFileOutcome,
   EngineFile,
@@ -959,6 +960,33 @@ test("ClaudeEngine: the menu is refreshed after a Turn's init, and a slower star
   const rest: EngineEvent[] = [];
   for (let next = await it.next(); !next.done; next = await it.next()) rest.push(next.value);
   assert.ok(!rest.some((e) => e.type === "menu"), `a stale menu was published: ${JSON.stringify(rest)}`);
+});
+
+/** Every `options` the SDK's `query()` receives across a session's startup probes and one Turn. */
+async function optionsOfProbesAndOneTurn(provider: ClaudeProviderConfig): Promise<Options[]> {
+  const seen: Options[] = [];
+  const { query } = scriptedQuery([initWithSkills([]), result()], { onOptions: (options) => seen.push(options) });
+  const session = await createClaudeEngine(provider, query).open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected() });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("hello");
+  await collect(it, (e) => e.type === "turn_ended");
+  await session.close();
+  return seen;
+}
+
+test("createClaudeEngine: a configured Claude executable runs both startup probes and every Turn", async () => {
+  const seen = await optionsOfProbesAndOneTurn({ type: "anthropic", claudeExecutable: "/opt/claude/bin/claude" });
+
+  assert.equal(seen.filter((o) => o.systemPrompt === undefined).length, 2, "both startup probes ran");
+  assert.equal(seen.filter((o) => o.systemPrompt !== undefined).length, 1, "the Turn ran");
+  for (const options of seen) assert.equal(options.pathToClaudeCodeExecutable, "/opt/claude/bin/claude");
+});
+
+test("createClaudeEngine: without a Claude executable, no query names one", async () => {
+  const seen = await optionsOfProbesAndOneTurn({ type: "anthropic" });
+
+  assert.equal(seen.length, 3);
+  for (const options of seen) assert.equal("pathToClaudeCodeExecutable" in options, false);
 });
 
 test("ClaudeEngine: a startup probe that fails leaves the menu for the first Turn to fill", async () => {

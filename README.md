@@ -182,6 +182,25 @@ aws configure           # static keys
 aws sso login           # SSO / IAM Identity Center
 ```
 
+### Claude Code executable
+
+On either Claude provider, `claudeExecutable` runs an installed Claude Code
+binary instead of the one bundled with the Agent SDK — for instance when your
+registry mirror lacks the SDK's per-platform Claude Code package:
+
+```json
+"provider": { "type": "anthropic", "claudeExecutable": "/usr/local/bin/claude" }
+```
+
+It is used for every Turn and for the startup probes that fill the "/" menu.
+There is no environment variable for it. It is only allowed on the Claude
+Engine: a `pi` or `copilot` engine with it set, or an empty value, is rejected
+at startup. The path itself is not checked at startup, so a wrong one shows up
+as each Turn failing with the SDK's error.
+
+The example config carries it as `"//claudeExecutable"`, which the connector
+ignores; drop the `//` to turn it on.
+
 ### Copilot provider <a name="copilot"></a>
 
 ```json

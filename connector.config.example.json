@@ -2,6 +2,7 @@
   "connectorCredential": "",
   "projectDir": "",
   "provider": {
-    "type": "anthropic"
+    "type": "anthropic",
+    "//claudeExecutable": "/usr/local/bin/claude"
   }
 }

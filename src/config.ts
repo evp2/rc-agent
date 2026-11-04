@@ -150,6 +150,7 @@ export function loadConfig(path: string): ConnectorConfig {
   if (engine !== "pi" && p.subagents !== undefined) {
     throw new Error("'provider.subagents' is only supported by the pi engine");
   }
+  const claudeExecutable = optionalClaudeExecutable(p, engine ?? impliedEngine({ type: providerType } as ProviderConfig));
 
   let provider: ProviderConfig | PiProviderConfig;
   if (engine === "pi") {
@@ -166,6 +167,7 @@ export function loadConfig(path: string): ConnectorConfig {
     provider = {
       type: "anthropic",
       apiKeyEnv: typeof p.apiKeyEnv === "string" ? p.apiKeyEnv : undefined,
+      ...(claudeExecutable ? { claudeExecutable } : {}),
     };
   } else if (providerType === "bedrock") {
     // Both optional -- the Claude adapter's provider environment falls back to the ambient AWS_REGION /
@@ -174,6 +176,7 @@ export function loadConfig(path: string): ConnectorConfig {
       type: "bedrock",
       region: optionalString(p, "region"),
       model: optionalString(p, "model"),
+      ...(claudeExecutable ? { claudeExecutable } : {}),
     };
   } else {
     provider = {
@@ -287,6 +290,18 @@ function rejectUnknownKeys(obj: Record<string, unknown>, allowed: string[], path
   if (unknown.length > 0) {
     throw new Error(`'${path}' has unknown ${unknown.length > 1 ? "keys" : "key"}: ${unknown.join(", ")}`);
   }
+}
+
+function optionalClaudeExecutable(provider: Record<string, unknown>, engine: EngineKind): string | undefined {
+  const value = provider.claudeExecutable;
+  if (value === undefined) return undefined;
+  if (engine !== "claude") {
+    throw new Error("'provider.claudeExecutable' is only supported by the claude engine");
+  }
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error("'provider.claudeExecutable' must be a non-empty string");
+  }
+  return value;
 }
 
 function optionalEngine(obj: Record<string, unknown>, providerType: ProviderConfig["type"]): EngineKind | undefined {

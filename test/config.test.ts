@@ -280,3 +280,35 @@ test("a subagent profile can't be named default, since that name is the profile 
     { message: "'provider.subagents.profiles' can't have a profile named 'default'; set 'provider.subagents.default' instead" },
   );
 });
+
+test("the Claude Engine keeps a configured Claude executable, on either of its providers", () => {
+  for (const type of ["anthropic", "bedrock"]) {
+    const config = loadConfig(writeConfig({ ...base, provider: { type, claudeExecutable: "/opt/claude/bin/claude" } }));
+    assert.equal((config.provider as { claudeExecutable?: string }).claudeExecutable, "/opt/claude/bin/claude");
+  }
+});
+
+test("a Claude executable is absent unless configured", () => {
+  assert.equal("claudeExecutable" in loadConfig(writeConfig(base)).provider, false);
+});
+
+test("a Claude executable is rejected on an engine that isn't claude, naming where it is allowed", () => {
+  for (const config of [
+    { ...base, engine: "pi", provider: { type: "anthropic", claudeExecutable: "/opt/claude" } },
+    { ...base, provider: { type: "copilot", claudeExecutable: "/opt/claude" } },
+  ]) {
+    assert.throws(() => loadConfig(writeConfig(config)), {
+      message: "'provider.claudeExecutable' is only supported by the claude engine",
+    });
+  }
+});
+
+test("an empty or non-string Claude executable is rejected, naming the field", () => {
+  for (const claudeExecutable of ["", 42, ["/opt/claude"]]) {
+    assert.throws(
+      () => loadConfig(writeConfig({ ...base, provider: { type: "anthropic", claudeExecutable } })),
+      { message: "'provider.claudeExecutable' must be a non-empty string" },
+      JSON.stringify(claudeExecutable),
+    );
+  }
+});
