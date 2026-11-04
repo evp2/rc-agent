@@ -154,6 +154,39 @@ subagent on another provider runs without it.
 Treat it as defence in depth, not the only control: an IAM policy that denies
 Bedrock requests without the guardrail remains the backstop.
 
+#### Renewing expired Bedrock credentials
+
+On Bedrock, Pi can renew short-lived AWS credentials itself when they expire
+mid-session:
+
+```json
+"provider": {
+  "type": "bedrock",
+  "awsAuthRefresh": ["aws", "sso", "login", "--profile", "dev"]
+}
+```
+
+`awsAuthRefresh` is the command and its arguments, run directly with no shell,
+so nothing in it is expanded or quoted. When a Bedrock call fails because the
+credentials have expired (an `ExpiredToken` error, or "The security token
+included in the request is expired"), the connector runs the command, waits for
+it, re-reads the AWS profile files, and sends the same call again, once. If
+that call fails too, its error ends the Turn and the command is not run again
+for it. Any other error, such as throttling or access denied, never runs the
+command.
+
+The command's stdout is discarded, and nothing it prints reaches the relay or
+the phone. If it exits non-zero, is killed, or runs past its 5-minute limit,
+the Turn ends with the original expiry error, and the connector's log records
+the exit status and the end of its stderr, with credential-looking values
+redacted. The command needs no terminal: its stdin is closed.
+
+It is accepted only with `"engine": "pi"` and `provider.type` `bedrock`;
+anywhere else the connector refuses to start. Subagents never run it: each one
+uses the credentials current when it starts. The connector still re-reads the
+AWS profile files before every Bedrock Turn, so credentials renewed outside the
+connector are picked up without it.
+
 ### Anthropic provider (claude.ai subscription or API key)
 
 ```json
@@ -198,7 +231,10 @@ environment.
 
 AWS credentials are resolved from the normal SDK chain (`AWS_PROFILE`,
 environment variables, SSO, instance profile, or `AWS_BEARER_TOKEN_BEDROCK`).
-The connector never manages credentials itself — configure them before starting:
+The connector never manages credentials itself, except that Pi can run a
+command you configure to renew expired ones (see
+[Renewing expired Bedrock credentials](#renewing-expired-bedrock-credentials)).
+Configure them before starting:
 
 ```bash
 aws configure           # static keys

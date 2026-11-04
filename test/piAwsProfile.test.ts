@@ -9,7 +9,7 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 
 import { refreshAwsProfileFiles } from "../src/engine/pi/awsProfile.ts";
 import type { EngineAnswer, EngineEvent } from "../src/engine/types.ts";
-import { FAUX_MODEL, piEngineOn } from "./piDoubles.ts";
+import { EXPIRED_TOKEN, failingWith, FAUX_MODEL, piEngineOn, scriptedCommand } from "./piDoubles.ts";
 
 let credentialsFile: string;
 
@@ -64,4 +64,38 @@ test("a Bedrock Turn rereads the AWS profile files", async () => {
   await session.close();
 
   assert.equal(await resolvedKey(), "NEWKEY");
+});
+
+test("a call resent after the refresh command runs uses the credentials it wrote", async () => {
+  writeKey("OLDKEY");
+  assert.equal(await resolvedKey(), "OLDKEY");
+
+  let resentWith: string | undefined;
+  const command = scriptedCommand([], () => writeKey("NEWKEY"));
+  const pi = piEngineOn(
+    [
+      failingWith(EXPIRED_TOKEN),
+      async () => {
+        resentWith = await resolvedKey();
+        return fauxAssistantMessage("ok");
+      },
+    ],
+    {
+      provider: { type: "bedrock", model: FAUX_MODEL, awsAuthRefresh: ["aws", "sso", "login"] },
+      piProvider: "amazon-bedrock",
+      runCommand: command.run,
+    },
+  );
+  const session = await pi.engine.open({
+    projectDir: pi.projectDir,
+    onQuestion: () => new Promise<EngineAnswer>(() => undefined),
+  });
+  session.send("hello");
+  for await (const event of session.events as AsyncIterable<EngineEvent>) {
+    if (event.type === "turn_ended") break;
+  }
+  await session.close();
+
+  assert.equal(command.runs.length, 1);
+  assert.equal(resentWith, "NEWKEY");
 });

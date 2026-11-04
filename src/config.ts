@@ -156,18 +156,24 @@ export function loadConfig(path: string): ConnectorConfig {
     throw new Error("'provider.guardrail' is only supported by the pi engine with provider.type 'bedrock'");
   }
 
+  if (p.awsAuthRefresh !== undefined && (engine !== "pi" || providerType !== "bedrock")) {
+    throw new Error("'provider.awsAuthRefresh' is only supported by the pi engine with provider.type 'bedrock'");
+  }
+
   let provider: ProviderConfig | PiProviderConfig;
   if (engine === "pi") {
     const model = optionalString(p, "model");
     const thinkingLevel = optionalThinkingLevel(p);
     const subagents = optionalSubagents(p);
     const guardrail = optionalGuardrail(p);
+    const awsAuthRefresh = optionalArgv(p, "awsAuthRefresh");
     provider = {
       type: providerType as ProviderConfig["type"],
       ...(model ? { model } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
       ...(subagents ? { subagents } : {}),
       ...(guardrail ? { guardrail } : {}),
+      ...(awsAuthRefresh ? { awsAuthRefresh } : {}),
     };
   } else if (providerType === "anthropic") {
     provider = {
@@ -243,6 +249,19 @@ function optionalThinkingLevel(obj: Record<string, unknown>, path = "provider.th
     );
   }
   return value as PiThinkingLevel;
+}
+
+function optionalArgv(provider: Record<string, unknown>, key: string): string[] | undefined {
+  const value = provider[key];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || !value.every((arg) => typeof arg === "string")) {
+    throw new Error(
+      `'provider.${key}' must be a non-empty list of strings: the command and its arguments, run without a shell`,
+    );
+  }
+  const empty = value.findIndex((arg) => arg.length === 0);
+  if (empty >= 0) throw new Error(`'provider.${key}[${empty}]' must be a non-empty string`);
+  return value;
 }
 
 function optionalSubagents(provider: Record<string, unknown>): SubagentProfiles | undefined {

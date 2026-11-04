@@ -22,6 +22,7 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
 
 import { PiEngine } from "../src/engine/pi/adapter.ts";
+import type { CommandResult, RunCommand } from "../src/engine/pi/awsAuthRefresh.ts";
 import type { PiProviderConfig } from "../src/provider.ts";
 
 // Keeps every test off the developer's own ~/.pi.
@@ -70,6 +71,8 @@ export function piEngineOn(
     projectDir?: string;
     realChild?: boolean;
     guardrailExtension?: string;
+    runCommand?: RunCommand;
+    now?: () => number;
   } = {},
 ): PiTestEngine {
   const faux = fauxProvider({
@@ -85,6 +88,8 @@ export function piEngineOn(
     homeDir: options.homeDir ?? freshProjectDir(),
     ...(options.realChild ? {} : { subagentCommand: { command: process.execPath, args: [FAKE_PI] } }),
     ...(options.guardrailExtension ? { subagentGuardrailExtension: options.guardrailExtension } : {}),
+    ...(options.runCommand ? { runCommand: options.runCommand } : {}),
+    ...(options.now ? { now: options.now } : {}),
     createModelRuntime: async () => {
       const credentials = new InMemoryCredentialStore();
       if (options.subscription) {
@@ -266,4 +271,33 @@ export function sendingRequest(payload: Record<string, unknown>): { step: FauxRe
     return fauxAssistantMessage("sent");
   };
   return { step, sent };
+}
+
+export const EXPIRED_TOKEN = "ExpiredTokenException: The security token included in the request is expired";
+
+export function failingWith(errorMessage: string, errorCode?: string): FauxResponseStep {
+  return () => ({
+    ...fauxAssistantMessage([], { stopReason: "error", errorMessage }),
+    ...(errorCode
+      ? { diagnostics: [{ type: "bedrock_response_failure", timestamp: Date.now(), details: { errorCode } }] }
+      : {}),
+  });
+}
+
+export interface ScriptedCommand {
+  run: RunCommand;
+  runs: { argv: readonly string[]; timeoutMs: number }[];
+}
+
+// Each run takes the next scripted result; once they run out, every run exits 0.
+export function scriptedCommand(results: Partial<CommandResult>[] = [], onRun?: () => void): ScriptedCommand {
+  const runs: ScriptedCommand["runs"] = [];
+  return {
+    runs,
+    run: async (argv, { timeoutMs }) => {
+      runs.push({ argv, timeoutMs });
+      onRun?.();
+      return { exitCode: 0, signal: null, stderr: "", ...results.shift() };
+    },
+  };
 }

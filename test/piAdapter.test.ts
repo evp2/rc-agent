@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import { type FauxResponseStep, fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import type { Engine, EngineAnswer, EngineEvent, EngineQuestion, EngineSession } from "../src/engine/types.ts";
@@ -14,12 +14,16 @@ import {
   type EngineGuaranteeHarness,
 } from "./engineGuaranteeSuite.ts";
 import type { PiProviderConfig } from "../src/provider.ts";
+import { runCommand } from "../src/engine/pi/awsAuthRefresh.ts";
 import {
   answeringByPrompt,
   callingTools,
+  EXPIRED_TOKEN,
+  failingWith,
   FAUX_MODEL,
   FOREIGN_MODEL,
   piEngineOn,
+  scriptedCommand,
   sendingRequest,
   startingShell,
   untilAborted,
@@ -636,4 +640,175 @@ test("PiEngine: a request for a non-Bedrock model carries no guardrail", async (
 test("PiEngine: with no guardrail configured, a Bedrock request is sent unchanged", async () => {
   const sent = await sentRequest({ type: "bedrock", model: FAUX_MODEL }, "amazon-bedrock", CONVERSE_REQUEST);
   assert.deepEqual(sent, CONVERSE_REQUEST);
+});
+
+const RENEW = ["aws", "sso", "login", "--profile", "dev"];
+
+function counting(steps: FauxResponseStep[]): { steps: FauxResponseStep[]; calls: () => number } {
+  let calls = 0;
+  return {
+    steps: steps.map((step): FauxResponseStep => (context, options, state, model) => {
+      calls++;
+      return typeof step === "function" ? step(context, options, state, model) : step;
+    }),
+    calls: () => calls,
+  };
+}
+
+function onBedrock(
+  steps: FauxResponseStep[],
+  options: Parameters<typeof piEngineOn>[1] & { awsAuthRefresh?: string[] } = {},
+) {
+  const { awsAuthRefresh = RENEW, ...rest } = options;
+  return piEngineOn(steps, {
+    piProvider: "amazon-bedrock",
+    provider: { type: "bedrock", model: FAUX_MODEL, awsAuthRefresh },
+    ...rest,
+  });
+}
+
+async function oneTurn(pi: ReturnType<typeof piEngineOn>): Promise<EngineEvent[]> {
+  const session = await pi.engine.open(openOptions(pi.projectDir));
+  session.send("hello");
+  const events = await readTurns(session, 1);
+  await session.close();
+  return events;
+}
+
+function ending(events: EngineEvent[]): unknown {
+  const ended = events.find((e) => e.type === "turn_ended");
+  return ended && withoutDurations([ended])[0];
+}
+
+test("PiEngine: a Bedrock call refused for expired credentials runs the refresh command once and is resent", async () => {
+  const model = counting([failingWith(EXPIRED_TOKEN), fauxAssistantMessage("renewed")]);
+  const command = scriptedCommand();
+  const events = await oneTurn(onBedrock(model.steps, { runCommand: command.run }));
+  assert.deepEqual(command.runs.map((r) => r.argv), [RENEW]);
+  assert.ok(command.runs[0]!.timeoutMs > 0);
+  assert.equal(model.calls(), 2);
+  assert.ok(events.some((e) => e.type === "assistant_text" && e.text === "renewed"));
+  assert.deepEqual(ending(events), { type: "turn_ended", outcome: "success" });
+});
+
+test("PiEngine: an expiry is recognised by the ExpiredToken error name Bedrock reports, whatever the message says", async () => {
+  const model = counting([failingWith("403: forbidden", "ExpiredTokenException"), fauxAssistantMessage("renewed")]);
+  const command = scriptedCommand();
+  const events = await oneTurn(onBedrock(model.steps, { runCommand: command.run }));
+  assert.equal(command.runs.length, 1);
+  assert.deepEqual(ending(events), { type: "turn_ended", outcome: "success" });
+});
+
+test("PiEngine: an expiry is recognised by the ExpiredToken wording when Bedrock reports no error name", async () => {
+  for (const message of ["ExpiredToken: token gone", "The security token included in the request is expired"]) {
+    const command = scriptedCommand();
+    const events = await oneTurn(onBedrock([failingWith(message), fauxAssistantMessage("renewed")], { runCommand: command.run }));
+    assert.equal(command.runs.length, 1, message);
+    assert.deepEqual(ending(events), { type: "turn_ended", outcome: "success" });
+  }
+});
+
+test("PiEngine: a resent call that expires again surfaces its error, and the command is not run a second time", async () => {
+  const model = counting([failingWith(EXPIRED_TOKEN), failingWith(`${EXPIRED_TOKEN} again`), fauxAssistantMessage("never")]);
+  const command = scriptedCommand();
+  const events = await oneTurn(onBedrock(model.steps, { runCommand: command.run }));
+  assert.equal(command.runs.length, 1);
+  assert.equal(model.calls(), 2);
+  assert.deepEqual(ending(events), { type: "turn_ended", outcome: "error", errors: [`${EXPIRED_TOKEN} again`] });
+});
+
+test("PiEngine: a refresh command that exits non-zero surfaces the original error and logs why, credentials redacted", async (t) => {
+  const logged = t.mock.method(console, "error", () => undefined);
+  const model = counting([failingWith(EXPIRED_TOKEN), fauxAssistantMessage("never")]);
+  const stderr = `${"noise\n".repeat(2000)}aws_session_token=FQoGZXIvYXdzEJr secret AKIAABCDEFGHIJKLMNOP\nsign-in failed\n`;
+  const command = scriptedCommand([{ exitCode: 2, stderr }]);
+  let clock = 1_000;
+  const events = await oneTurn(
+    onBedrock(model.steps, {
+      runCommand: async (argv, options) => {
+        clock += 4_000;
+        return command.run(argv, options);
+      },
+      now: () => clock,
+    }),
+  );
+  assert.equal(model.calls(), 1);
+  assert.deepEqual(ending(events), { type: "turn_ended", outcome: "error", errors: [EXPIRED_TOKEN] });
+  const lines = logged.mock.calls.map((c) => c.arguments.join(" ")).filter((l) => l.includes("awsAuthRefresh"));
+  assert.equal(lines.length, 1);
+  const [line] = lines as [string];
+  assert.match(line, /exited with status 2 after 4000ms/);
+  assert.match(line, /sign-in failed/);
+  assert.doesNotMatch(line, /FQoGZXIvYXdzEJr|AKIAABCDEFGHIJKLMNOP/);
+  assert.ok(line.length < 3_000);
+});
+
+test("PiEngine: an error that isn't credential expiry never runs the refresh command", async () => {
+  const command = scriptedCommand();
+  const events = await oneTurn(
+    onBedrock([failingWith("AccessDeniedException: not authorized", "AccessDeniedException")], { runCommand: command.run }),
+  );
+  assert.equal(command.runs.length, 0);
+  assert.deepEqual(ending(events), {
+    type: "turn_ended",
+    outcome: "error",
+    errors: ["AccessDeniedException: not authorized"],
+  });
+});
+
+test("PiEngine: an expiry after the model has started answering is not resent", async () => {
+  const command = scriptedCommand();
+  const partial: FauxResponseStep = () => fauxAssistantMessage("half an answer", { stopReason: "error", errorMessage: EXPIRED_TOKEN });
+  const events = await oneTurn(onBedrock([partial, fauxAssistantMessage("never")], { runCommand: command.run }));
+  assert.equal(command.runs.length, 0);
+  assert.deepEqual(ending(events), { type: "turn_ended", outcome: "error", errors: [EXPIRED_TOKEN] });
+});
+
+test("PiEngine: an expiry on a model that isn't on Bedrock never runs the refresh command", async () => {
+  const command = scriptedCommand();
+  const pi = piEngineOn([failingWith(EXPIRED_TOKEN)], {
+    provider: { type: "anthropic", model: FAUX_MODEL, awsAuthRefresh: RENEW },
+    runCommand: command.run,
+  });
+  const events = await oneTurn(pi);
+  assert.equal(command.runs.length, 0);
+  assert.deepEqual(ending(events), { type: "turn_ended", outcome: "error", errors: [EXPIRED_TOKEN] });
+});
+
+test("PiEngine: the refresh command's output never reaches the emitted events or the log", async (t) => {
+  const logged = [t.mock.method(console, "error", () => undefined), t.mock.method(console, "log", () => undefined)];
+  const script = "console.log('STDOUT-6f1c'); console.error('STDERR-9a2e')";
+  for (const exit of [0, 1]) {
+    const events = await oneTurn(
+      onBedrock([failingWith(EXPIRED_TOKEN), fauxAssistantMessage("renewed")], {
+        awsAuthRefresh: [process.execPath, "-e", `${script}; process.exit(${exit})`],
+      }),
+    );
+    assert.doesNotMatch(JSON.stringify(events), /STDOUT-6f1c|STDERR-9a2e/);
+  }
+  const output = logged.flatMap((m) => m.mock.calls.map((c) => c.arguments.join(" "))).join("\n");
+  assert.doesNotMatch(output, /STDOUT-6f1c/);
+  assert.match(output, /STDERR-9a2e/);
+});
+
+test("PiEngine: the refresh command runs with no shell, so its arguments reach it verbatim", async () => {
+  const result = await runCommand(
+    [process.execPath, "-e", "process.stderr.write(process.argv[1]); process.exit(3)", "$HOME; echo hi"],
+    { timeoutMs: 10_000 },
+  );
+  assert.deepEqual(result, { exitCode: 3, signal: null, stderr: "$HOME; echo hi" });
+});
+
+test("PiEngine: a refresh command that outlives its timeout is killed", async () => {
+  const started = Date.now();
+  const result = await runCommand([process.execPath, "-e", "setTimeout(() => {}, 60_000)"], { timeoutMs: 200 });
+  assert.equal(result.exitCode, null);
+  assert.equal(result.signal, "SIGTERM");
+  assert.ok(Date.now() - started < 10_000);
+});
+
+test("PiEngine: a refresh command that can't be started reports why instead of throwing", async () => {
+  const result = await runCommand(["/nonexistent/aws-sign-in"], { timeoutMs: 10_000 });
+  assert.equal(result.exitCode, null);
+  assert.match(result.stderr, /ENOENT/);
 });

@@ -39,6 +39,7 @@ import { chooseEffort, chooseModel } from "./modelCommands";
 import { type SubagentCommand, subagentSettings } from "./subagent";
 import { refreshAwsProfileFiles } from "./awsProfile";
 import { createGuardrailExtension } from "./guardrail";
+import { CredentialRenewal, renewExpiredCredentials, runCommand, type RunCommand } from "./awsAuthRefresh";
 import { connectorTools, QUESTION_TOOL } from "./tools";
 
 const PI_PROVIDERS: Record<ProviderConfig["type"], string> = {
@@ -54,6 +55,8 @@ export interface PiEngineDeps {
   subagentCommand?: SubagentCommand;
   subagentGuardrailExtension?: string;
   createModelRuntime?: () => Promise<ModelRuntime>;
+  runCommand?: RunCommand;
+  now?: () => number;
 }
 
 export function createPiEngine(provider: PiProviderConfig, projectDir: string): Engine {
@@ -66,9 +69,18 @@ export class PiEngine implements Engine {
   readonly kind = "pi" as const;
   readonly capabilities = { steer: true };
   private readonly createModelRuntime: () => Promise<ModelRuntime>;
+  private readonly renewal: CredentialRenewal | undefined;
 
   constructor(private readonly deps: PiEngineDeps) {
     this.createModelRuntime = deps.createModelRuntime ?? (() => ModelRuntime.create());
+    const { awsAuthRefresh } = deps.provider;
+    this.renewal = awsAuthRefresh
+      ? new CredentialRenewal(awsAuthRefresh, {
+          run: deps.runCommand ?? runCommand,
+          now: deps.now ?? Date.now,
+          reload: refreshAwsProfileFiles,
+        })
+      : undefined;
   }
 
   async verify(): Promise<void> {
@@ -127,6 +139,7 @@ export class PiEngine implements Engine {
     const { provider } = this.deps;
     const agentDir = getAgentDir();
     const modelRuntime = await this.createModelRuntime();
+    if (this.renewal) renewExpiredCredentials(modelRuntime, this.renewal);
     const piProvider = PI_PROVIDERS[provider.type];
     const branch = sessionManager.getBranch();
     const chosenAlready = switchedIn(branch, "model_change");

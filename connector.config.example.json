@@ -4,6 +4,7 @@
   "provider": {
     "type": "anthropic",
     "//claudeExecutable": "/usr/local/bin/claude",
-    "//guardrail": { "identifier": "YOUR_GUARDRAIL_ID", "version": "DRAFT" }
+    "//guardrail": { "identifier": "YOUR_GUARDRAIL_ID", "version": "DRAFT" },
+    "//awsAuthRefresh": ["aws", "sso", "login", "--profile", "YOUR_PROFILE"]
   }
 }

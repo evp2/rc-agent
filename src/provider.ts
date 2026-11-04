@@ -52,6 +52,8 @@ export interface PiProviderConfig {
   subagents?: SubagentProfiles;
   /** Only on provider.type `bedrock`. */
   guardrail?: BedrockGuardrail;
+  /** Bedrock only. Run without a shell when a call fails on expired credentials. */
+  awsAuthRefresh?: string[];
 }
 
 /** The providers the Claude Engine runs on. */

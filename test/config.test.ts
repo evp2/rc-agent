@@ -312,6 +312,7 @@ test("an empty or non-string Claude executable is rejected, naming the field", (
     );
   }
 });
+
 const GUARDRAIL_PLACEMENT = "'provider.guardrail' is only supported by the pi engine with provider.type 'bedrock'";
 
 test("a pi engine on bedrock keeps a guardrail, with a DRAFT or numbered version", () => {
@@ -352,6 +353,40 @@ test("a guardrail with an empty or missing identifier or version is rejected, na
   }
 });
 
+test("a pi engine on bedrock keeps an AWS credential refresh command as its argument list", () => {
+  const awsAuthRefresh = ["aws", "sso", "login", "--profile", "dev"];
+  const config = loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "bedrock", awsAuthRefresh } }));
+  assert.deepEqual(config.provider, { type: "bedrock", awsAuthRefresh });
+});
+
+test("an AWS credential refresh command is rejected on pi with a provider other than bedrock", () => {
+  for (const type of ["anthropic", "copilot"]) {
+    assert.throws(
+      () => loadConfig(writeConfig({ ...base, engine: "pi", provider: { type, awsAuthRefresh: ["aws", "sso", "login"] } })),
+      { message: "'provider.awsAuthRefresh' is only supported by the pi engine with provider.type 'bedrock'" },
+    );
+  }
+});
+
+test("an AWS credential refresh command is rejected on an engine that isn't pi", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, provider: { type: "bedrock", awsAuthRefresh: ["aws", "sso", "login"] } })),
+    { message: "'provider.awsAuthRefresh' is only supported by the pi engine with provider.type 'bedrock'" },
+  );
+});
+
+test("an AWS credential refresh command that is empty or not a list of strings is rejected, naming the field", () => {
+  for (const awsAuthRefresh of [[], "aws sso login", [42]]) {
+    assert.throws(
+      () => loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "bedrock", awsAuthRefresh } })),
+      {
+        message:
+          "'provider.awsAuthRefresh' must be a non-empty list of strings: the command and its arguments, run without a shell",
+      },
+    );
+  }
+});
+
 test("a guardrail that isn't an object, or has a misspelt key, is rejected", () => {
   const pi = (guardrail: unknown) => () =>
     loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "bedrock", guardrail } }));
@@ -359,4 +394,11 @@ test("a guardrail that isn't an object, or has a misspelt key, is rejected", () 
   assert.throws(pi({ identifier: "gr-abc123", version: "1", verison: "2" }), {
     message: "'provider.guardrail' has unknown key: verison",
   });
+});
+
+test("an AWS credential refresh command with an empty element is rejected, naming the element", () => {
+  assert.throws(
+    () => loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "bedrock", awsAuthRefresh: ["aws", ""] } })),
+    { message: "'provider.awsAuthRefresh[1]' must be a non-empty string" },
+  );
 });
