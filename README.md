@@ -130,6 +130,28 @@ field a profile leaves out is inherited from the session. Every configured model
 is checked when the connector starts, like `provider.model`. A configured model
 stays fixed when you switch the session's model with `/model`.
 
+#### Bedrock guardrail
+
+On the Bedrock provider, `guardrail` makes every Bedrock request the Pi session
+sends carry an Amazon Bedrock guardrail:
+
+```json
+"provider": {
+  "type": "bedrock",
+  "guardrail": { "identifier": "YOUR_GUARDRAIL_ID", "version": "DRAFT" }
+}
+```
+
+`identifier` is the guardrail's ID or ARN, and `version` is a version number
+such as `"1"`, or `"DRAFT"`; both are required, non-empty strings. It is set in the
+config only, with no environment variable. The connector refuses to start when
+`guardrail` is set on any engine other than Pi, or on Pi with a provider other
+than `bedrock`. It applies to the session's own requests only: a subagent's
+requests don't carry it.
+
+Treat it as defence in depth, not the only control: an IAM policy that denies
+Bedrock requests without the guardrail remains the backstop.
+
 ### Anthropic provider (claude.ai subscription or API key)
 
 ```json

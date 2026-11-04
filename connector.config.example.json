@@ -3,6 +3,7 @@
   "projectDir": "",
   "provider": {
     "type": "anthropic",
-    "//claudeExecutable": "/usr/local/bin/claude"
+    "//claudeExecutable": "/usr/local/bin/claude",
+    "//guardrail": { "identifier": "YOUR_GUARDRAIL_ID", "version": "DRAFT" }
   }
 }

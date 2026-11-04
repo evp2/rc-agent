@@ -39,11 +39,19 @@ export interface SubagentProfiles {
   profiles?: Record<string, SubagentProfile>;
 }
 
+export interface BedrockGuardrail {
+  identifier: string;
+  /** A published version number, or `DRAFT`. */
+  version: string;
+}
+
 export interface PiProviderConfig {
   type: ProviderConfig["type"];
   model?: string;
   thinkingLevel?: PiThinkingLevel;
   subagents?: SubagentProfiles;
+  /** Only on provider.type `bedrock`. */
+  guardrail?: BedrockGuardrail;
 }
 
 /** The providers the Claude Engine runs on. */

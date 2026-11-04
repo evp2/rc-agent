@@ -312,3 +312,51 @@ test("an empty or non-string Claude executable is rejected, naming the field", (
     );
   }
 });
+const GUARDRAIL_PLACEMENT = "'provider.guardrail' is only supported by the pi engine with provider.type 'bedrock'";
+
+test("a pi engine on bedrock keeps a guardrail, with a DRAFT or numbered version", () => {
+  for (const version of ["DRAFT", "3"]) {
+    const guardrail = { identifier: "gr-abc123", version };
+    const config = loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "bedrock", guardrail } }));
+    assert.deepEqual(config.provider, { type: "bedrock", guardrail });
+  }
+});
+
+test("a guardrail is rejected anywhere but the pi engine on bedrock, saying where it is allowed", () => {
+  const guardrail = { identifier: "gr-abc123", version: "1" };
+  const elsewhere = [
+    { provider: { type: "bedrock", guardrail } },
+    { engine: "claude", provider: { type: "anthropic", guardrail } },
+    { engine: "copilot", provider: { type: "copilot", guardrail } },
+    { engine: "pi", provider: { type: "anthropic", guardrail } },
+    { engine: "pi", provider: { type: "copilot", guardrail } },
+  ];
+  for (const config of elsewhere) {
+    assert.throws(() => loadConfig(writeConfig({ ...base, ...config })), { message: GUARDRAIL_PLACEMENT });
+  }
+});
+
+test("a guardrail with an empty or missing identifier or version is rejected, naming the field", () => {
+  const cases: [Record<string, unknown>, string][] = [
+    [{ identifier: "", version: "1" }, "identifier"],
+    [{ version: "1" }, "identifier"],
+    [{ identifier: "gr-abc123", version: "" }, "version"],
+    [{ identifier: "gr-abc123" }, "version"],
+    [{ identifier: "gr-abc123", version: 1 }, "version"],
+  ];
+  for (const [guardrail, field] of cases) {
+    assert.throws(
+      () => loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "bedrock", guardrail } })),
+      { message: `'provider.guardrail.${field}' is required and must be a non-empty string` },
+    );
+  }
+});
+
+test("a guardrail that isn't an object, or has a misspelt key, is rejected", () => {
+  const pi = (guardrail: unknown) => () =>
+    loadConfig(writeConfig({ ...base, engine: "pi", provider: { type: "bedrock", guardrail } }));
+  assert.throws(pi("gr-abc123"), { message: "'provider.guardrail' must be an object" });
+  assert.throws(pi({ identifier: "gr-abc123", version: "1", verison: "2" }), {
+    message: "'provider.guardrail' has unknown key: verison",
+  });
+});

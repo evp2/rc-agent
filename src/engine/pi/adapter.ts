@@ -38,6 +38,7 @@ import { type FinishedTask, TaskRegistry } from "./backgroundTasks";
 import { chooseEffort, chooseModel } from "./modelCommands";
 import { type SubagentCommand, subagentSettings } from "./subagent";
 import { refreshAwsProfileFiles } from "./awsProfile";
+import { createGuardrailExtension } from "./guardrail";
 import { connectorTools, QUESTION_TOOL } from "./tools";
 
 const PI_PROVIDERS: Record<ProviderConfig["type"], string> = {
@@ -145,7 +146,12 @@ export class PiEngine implements Engine {
       agentDir,
       settingsManager,
       noExtensions: true,
-      extensionFactories: [createCodemodeExtension({ mode: "on" }), createToolSearchExtension(), createMcpExtension()],
+      extensionFactories: [
+        createCodemodeExtension({ mode: "on" }),
+        createToolSearchExtension(),
+        createMcpExtension(),
+        ...(provider.guardrail ? [createGuardrailExtension(provider.guardrail)] : []),
+      ],
       additionalSkillPaths: claudeSkills,
     });
     await resourceLoader.reload();

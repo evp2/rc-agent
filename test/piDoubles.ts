@@ -255,3 +255,13 @@ export function startingSubagent(
 ): FauxResponseStep {
   return fauxAssistantMessage(subagentCall(plan, options), { stopReason: "toolUse" });
 }
+
+// Faux builds no provider request, so this step sends one through Pi's request hook the way a real provider does.
+export function sendingRequest(payload: Record<string, unknown>): { step: FauxResponseStep; sent: unknown[] } {
+  const sent: unknown[] = [];
+  const step: FauxResponseStep = async (_context, options, _state, model) => {
+    sent.push((await options?.onPayload?.(payload, model)) ?? payload);
+    return fauxAssistantMessage("sent");
+  };
+  return { step, sent };
+}

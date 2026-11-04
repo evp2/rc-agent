@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 import { ENGINE_KINDS, type EngineKind } from "./engine/types";
 import {
+  type BedrockGuardrail,
   PI_THINKING_LEVELS,
   type PiProviderConfig,
   type PiThinkingLevel,
@@ -151,17 +152,22 @@ export function loadConfig(path: string): ConnectorConfig {
     throw new Error("'provider.subagents' is only supported by the pi engine");
   }
   const claudeExecutable = optionalClaudeExecutable(p, engine ?? impliedEngine({ type: providerType } as ProviderConfig));
+  if (p.guardrail !== undefined && (engine !== "pi" || providerType !== "bedrock")) {
+    throw new Error("'provider.guardrail' is only supported by the pi engine with provider.type 'bedrock'");
+  }
 
   let provider: ProviderConfig | PiProviderConfig;
   if (engine === "pi") {
     const model = optionalString(p, "model");
     const thinkingLevel = optionalThinkingLevel(p);
     const subagents = optionalSubagents(p);
+    const guardrail = optionalGuardrail(p);
     provider = {
       type: providerType as ProviderConfig["type"],
       ...(model ? { model } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
       ...(subagents ? { subagents } : {}),
+      ...(guardrail ? { guardrail } : {}),
     };
   } else if (providerType === "anthropic") {
     provider = {
@@ -263,6 +269,16 @@ function optionalSubagents(provider: Record<string, unknown>): SubagentProfiles 
     );
   }
   return result;
+}
+
+function optionalGuardrail(provider: Record<string, unknown>): BedrockGuardrail | undefined {
+  if (provider.guardrail === undefined) return undefined;
+  const guardrail = requireObject(provider.guardrail, "provider.guardrail");
+  rejectUnknownKeys(guardrail, ["identifier", "version"], "provider.guardrail");
+  return {
+    identifier: requireString(guardrail, "identifier", "provider.guardrail.identifier"),
+    version: requireString(guardrail, "version", "provider.guardrail.version"),
+  };
 }
 
 function parseProfile(raw: unknown, path: string): SubagentProfile {
@@ -379,10 +395,10 @@ function requireConnectorCredential(obj: Record<string, unknown>, path: string):
   return value;
 }
 
-function requireString(obj: Record<string, unknown>, key: string): string {
+function requireString(obj: Record<string, unknown>, key: string, path = key): string {
   const value = obj[key];
   if (typeof value !== "string" || value.length === 0) {
-    throw new Error(`'${key}' is required and must be a non-empty string`);
+    throw new Error(`'${path}' is required and must be a non-empty string`);
   }
   return value;
 }

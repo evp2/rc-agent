@@ -14,7 +14,17 @@ import {
   type EngineGuaranteeHarness,
 } from "./engineGuaranteeSuite.ts";
 import type { PiProviderConfig } from "../src/provider.ts";
-import { answeringByPrompt, callingTools, FAUX_MODEL, FOREIGN_MODEL, piEngineOn, startingShell, untilAborted, writePiSettings } from "./piDoubles.ts";
+import {
+  answeringByPrompt,
+  callingTools,
+  FAUX_MODEL,
+  FOREIGN_MODEL,
+  piEngineOn,
+  sendingRequest,
+  startingShell,
+  untilAborted,
+  writePiSettings,
+} from "./piDoubles.ts";
 
 after(() => writePiSettings({}));
 
@@ -586,3 +596,44 @@ for (const file of ["AGENTS.md", "CLAUDE.md"]) {
     assert.match(seen, /haiku about pelicans/);
   });
 }
+
+const GUARDRAIL = { identifier: "gr-abc123", version: "DRAFT" };
+const CONVERSE_REQUEST = { modelId: FAUX_MODEL, messages: [{ role: "user", content: [{ text: "hello" }] }] };
+
+async function sentRequest(
+  provider: PiProviderConfig,
+  piProvider: string,
+  payload: Record<string, unknown>,
+): Promise<unknown> {
+  const request = sendingRequest(payload);
+  const pi = piEngineOn([request.step], { provider, piProvider });
+  const session = await pi.engine.open(openOptions(pi.projectDir));
+  session.send("hello");
+  await readTurns(session, 1);
+  await session.close();
+  assert.equal(request.sent.length, 1);
+  return request.sent[0];
+}
+
+test("PiEngine: a Bedrock request carries the configured guardrail, though the session runs with extensions disabled", async () => {
+  const sent = await sentRequest(
+    { type: "bedrock", model: FAUX_MODEL, guardrail: GUARDRAIL },
+    "amazon-bedrock",
+    CONVERSE_REQUEST,
+  );
+  assert.deepEqual(sent, {
+    ...CONVERSE_REQUEST,
+    guardrailConfig: { guardrailIdentifier: "gr-abc123", guardrailVersion: "DRAFT" },
+  });
+});
+
+test("PiEngine: a request for a non-Bedrock model carries no guardrail", async () => {
+  const request = { model: FAUX_MODEL, messages: [{ role: "user", content: "hello" }] };
+  const sent = await sentRequest({ type: "anthropic", model: FAUX_MODEL, guardrail: GUARDRAIL }, "anthropic", request);
+  assert.deepEqual(sent, request);
+});
+
+test("PiEngine: with no guardrail configured, a Bedrock request is sent unchanged", async () => {
+  const sent = await sentRequest({ type: "bedrock", model: FAUX_MODEL }, "amazon-bedrock", CONVERSE_REQUEST);
+  assert.deepEqual(sent, CONVERSE_REQUEST);
+});
