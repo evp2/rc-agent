@@ -289,7 +289,6 @@ export interface ScriptedCommand {
   runs: { argv: readonly string[]; timeoutMs: number }[];
 }
 
-// Each run takes the next scripted result; once they run out, every run exits 0.
 export function scriptedCommand(results: Partial<CommandResult>[] = [], onRun?: () => void): ScriptedCommand {
   const runs: ScriptedCommand["runs"] = [];
   return {

@@ -1009,7 +1009,6 @@ function scriptedRuntime(replies: AssistantMessage[]): Pick<ModelRuntime, "strea
   };
 }
 
-// Holds the command until every call has asked for a renewal, so all three are waiting on the same run.
 function heldUntilAsked(times: number, result: number) {
   let release: () => void = () => undefined;
   const released = new Promise<void>((resolve) => (release = resolve));

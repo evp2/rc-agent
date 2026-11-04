@@ -1,5 +1,4 @@
 interface ClaudeEngineSettings {
-  /** The Claude Code executable to run. Absent means the one bundled with the Agent SDK. */
   claudeExecutable?: string;
 }
 
@@ -41,7 +40,6 @@ export interface SubagentProfiles {
 
 export interface BedrockGuardrail {
   identifier: string;
-  /** A published version number, or `DRAFT`. */
   version: string;
 }
 
@@ -50,9 +48,7 @@ export interface PiProviderConfig {
   model?: string;
   thinkingLevel?: PiThinkingLevel;
   subagents?: SubagentProfiles;
-  /** Only on provider.type `bedrock`. */
   guardrail?: BedrockGuardrail;
-  /** Bedrock only. Run without a shell when a call fails on expired credentials. */
   awsAuthRefresh?: string[];
 }
 

@@ -962,7 +962,6 @@ test("ClaudeEngine: the menu is refreshed after a Turn's init, and a slower star
   assert.ok(!rest.some((e) => e.type === "menu"), `a stale menu was published: ${JSON.stringify(rest)}`);
 });
 
-/** Every `options` the SDK's `query()` receives across a session's startup probes and one Turn. */
 async function optionsOfProbesAndOneTurn(provider: ClaudeProviderConfig): Promise<Options[]> {
   const seen: Options[] = [];
   const { query } = scriptedQuery([initWithSkills([]), result()], { onOptions: (options) => seen.push(options) });

@@ -17,9 +17,7 @@ export interface CommandResult {
 
 export type RunCommand = (argv: readonly string[], options: { timeoutMs: number }) => Promise<CommandResult>;
 
-/** A sign-in tool can wait on a browser, so this is generous. */
 const AWS_AUTH_REFRESH_TIMEOUT_MS = 5 * 60_000;
-/** Long enough that a command failing instantly is not re-run by every call that expires. */
 export const RENEWAL_COOLDOWN_MS = 30_000;
 const KILL_GRACE_MS = 5_000;
 const STDERR_KEPT_CHARS = 64 * 1024;
@@ -56,11 +54,9 @@ export const runCommand: RunCommand = (argv, { timeoutMs }) =>
 export interface CredentialRenewalDeps {
   run: RunCommand;
   now: () => number;
-  /** Re-reads the AWS profile files once the command has written new credentials to them. */
   reload: () => Promise<void>;
 }
 
-/** Runs `provider.awsAuthRefresh`. Its stdout is never read and its stderr only reaches the local log. */
 export class CredentialRenewal {
   constructor(
     private readonly argv: readonly string[],
@@ -70,10 +66,7 @@ export class CredentialRenewal {
   private inFlight: Promise<boolean> | undefined;
   private last: { finishedAt: number; renewed: boolean } | undefined;
 
-  /**
-   * Calls made while a run is in flight share it. Inside the cooldown after a run, nothing runs and the
-   * call gets that run's outcome, so a call sent on the old credentials is resent after a success.
-   */
+  // Inside the cooldown nothing runs and the call gets the last run's outcome, so a call sent on the old credentials is resent after a success.
   renew(): Promise<boolean> {
     if (this.inFlight) return this.inFlight;
     if (this.last && this.deps.now() - this.last.finishedAt < RENEWAL_COOLDOWN_MS) {
@@ -141,10 +134,7 @@ function isExpiredCredentials(message: AssistantMessage): boolean {
 
 type StreamSimple = ModelRuntime["streamSimple"];
 
-/**
- * Resends a Bedrock call whose credentials expired, once, after `renewal` succeeds. Only a failure that
- * comes before any output is resent, so the agent never sees half of one answer followed by another.
- */
+// Only an expiry before any output is resent, so the agent never sees half of one answer followed by another.
 export function renewExpiredCredentials(runtime: Pick<ModelRuntime, "streamSimple">, renewal: CredentialRenewal): void {
   const send: StreamSimple = runtime.streamSimple.bind(runtime);
   // A virtual model's call re-enters streamSimple, so an error already resent once can pass through here again.
@@ -175,7 +165,6 @@ function fail(outer: AssistantMessageEventStream, error: AssistantMessage): void
   outer.end(error);
 }
 
-/** Forwards `inner` to `outer`, unless it is an expiry before any output: then forwards nothing and returns that error. */
 async function relayUnlessExpired(
   inner: AssistantMessageEventStream,
   outer: AssistantMessageEventStream,

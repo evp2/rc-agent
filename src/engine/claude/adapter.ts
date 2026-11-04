@@ -42,7 +42,6 @@ type Menu = { skills: SkillInfo[]; localCommands: SkillInfo[] };
 export interface ClaudeEngineDeps {
   query: typeof realQuery;
   env: NodeJS.ProcessEnv;
-  /** Absent means the Claude Code executable bundled with the Agent SDK. */
   claudeExecutable?: string;
   /**
    * Reads the menu once when a session opens, so the phone has one before the

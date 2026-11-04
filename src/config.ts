@@ -152,12 +152,10 @@ export function loadConfig(path: string): ConnectorConfig {
     throw new Error("'provider.subagents' is only supported by the pi engine");
   }
   const claudeExecutable = optionalClaudeExecutable(p, engine ?? impliedEngine({ type: providerType } as ProviderConfig));
-  if (p.guardrail !== undefined && (engine !== "pi" || providerType !== "bedrock")) {
-    throw new Error("'provider.guardrail' is only supported by the pi engine with provider.type 'bedrock'");
-  }
-
-  if (p.awsAuthRefresh !== undefined && (engine !== "pi" || providerType !== "bedrock")) {
-    throw new Error("'provider.awsAuthRefresh' is only supported by the pi engine with provider.type 'bedrock'");
+  for (const key of ["guardrail", "awsAuthRefresh"]) {
+    if (p[key] !== undefined && (engine !== "pi" || providerType !== "bedrock")) {
+      throw new Error(`'provider.${key}' is only supported by the pi engine with provider.type 'bedrock'`);
+    }
   }
 
   let provider: ProviderConfig | PiProviderConfig;
