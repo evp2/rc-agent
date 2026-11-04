@@ -2,6 +2,9 @@ import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 
 import type { BedrockGuardrail } from "../../provider";
 
+export const GUARDRAIL_ID_FLAG = "bedrock-guardrail-id";
+export const GUARDRAIL_VERSION_FLAG = "bedrock-guardrail-version";
+
 export function createGuardrailExtension(guardrail: BedrockGuardrail): ExtensionFactory {
   return (pi) => {
     pi.on("before_provider_request", (event) => guardedRequest(event.payload, guardrail));

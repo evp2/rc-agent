@@ -8,6 +8,7 @@ import { after, test } from "node:test";
 import { fauxAssistantMessage, type FauxResponseStep, type JsonObject, type Usage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
+import { guardrailExtensionPath, subagentArgs } from "../src/engine/pi/subagent.ts";
 import type { EngineAnswer, EngineEvent, EngineUsage } from "../src/engine/types.ts";
 import type { PiProviderConfig } from "../src/provider.ts";
 import {
@@ -686,5 +687,104 @@ for (const signal of ["SIGKILL", "SIGTERM"] as const) {
     } finally {
       host.kill("SIGKILL");
     }
+  });
+}
+
+const GUARDRAIL = { identifier: "gr-abc123", version: "DRAFT" };
+const PI_BASE = { command: "node", args: ["cli.js"] };
+const GUARD = { extension: "/dist/guardrailExtension.js", guardrail: GUARDRAIL };
+const GUARD_ARGS = ["-e", GUARD.extension, "--bedrock-guardrail-id=gr-abc123", "--bedrock-guardrail-version=DRAFT"];
+
+test("subagentArgs: a Bedrock subagent with a guardrail loads the guardrail extension with its identifier and version", () => {
+  const settings = { model: "amazon-bedrock/claude", thinking: "low" };
+  assert.deepEqual(subagentArgs(PI_BASE, settings, GUARD), [...subagentArgs(PI_BASE, settings), ...GUARD_ARGS]);
+});
+
+test("subagentArgs: a subagent on any other provider is launched as before, even with a guardrail", () => {
+  const settings = { model: "anthropic/claude", thinking: "low" };
+  assert.deepEqual(subagentArgs(PI_BASE, settings, GUARD), subagentArgs(PI_BASE, settings));
+});
+
+test("subagentArgs: with no guardrail the arguments are unchanged", () => {
+  assert.deepEqual(subagentArgs(PI_BASE, { model: "amazon-bedrock/claude", thinking: "low" }), [
+    "cli.js",
+    "--mode",
+    "json",
+    "-p",
+    "--no-session",
+    "--no-extensions",
+    "--no-mcp",
+    "--tools",
+    "read,bash,edit,write",
+    "--model",
+    "amazon-bedrock/claude",
+    "--thinking",
+    "low",
+  ]);
+});
+
+async function bedrockChild(
+  provider: PiProviderConfig,
+  options: { guardrailExtension?: string; foreignProviders?: string[] } = {},
+) {
+  const record = recordFile();
+  const { session, it } = await openSession(
+    [startingSubagent({ say: "ok", record }, { id: "call-sub" }), fauxAssistantMessage("fine")],
+    { provider, piProvider: "amazon-bedrock", ...options },
+  );
+  session.send("go");
+  const events = await readUntil(it, isTurnEnd);
+  await session.close();
+  return { argv: recorded(record)?.argv, events };
+}
+
+const BEDROCK = { type: "bedrock", model: "faux-model" } as const;
+
+test("PiEngine: a Bedrock subagent is launched with the guardrail extension, identifier and version", async () => {
+  const { argv } = await bedrockChild({ ...BEDROCK, guardrail: GUARDRAIL });
+  assert.ok(argv, "the child ran");
+  assert.ok(argv.includes("--no-extensions"));
+  assert.equal(argv[argv.indexOf("-e") + 1], guardrailExtensionPath());
+  assert.ok(argv.includes("--bedrock-guardrail-id=gr-abc123"));
+  assert.ok(argv.includes("--bedrock-guardrail-version=DRAFT"));
+});
+
+test("PiEngine: a subagent profile on another provider is launched without the guardrail", async () => {
+  const { argv } = await bedrockChild(
+    { ...BEDROCK, guardrail: GUARDRAIL, subagents: { default: { model: `anthropic/${FOREIGN_MODEL}` } } },
+    { foreignProviders: ["anthropic"] },
+  );
+  assert.ok(argv, "the child ran");
+  assert.equal(argv.includes("-e"), false);
+  assert.equal(argv.some((a) => a.startsWith("--bedrock-guardrail")), false);
+});
+
+test("PiEngine: with no guardrail configured a Bedrock subagent loads no extension", async () => {
+  const { argv } = await bedrockChild(BEDROCK);
+  assert.ok(argv, "the child ran");
+  assert.equal(argv.includes("-e"), false);
+});
+
+test("PiEngine: a Bedrock subagent whose guardrail extension is missing does not run and the call fails", async () => {
+  const { argv, events } = await bedrockChild(
+    { ...BEDROCK, guardrail: GUARDRAIL },
+    { guardrailExtension: join(tmpdir(), "no-such-guardrail-extension.js") },
+  );
+  assert.equal(argv, undefined);
+  const result = only(events, "tool_result");
+  assert.equal(result.isError, true);
+  assert.match(result.text ?? "", /guardrail/);
+});
+
+for (const [what, guardrail] of [
+  ["identifier", { ...GUARDRAIL, identifier: "" }],
+  ["version", { ...GUARDRAIL, version: "" }],
+] as const) {
+  test(`PiEngine: a Bedrock subagent whose guardrail ${what} is empty does not run and the call fails`, async () => {
+    const { argv, events } = await bedrockChild({ ...BEDROCK, guardrail });
+    assert.equal(argv, undefined);
+    const result = only(events, "tool_result");
+    assert.equal(result.isError, true);
+    assert.match(result.text ?? "", /guardrail/);
   });
 }

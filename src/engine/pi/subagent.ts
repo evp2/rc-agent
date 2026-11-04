@@ -1,9 +1,11 @@
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Usage } from "@earendil-works/pi-ai";
 
-import type { SubagentProfiles } from "../../provider";
+import type { BedrockGuardrail, SubagentProfiles } from "../../provider";
+import { GUARDRAIL_ID_FLAG, GUARDRAIL_VERSION_FLAG } from "./guardrail";
 
 export interface SubagentCommand {
   command: string;
@@ -35,7 +37,45 @@ export function installedPi(): SubagentCommand {
   return { command: process.execPath, args: [join(dirname(entry), "bundle", "cli.js")] };
 }
 
-export function subagentArgs(base: SubagentCommand, settings: SubagentSettings): string[] {
+export interface SubagentGuard {
+  extension: string;
+  guardrail: BedrockGuardrail;
+}
+
+export function onBedrock(model: string): boolean {
+  return model.startsWith("amazon-bedrock/");
+}
+
+// Built next to the bundle as guardrailExtension.js; run from source, Pi loads the .ts entry itself.
+export function guardrailExtensionPath(): string | undefined {
+  return ["./guardrailExtension.js", "./guardrailExtension.ts"]
+    .map((name) => fileURLToPath(new URL(name, import.meta.url)))
+    .find((path) => existsSync(path));
+}
+
+export function subagentGuard(
+  guardrail: BedrockGuardrail,
+  extension: string | undefined,
+): SubagentGuard | { error: string } {
+  if (!guardrail.identifier || !guardrail.version) {
+    return { error: "The Bedrock guardrail's identifier or version is empty, so the subagent was not started." };
+  }
+  if (!extension || !existsSync(extension)) {
+    return { error: "The Bedrock guardrail extension is missing from the connector, so the subagent was not started." };
+  }
+  return { extension, guardrail };
+}
+
+export function subagentArgs(base: SubagentCommand, settings: SubagentSettings, guard?: SubagentGuard): string[] {
+  const guarded =
+    guard && onBedrock(settings.model)
+      ? [
+          "-e",
+          guard.extension,
+          `--${GUARDRAIL_ID_FLAG}=${guard.guardrail.identifier}`,
+          `--${GUARDRAIL_VERSION_FLAG}=${guard.guardrail.version}`,
+        ]
+      : [];
   return [
     ...base.args,
     "--mode",
@@ -50,6 +90,7 @@ export function subagentArgs(base: SubagentCommand, settings: SubagentSettings):
     settings.model,
     "--thinking",
     settings.thinking,
+    ...guarded,
   ];
 }
 

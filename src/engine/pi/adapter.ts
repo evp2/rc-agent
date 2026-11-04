@@ -52,6 +52,7 @@ export interface PiEngineDeps {
   projectDir: string;
   homeDir?: string;
   subagentCommand?: SubagentCommand;
+  subagentGuardrailExtension?: string;
   createModelRuntime?: () => Promise<ModelRuntime>;
 }
 
@@ -86,6 +87,8 @@ export class PiEngine implements Engine {
       (task) => opened?.finished(task),
       {
         ...(this.deps.subagentCommand ? { command: this.deps.subagentCommand } : {}),
+        ...(this.deps.provider.guardrail ? { guardrail: this.deps.provider.guardrail } : {}),
+        ...(this.deps.subagentGuardrailExtension ? { guardrailExtension: this.deps.subagentGuardrailExtension } : {}),
         settings: (profile) => {
           const model = piSession?.model;
           if (!model) throw new Error("the session has no model");

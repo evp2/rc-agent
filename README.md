@@ -146,8 +146,10 @@ sends carry an Amazon Bedrock guardrail:
 such as `"1"`, or `"DRAFT"`; both are required, non-empty strings. It is set in the
 config only, with no environment variable. The connector refuses to start when
 `guardrail` is set on any engine other than Pi, or on Pi with a provider other
-than `bedrock`. It applies to the session's own requests only: a subagent's
-requests don't carry it.
+than `bedrock`. A subagent on a Bedrock model carries it too, and fails closed:
+if the connector can't apply the guardrail to the subagent, the subagent
+doesn't run and the call fails, rather than sending a request without it. A
+subagent on another provider runs without it.
 
 Treat it as defence in depth, not the only control: an IAM policy that denies
 Bedrock requests without the guardrail remains the backstop.

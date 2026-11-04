@@ -4,8 +4,18 @@ import { randomUUID } from "node:crypto";
 import type { Usage } from "@earendil-works/pi-ai";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 
+import type { BedrockGuardrail } from "../../provider";
 import type { EngineEvent } from "../types";
-import { ChildStream, installedPi, type SubagentCommand, type SubagentSettings, subagentArgs } from "./subagent";
+import {
+  ChildStream,
+  guardrailExtensionPath,
+  installedPi,
+  onBedrock,
+  type SubagentCommand,
+  type SubagentSettings,
+  subagentArgs,
+  subagentGuard,
+} from "./subagent";
 
 export const MAX_BACKGROUND_TASKS = 4;
 
@@ -29,6 +39,8 @@ export type StartedTask = { ok: true; taskId: string; finished: Promise<Finished
 
 export interface SubagentLauncher {
   command?: SubagentCommand;
+  guardrail?: BedrockGuardrail;
+  guardrailExtension?: string;
   settings(profile?: string): SubagentSettings | { error: string };
 }
 
@@ -137,6 +149,11 @@ export class TaskRegistry {
     const launcher = this.subagents;
     const settings = launcher.settings(profile);
     if ("error" in settings) return { ok: false, reason: settings.error };
+    const guard =
+      launcher.guardrail && onBedrock(settings.model)
+        ? subagentGuard(launcher.guardrail, launcher.guardrailExtension ?? guardrailExtensionPath())
+        : undefined;
+    if (guard && "error" in guard) return { ok: false, reason: guard.error };
     const base = launcher.command ?? installedPi();
     return this.start({
       toolUseId,
@@ -144,7 +161,7 @@ export class TaskRegistry {
       foreground,
       description: description.trim() || describe(prompt),
       command: base.command,
-      args: subagentArgs(base, settings),
+      args: subagentArgs(base, settings, guard),
       stdin: prompt,
       piProvider: settings.model.slice(0, settings.model.indexOf("/")),
     });

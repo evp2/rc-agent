@@ -15,7 +15,11 @@ try {
 }
 
 await esbuild.build({
-  entryPoints: { index: "src/cli/index.ts", main: "src/cli/main.ts" },
+  entryPoints: {
+    index: "src/cli/index.ts",
+    main: "src/cli/main.ts",
+    guardrailExtension: "src/engine/pi/guardrailExtension.ts",
+  },
   bundle: true,
   platform: "node",
   // package.json declares "type": "module", so dist/index.js is loaded as ESM.

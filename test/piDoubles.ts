@@ -69,6 +69,7 @@ export function piEngineOn(
     homeDir?: string;
     projectDir?: string;
     realChild?: boolean;
+    guardrailExtension?: string;
   } = {},
 ): PiTestEngine {
   const faux = fauxProvider({
@@ -83,6 +84,7 @@ export function piEngineOn(
     projectDir,
     homeDir: options.homeDir ?? freshProjectDir(),
     ...(options.realChild ? {} : { subagentCommand: { command: process.execPath, args: [FAKE_PI] } }),
+    ...(options.guardrailExtension ? { subagentGuardrailExtension: options.guardrailExtension } : {}),
     createModelRuntime: async () => {
       const credentials = new InMemoryCredentialStore();
       if (options.subscription) {
