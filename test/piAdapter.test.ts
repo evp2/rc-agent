@@ -3,8 +3,15 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { type FauxResponseStep, fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  type AssistantMessage,
+  createAssistantMessageEventStream,
+  type FauxResponseStep,
+  fauxAssistantMessage,
+  fauxText,
+  fauxToolCall,
+} from "@earendil-works/pi-ai";
+import { type ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import type { Engine, EngineAnswer, EngineEvent, EngineQuestion, EngineSession } from "../src/engine/types.ts";
 import {
@@ -14,7 +21,12 @@ import {
   type EngineGuaranteeHarness,
 } from "./engineGuaranteeSuite.ts";
 import type { PiProviderConfig } from "../src/provider.ts";
-import { runCommand } from "../src/engine/pi/awsAuthRefresh.ts";
+import {
+  CredentialRenewal,
+  RENEWAL_COOLDOWN_MS,
+  renewExpiredCredentials,
+  runCommand,
+} from "../src/engine/pi/awsAuthRefresh.ts";
 import {
   answeringByPrompt,
   callingTools,
@@ -811,4 +823,196 @@ test("PiEngine: a refresh command that can't be started reports why instead of t
   const result = await runCommand(["/nonexistent/aws-sign-in"], { timeoutMs: 10_000 });
   assert.equal(result.exitCode, null);
   assert.match(result.stderr, /ENOENT/);
+});
+
+async function turnsInOrder(pi: ReturnType<typeof piEngineOn>, count: number): Promise<unknown[]> {
+  const session = await pi.engine.open(openOptions(pi.projectDir));
+  const it = session.events[Symbol.asyncIterator]();
+  const endings: unknown[] = [];
+  while (endings.length < count) {
+    session.send(`command ${endings.length + 1}`);
+    for (;;) {
+      const next = await it.next();
+      if (next.done) throw new Error("event stream ended");
+      if (next.value.type === "turn_ended") {
+        endings.push(withoutDurations([next.value])[0]);
+        break;
+      }
+    }
+  }
+  await session.close();
+  return endings;
+}
+
+function manualClock(): { now: () => number; advance: (ms: number) => void } {
+  let time = 1_000_000;
+  return { now: () => time, advance: (ms) => (time += ms) };
+}
+
+function advancingFirst(advance: () => void, step: FauxResponseStep): FauxResponseStep {
+  return (context, options, state, model) => {
+    advance();
+    return typeof step === "function" ? step(context, options, state, model) : step;
+  };
+}
+
+const SUCCEEDED = { type: "turn_ended", outcome: "success" };
+const EXPIRED = { type: "turn_ended", outcome: "error", errors: [EXPIRED_TOKEN] };
+
+test("PiEngine: after a failed refresh, an expiry inside the cooldown surfaces its error without running the command", async (t) => {
+  t.mock.method(console, "error", () => undefined);
+  const clock = manualClock();
+  const command = scriptedCommand([{ exitCode: 1 }], () => clock.advance(4_000));
+  const endings = await turnsInOrder(
+    onBedrock(
+      [failingWith(EXPIRED_TOKEN), advancingFirst(() => clock.advance(RENEWAL_COOLDOWN_MS - 1), failingWith(EXPIRED_TOKEN))],
+      { runCommand: command.run, now: clock.now },
+    ),
+    2,
+  );
+  assert.equal(command.runs.length, 1);
+  assert.deepEqual(endings, [EXPIRED, EXPIRED]);
+});
+
+test("PiEngine: a successful refresh starts the cooldown too, so an expiry inside it surfaces its error", async () => {
+  const clock = manualClock();
+  const command = scriptedCommand([], () => clock.advance(4_000));
+  const endings = await turnsInOrder(
+    onBedrock(
+      [
+        failingWith(EXPIRED_TOKEN),
+        fauxAssistantMessage("renewed"),
+        advancingFirst(() => clock.advance(RENEWAL_COOLDOWN_MS - 1), failingWith(EXPIRED_TOKEN)),
+        fauxAssistantMessage("never"),
+      ],
+      { runCommand: command.run, now: clock.now },
+    ),
+    2,
+  );
+  assert.equal(command.runs.length, 1);
+  assert.deepEqual(endings, [SUCCEEDED, EXPIRED]);
+});
+
+test("PiEngine: once the cooldown has passed, an expiry runs the refresh command again", async (t) => {
+  t.mock.method(console, "error", () => undefined);
+  const clock = manualClock();
+  const command = scriptedCommand([{ exitCode: 1 }], () => clock.advance(4_000));
+  const endings = await turnsInOrder(
+    onBedrock(
+      [
+        failingWith(EXPIRED_TOKEN),
+        advancingFirst(() => clock.advance(RENEWAL_COOLDOWN_MS), failingWith(EXPIRED_TOKEN)),
+        fauxAssistantMessage("renewed"),
+      ],
+      { runCommand: command.run, now: clock.now },
+    ),
+    2,
+  );
+  assert.equal(command.runs.length, 2);
+  assert.deepEqual(endings, [EXPIRED, SUCCEEDED]);
+});
+
+test("PiEngine: a refresh runner that throws does not leave a later expiry waiting on it", async (t) => {
+  t.mock.method(console, "error", () => undefined);
+  const clock = manualClock();
+  let runs = 0;
+  const endings = await turnsInOrder(
+    onBedrock(
+      [
+        failingWith(EXPIRED_TOKEN),
+        advancingFirst(() => clock.advance(RENEWAL_COOLDOWN_MS), failingWith(EXPIRED_TOKEN)),
+        fauxAssistantMessage("renewed"),
+      ],
+      {
+        runCommand: async () => {
+          if (++runs === 1) throw new Error("spawn exploded");
+          return { exitCode: 0, signal: null, stderr: "" };
+        },
+        now: clock.now,
+      },
+    ),
+    2,
+  );
+  assert.equal(runs, 2);
+  assert.deepEqual(endings, [EXPIRED, SUCCEEDED]);
+});
+
+const BEDROCK_MODEL = { provider: "amazon-bedrock", id: FAUX_MODEL } as Parameters<ModelRuntime["streamSimple"]>[0];
+const NO_CONTEXT = { messages: [] } as Parameters<ModelRuntime["streamSimple"]>[1];
+
+function onBedrockModel(text: string, stopReason: "stop" | "error" = "stop"): AssistantMessage {
+  return {
+    ...fauxAssistantMessage(stopReason === "error" ? [] : text, {
+      stopReason,
+      ...(stopReason === "error" ? { errorMessage: text } : {}),
+    }),
+    provider: "amazon-bedrock",
+  };
+}
+
+function scriptedRuntime(replies: AssistantMessage[]): Pick<ModelRuntime, "streamSimple"> & { calls: () => number } {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    streamSimple: () => {
+      const reply = replies[calls++]!;
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => {
+        stream.push(
+          reply.stopReason === "error"
+            ? { type: "error", reason: "error", error: reply }
+            : { type: "done", reason: "stop", message: reply },
+        );
+        stream.end(reply);
+      });
+      return stream;
+    },
+  };
+}
+
+// Holds the command until every call has asked for a renewal, so all three are waiting on the same run.
+function heldUntilAsked(times: number, result: number) {
+  let release: () => void = () => undefined;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  const command = scriptedCommand([{ exitCode: result }]);
+  const renewal = new CredentialRenewal(RENEW, {
+    run: async (argv, options) => {
+      await released;
+      return command.run(argv, options);
+    },
+    now: Date.now,
+    reload: async () => undefined,
+  });
+  const renew = renewal.renew.bind(renewal);
+  let asked = 0;
+  renewal.renew = () => {
+    if (++asked === times) release();
+    return renew();
+  };
+  return { renewal, command, asked: () => asked };
+}
+
+test("PiEngine: three Bedrock calls that expire together share one run of the refresh command, and each is resent once", async () => {
+  const runtime = scriptedRuntime([
+    ...[1, 2, 3].map(() => onBedrockModel(EXPIRED_TOKEN, "error")),
+    ...[1, 2, 3].map((n) => onBedrockModel(`renewed ${n}`)),
+  ]);
+  const { renewal, command, asked } = heldUntilAsked(3, 0);
+  renewExpiredCredentials(runtime, renewal);
+  const results = await Promise.all([1, 2, 3].map(() => runtime.streamSimple(BEDROCK_MODEL, NO_CONTEXT).result()));
+  assert.equal(asked(), 3);
+  assert.equal(command.runs.length, 1);
+  assert.equal(runtime.calls(), 6);
+  assert.deepEqual(results.map((r) => r.stopReason).sort(), ["stop", "stop", "stop"]);
+});
+
+test("PiEngine: three Bedrock calls sharing a refresh that fails each surface their original error", async (t) => {
+  t.mock.method(console, "error", () => undefined);
+  const runtime = scriptedRuntime([1, 2, 3].map(() => onBedrockModel(EXPIRED_TOKEN, "error")));
+  const { renewal, command } = heldUntilAsked(3, 1);
+  renewExpiredCredentials(runtime, renewal);
+  const results = await Promise.all([1, 2, 3].map(() => runtime.streamSimple(BEDROCK_MODEL, NO_CONTEXT).result()));
+  assert.equal(command.runs.length, 1);
+  assert.equal(runtime.calls(), 3);
+  assert.deepEqual(results.map((r) => r.errorMessage), [EXPIRED_TOKEN, EXPIRED_TOKEN, EXPIRED_TOKEN]);
 });

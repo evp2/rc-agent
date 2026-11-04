@@ -19,6 +19,8 @@ export type RunCommand = (argv: readonly string[], options: { timeoutMs: number 
 
 /** A sign-in tool can wait on a browser, so this is generous. */
 const AWS_AUTH_REFRESH_TIMEOUT_MS = 5 * 60_000;
+/** Long enough that a command failing instantly is not re-run by every call that expires. */
+export const RENEWAL_COOLDOWN_MS = 30_000;
 const KILL_GRACE_MS = 5_000;
 const STDERR_KEPT_CHARS = 64 * 1024;
 const STDERR_LOGGED_CHARS = 2_000;
@@ -65,8 +67,26 @@ export class CredentialRenewal {
     private readonly deps: CredentialRenewalDeps,
   ) {}
 
-  /** True when the command exited 0 and the profile files were re-read. */
-  async renew(): Promise<boolean> {
+  private inFlight: Promise<boolean> | undefined;
+  private finishedAt: number | undefined;
+
+  /** Calls made while a run is in flight share it; inside the cooldown after any run, nothing runs. */
+  renew(): Promise<boolean> {
+    if (this.inFlight) return this.inFlight;
+    if (this.finishedAt !== undefined && this.deps.now() - this.finishedAt < RENEWAL_COOLDOWN_MS) {
+      return Promise.resolve(false);
+    }
+    const run = this.run()
+      .catch(() => false)
+      .finally(() => {
+        this.inFlight = undefined;
+        this.finishedAt = this.deps.now();
+      });
+    this.inFlight = run;
+    return run;
+  }
+
+  private async run(): Promise<boolean> {
     const started = this.deps.now();
     const result = await this.deps
       .run(this.argv, { timeoutMs: AWS_AUTH_REFRESH_TIMEOUT_MS })

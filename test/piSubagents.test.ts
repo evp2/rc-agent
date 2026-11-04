@@ -16,6 +16,7 @@ import {
   type ChildPlan,
   FOREIGN_MODEL,
   piEngineOn,
+  scriptedCommand,
   startingShell,
   startingSubagent,
   untilAborted,
@@ -425,6 +426,28 @@ test("PiEngine: the child gets the session's directory, model and credentials-be
   assert.equal(flag("--model"), "anthropic/faux-model");
   assert.ok(flag("--thinking"));
   await session.close();
+});
+
+test("PiEngine: a subagent on Bedrock is launched with nothing that would let it run the refresh command", async () => {
+  const record = recordFile();
+  const renew = ["aws-sign-in-7c3e", "--profile", "dev"];
+  const command = scriptedCommand();
+  const { session, it } = await openSession(
+    [startingSubagent({ say: "ok", record }), fauxAssistantMessage("fine")],
+    {
+      piProvider: "amazon-bedrock",
+      provider: { type: "bedrock", model: "faux-model", awsAuthRefresh: renew },
+      runCommand: command.run,
+    },
+  );
+  session.send("go");
+  await readUntil(it, isTurnEnd);
+  await session.close();
+  const child = recorded(record)!;
+  assert.equal(child.argv[child.argv.indexOf("--model") + 1], "amazon-bedrock/faux-model");
+  assert.ok(child.argv.includes("--no-extensions"));
+  assert.doesNotMatch(child.argv.join(" "), /aws-sign-in-7c3e|awsAuthRefresh/);
+  assert.equal(command.runs.length, 0);
 });
 
 async function childFlags(provider: PiProviderConfig, profile?: string): Promise<(name: string) => string | undefined> {

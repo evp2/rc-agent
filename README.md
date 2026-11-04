@@ -175,6 +175,13 @@ that call fails too, its error ends the Turn and the command is not run again
 for it. Any other error, such as throttling or access denied, never runs the
 command.
 
+Calls that expire while the command is running, in any session, wait for that
+same run and are each sent again once when it finishes, so parallel work opens
+one sign-in, not several. For 30 seconds after a run finishes, whether it
+succeeded or failed, the command is not run again: a call that expires in that
+window ends with its expiry error. A command that fails instantly therefore
+cannot be re-run by every call.
+
 The command's stdout is discarded, and nothing it prints reaches the relay or
 the phone. If it exits non-zero, is killed, or runs past its 5-minute limit,
 the Turn ends with the original expiry error, and the connector's log records
@@ -182,10 +189,11 @@ the exit status and the end of its stderr, with credential-looking values
 redacted. The command needs no terminal: its stdin is closed.
 
 It is accepted only with `"engine": "pi"` and `provider.type` `bedrock`;
-anywhere else the connector refuses to start. Subagents never run it: each one
-uses the credentials current when it starts. The connector still re-reads the
-AWS profile files before every Bedrock Turn, so credentials renewed outside the
-connector are picked up without it.
+anywhere else the connector refuses to start. Subagents do not renew
+credentials: they never run the command, and each one uses the credentials
+current when it starts, so an expiry inside a subagent is not rescued. The
+connector still re-reads the AWS profile files before every Bedrock Turn, so
+credentials renewed outside the connector are picked up without it.
 
 ### Anthropic provider (claude.ai subscription or API key)
 
