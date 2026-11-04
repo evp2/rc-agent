@@ -177,10 +177,10 @@ command.
 
 Calls that expire while the command is running, in any session, wait for that
 same run and are each sent again once when it finishes, so parallel work opens
-one sign-in, not several. For 30 seconds after a run finishes, whether it
-succeeded or failed, the command is not run again: a call that expires in that
-window ends with its expiry error. A command that fails instantly therefore
-cannot be re-run by every call.
+one sign-in, not several. For 30 seconds after a run finishes, the command is
+not run again. A call that expires in that window after a successful run is
+sent again once on the renewed credentials; after a failed run it ends with its
+expiry error, so a command that fails instantly cannot be re-run by every call.
 
 The command's stdout is discarded, and nothing it prints reaches the relay or
 the phone. If it exits non-zero, is killed, or runs past its 5-minute limit,

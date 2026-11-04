@@ -874,7 +874,7 @@ test("PiEngine: after a failed refresh, an expiry inside the cooldown surfaces i
   assert.deepEqual(endings, [EXPIRED, EXPIRED]);
 });
 
-test("PiEngine: a successful refresh starts the cooldown too, so an expiry inside it surfaces its error", async () => {
+test("PiEngine: an expiry inside the cooldown after a successful refresh is resent without running the command", async () => {
   const clock = manualClock();
   const command = scriptedCommand([], () => clock.advance(4_000));
   const endings = await turnsInOrder(
@@ -883,6 +883,26 @@ test("PiEngine: a successful refresh starts the cooldown too, so an expiry insid
         failingWith(EXPIRED_TOKEN),
         fauxAssistantMessage("renewed"),
         advancingFirst(() => clock.advance(RENEWAL_COOLDOWN_MS - 1), failingWith(EXPIRED_TOKEN)),
+        fauxAssistantMessage("resent on the renewed credentials"),
+      ],
+      { runCommand: command.run, now: clock.now },
+    ),
+    2,
+  );
+  assert.equal(command.runs.length, 1);
+  assert.deepEqual(endings, [SUCCEEDED, SUCCEEDED]);
+});
+
+test("PiEngine: a call resent inside the cooldown after a successful refresh that expires again surfaces its error", async () => {
+  const clock = manualClock();
+  const command = scriptedCommand([], () => clock.advance(4_000));
+  const endings = await turnsInOrder(
+    onBedrock(
+      [
+        failingWith(EXPIRED_TOKEN),
+        fauxAssistantMessage("renewed"),
+        advancingFirst(() => clock.advance(1_000), failingWith(EXPIRED_TOKEN)),
+        failingWith(`${EXPIRED_TOKEN} again`),
         fauxAssistantMessage("never"),
       ],
       { runCommand: command.run, now: clock.now },
@@ -890,7 +910,26 @@ test("PiEngine: a successful refresh starts the cooldown too, so an expiry insid
     2,
   );
   assert.equal(command.runs.length, 1);
-  assert.deepEqual(endings, [SUCCEEDED, EXPIRED]);
+  assert.deepEqual(endings, [SUCCEEDED, { type: "turn_ended", outcome: "error", errors: [`${EXPIRED_TOKEN} again`] }]);
+});
+
+test("PiEngine: once the cooldown after a successful refresh has passed, an expiry runs the command again", async () => {
+  const clock = manualClock();
+  const command = scriptedCommand([], () => clock.advance(4_000));
+  const endings = await turnsInOrder(
+    onBedrock(
+      [
+        failingWith(EXPIRED_TOKEN),
+        fauxAssistantMessage("renewed"),
+        advancingFirst(() => clock.advance(RENEWAL_COOLDOWN_MS), failingWith(EXPIRED_TOKEN)),
+        fauxAssistantMessage("renewed again"),
+      ],
+      { runCommand: command.run, now: clock.now },
+    ),
+    2,
+  );
+  assert.equal(command.runs.length, 2);
+  assert.deepEqual(endings, [SUCCEEDED, SUCCEEDED]);
 });
 
 test("PiEngine: once the cooldown has passed, an expiry runs the refresh command again", async (t) => {

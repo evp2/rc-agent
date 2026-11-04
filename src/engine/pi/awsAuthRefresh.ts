@@ -68,19 +68,23 @@ export class CredentialRenewal {
   ) {}
 
   private inFlight: Promise<boolean> | undefined;
-  private finishedAt: number | undefined;
+  private last: { finishedAt: number; renewed: boolean } | undefined;
 
-  /** Calls made while a run is in flight share it; inside the cooldown after any run, nothing runs. */
+  /**
+   * Calls made while a run is in flight share it. Inside the cooldown after a run, nothing runs and the
+   * call gets that run's outcome, so a call sent on the old credentials is resent after a success.
+   */
   renew(): Promise<boolean> {
     if (this.inFlight) return this.inFlight;
-    if (this.finishedAt !== undefined && this.deps.now() - this.finishedAt < RENEWAL_COOLDOWN_MS) {
-      return Promise.resolve(false);
+    if (this.last && this.deps.now() - this.last.finishedAt < RENEWAL_COOLDOWN_MS) {
+      return Promise.resolve(this.last.renewed);
     }
     const run = this.run()
       .catch(() => false)
-      .finally(() => {
+      .then((renewed) => {
         this.inFlight = undefined;
-        this.finishedAt = this.deps.now();
+        this.last = { finishedAt: this.deps.now(), renewed };
+        return renewed;
       });
     this.inFlight = run;
     return run;
