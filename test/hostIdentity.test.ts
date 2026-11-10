@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { execFile, execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -91,3 +91,32 @@ test("an unreadable host id file is replaced rather than failing session creatio
   assert.equal(typeof bodies[0].host_id, "string");
   assert.equal(bodies[1].host_id, bodies[0].host_id);
 });
+
+test("Connectors starting at once on a fresh machine all settle on one host id", async () => {
+  const home = mkdtempSync(join(tmpdir(), "crc-host-home-"));
+  const startAt = Date.now() + 3_000;
+  const ids = await Promise.all(
+    Array.from(
+      { length: 8 },
+      () =>
+        new Promise<string>((resolve, reject) => {
+          execFile(
+            process.execPath,
+            ["--import", "tsx", "--input-type=module", "-e", identityAt(startAt)],
+            { env: { ...process.env, HOME: home }, encoding: "utf-8" },
+            (err, stdout) => (err ? reject(err) : resolve(stdout.trim())),
+          );
+        }),
+    ),
+  );
+
+  assert.equal(new Set(ids).size, 1, ids.join("\n"));
+  assert.equal(JSON.parse(readFileSync(join(home, ".claude-remote-control", "host.json"), "utf-8")).hostId, ids[0]);
+});
+
+// Every process loads first, then spins to one shared instant, so their first reads of host.json race.
+const identityAt = (startAt: number) => `
+const { hostIdentity } = await import(${JSON.stringify(new URL("../src/host.ts", import.meta.url).href)});
+while (Date.now() < ${startAt});
+console.log(hostIdentity().hostId);
+`;

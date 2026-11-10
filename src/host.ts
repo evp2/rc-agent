@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { linkSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +35,19 @@ function writeHostId(): string {
   const hostId = randomUUID();
   const tmp = `${HOST_FILE}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify({ hostId })}\n`, { mode: 0o600 });
+  try {
+    // A link, unlike a rename, refuses to replace a host.json another Connector created meanwhile.
+    linkSync(tmp, HOST_FILE);
+    rmSync(tmp);
+    return hostId;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  const raced = readHostId();
+  if (raced) {
+    rmSync(tmp);
+    return raced;
+  }
   renameSync(tmp, HOST_FILE);
-  return hostId;
+  return readHostId() ?? hostId;
 }
