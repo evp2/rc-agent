@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
-import { RelayClient } from "../src/relay/client.ts";
-import { CONNECTOR_VERSION } from "../src/version.ts";
+import type { RelayClient as RelayClientType } from "../src/relay/client.ts";
+
+// Session creation records the host id under HOME, fixed when the client loads.
+process.env.HOME = mkdtempSync(join(tmpdir(), "crc-relay-client-home-"));
+const { RelayClient } = await import("../src/relay/client.ts");
+const { CONNECTOR_VERSION } = await import("../src/version.ts");
 
 /**
  * Observed in production: a relay request whose connection hangs (no
@@ -232,7 +239,7 @@ test("uploadFile streams the file from disk rather than reading it whole into me
 });
 
 /** A RelayClient resumed against a relay faked just long enough to construct it. */
-async function withFakeResume(): Promise<RelayClient> {
+async function withFakeResume(): Promise<RelayClientType> {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch;
   try {

@@ -1,6 +1,7 @@
 import { openAsBlob } from "node:fs";
 
 import type { EngineKind } from "../engine/types";
+import { hostIdentity } from "../host";
 import type { ProviderConfig } from "../provider";
 import { CONNECTOR_VERSION } from "../version";
 
@@ -210,6 +211,7 @@ export class RelayClient {
     staticUrl: string | undefined;
     controlUrl: string | undefined;
   }> {
+    const host = hostIdentity();
     const res = await boundedFetch(
       `${relayBaseUrl}/sessions`,
       {
@@ -225,6 +227,8 @@ export class RelayClient {
           provider_model: input.providerModel,
           provider_region: input.providerRegion,
           project_dir: input.projectDir,
+          host_id: host.hostId,
+          host_name: host.hostName,
         }),
       },
       requestTimeoutMs,
