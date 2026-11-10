@@ -72,6 +72,48 @@ await RelayClient.create("https://relay.test", "c", { permissionMode: "bypassPer
 console.log(sent.host_id);
 `;
 
+type Request = { method: string; url: string; body?: Record<string, unknown> };
+
+async function resumeSession(respond: (req: Request) => Response): Promise<Request[]> {
+  const realFetch = globalThis.fetch;
+  const requests: Request[] = [];
+  globalThis.fetch = (async (url: string, init: RequestInit = {}) => {
+    const req = {
+      method: init.method ?? "GET",
+      url,
+      body: init.body ? JSON.parse(init.body as string) : undefined,
+    };
+    requests.push(req);
+    return respond(req);
+  }) as typeof fetch;
+  try {
+    await RelayClient.resume("https://relay.test", "s1", "k");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  return requests;
+}
+
+const SNAPSHOT = () => new Response(JSON.stringify({ session_id: "s1", status: "active" }));
+
+test("resuming a session reports the same host id and hostname that session creation sends", async () => {
+  rmSync(homeDir, { recursive: true, force: true });
+  const [created] = await createSessions(1, mkdtempSync(join(tmpdir(), "crc-host-project-")));
+
+  const requests = await resumeSession(SNAPSHOT);
+
+  const report = requests.find((r) => r.method === "PUT" && r.url === "https://relay.test/sessions/s1/host");
+  assert.deepEqual(report?.body, { host_id: created.host_id, host_name: hostname() });
+});
+
+test("a relay that refuses the Host report still lets the session resume", async () => {
+  const requests = await resumeSession((req) =>
+    req.method === "PUT" ? new Response(JSON.stringify({ message: "Not Found" }), { status: 404 }) : SNAPSHOT(),
+  );
+
+  assert.ok(requests.some((r) => r.method === "PUT"));
+});
+
 test("two machines' homes never share a host id", async () => {
   rmSync(homeDir, { recursive: true, force: true });
   const [a] = await createSessions(1, mkdtempSync(join(tmpdir(), "crc-host-project-")));

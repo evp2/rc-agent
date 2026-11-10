@@ -268,6 +268,9 @@ export class RelayClient {
    * status probe is what distinguishes a
    * session that is still good from one that has ended or aged out, so callers
    * can fall back to {@link RelayClient.create} on {@link SessionEndedError}.
+   *
+   * Also reports this machine's Host, the only way a session created before
+   * Connectors sent one can gain it.
    */
   static async resume(
     relayBaseUrl: string,
@@ -277,7 +280,23 @@ export class RelayClient {
   ): Promise<RelayClient> {
     const client = new RelayClient(relayBaseUrl, sessionId, secret, requestTimeoutMs);
     await client.getSession();
+    await client.reportHost();
     return client;
+  }
+
+  /** Best-effort, and a 404 is not the session ending: a relay that predates the route answers it. */
+  private async reportHost(): Promise<void> {
+    try {
+      const host = hostIdentity();
+      const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/host`, {
+        method: "PUT",
+        headers: { "content-type": "application/json", ...this.authHeaders() },
+        body: JSON.stringify({ host_id: host.hostId, host_name: host.hostName }),
+      });
+      if (!res.ok && res.status !== 404) console.error(`Failed to report this Host: HTTP ${res.status}`);
+    } catch (e) {
+      console.error("Failed to report this Host:", (e as Error).message);
+    }
   }
 
   /**
