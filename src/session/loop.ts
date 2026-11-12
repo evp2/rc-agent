@@ -17,6 +17,7 @@ import { createBannerDeduper } from "./engineEvents";
 import { flushEvents } from "./events";
 import { showImage } from "./images";
 import { InFlight } from "./inFlight";
+import { memoryOptions } from "./memory";
 import { pumpEngineEvents } from "./pump";
 import { runTurn } from "./turn";
 import { answerQuestion, watchForKills, watchForSteers } from "./watchers";
@@ -217,6 +218,7 @@ export async function runConnector(config: ResolvedConnectorConfig): Promise<Run
     onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
     onShowImage: (image, signal) => showImage(ctx, image, signal),
     onArchiveFile: (file, signal) => archiveFile(ctx, file, signal),
+    ...(engine.kind === "pi" || engine.kind === "copilot" ? memoryOptions(config.projectDir) : {}),
   });
 
   ctx = {

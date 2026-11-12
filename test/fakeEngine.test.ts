@@ -13,10 +13,13 @@ import {
   type FakeEngineSession,
 } from "../src/engine/fakeEngine.ts";
 import { archivedText } from "../src/engine/archiveFileTool.ts";
+import { forgottenText, rememberedText } from "../src/engine/memoryTools.ts";
 import { IMAGE_SHOWN } from "../src/engine/showImageTool.ts";
 import type { EngineAnswer, EngineEvent, EngineQuestion } from "../src/engine/types.ts";
 import {
   ARCHIVE_FILE_CALL,
+  FORGET_CALL,
+  REMEMBER_CALL,
   runEngineGuaranteeSuite,
   SHOW_IMAGE_CALL,
   type ConnectorToolResult,
@@ -69,6 +72,43 @@ const harness: EngineGuaranteeHarness = {
       },
     });
     return { engine, toolResult: () => seen };
+  },
+
+  makeRememberEngine: () => {
+    let seen: ConnectorToolResult | undefined;
+    const engine = new FakeEngine({
+      handlerFor: () => async (ctx) => {
+        const outcome = await ctx.remember(REMEMBER_CALL);
+        seen = outcome.saved
+          ? { text: rememberedText(REMEMBER_CALL.scope, outcome.index, outcome.replaced), isError: false }
+          : { text: outcome.reason, isError: true };
+        return { outcome: "success" };
+      },
+    });
+    return { engine, toolResult: () => seen };
+  },
+
+  makeForgetEngine: () => {
+    let seen: ConnectorToolResult | undefined;
+    const engine = new FakeEngine({
+      handlerFor: () => async (ctx) => {
+        const outcome = await ctx.forget(FORGET_CALL);
+        seen = outcome.forgotten ? { text: forgottenText(FORGET_CALL.scope, outcome.index), isError: false } : { text: outcome.reason, isError: true };
+        return { outcome: "success" };
+      },
+    });
+    return { engine, toolResult: () => seen };
+  },
+
+  makeStartupTextEngine: () => {
+    let seen: string | undefined;
+    const engine = new FakeEngine({
+      handlerFor: () => async (ctx) => {
+        seen = ctx.startupText;
+        return { outcome: "success" };
+      },
+    });
+    return { engine, startupText: () => seen };
   },
 
   makeArchiveFileEngine: () => {

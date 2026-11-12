@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -8,6 +9,7 @@ import type { SessionEvent } from "@github/copilot-sdk";
 import { approveEverything, CopilotEngine } from "../src/engine/copilot/adapter.ts";
 import type { CopilotRuntime } from "../src/engine/copilot/runtime.ts";
 import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION } from "../src/engine/archiveFileTool.ts";
+import { memoryOptions } from "../src/session/memory.ts";
 import type {
   ArchiveFileOutcome,
   EngineAnswer,
@@ -28,8 +30,11 @@ import {
 } from "./copilotDoubles.ts";
 import {
   ARCHIVE_FILE_CALL,
+  FORGET_CALL,
+  REMEMBER_CALL,
   runEngineGuaranteeSuite,
   SHOW_IMAGE_CALL,
+  STARTUP_TEXT,
   type ConnectorToolResult,
   type EngineGuaranteeHarness,
 } from "./engineGuaranteeSuite.ts";
@@ -134,6 +139,27 @@ const harness: EngineGuaranteeHarness = {
   makeArchiveFileEngine: () => {
     const { toolUseId, path } = ARCHIVE_FILE_CALL;
     return toolCallingEngine("archive_file", toolUseId, { path });
+  },
+
+  makeRememberEngine: () => {
+    const { toolUseId, scope, name, description, content } = REMEMBER_CALL;
+    return toolCallingEngine("remember", toolUseId, { scope, name, description, content });
+  },
+
+  makeForgetEngine: () => {
+    const { toolUseId, scope, name } = FORGET_CALL;
+    return toolCallingEngine("forget", toolUseId, { scope, name });
+  },
+
+  makeStartupTextEngine: () => {
+    const runtime = new FakeCopilotRuntime({ onSend: (s) => s.emit(simpleTurn()) });
+    return {
+      engine: engineOn(runtime),
+      startupText: () => {
+        const message = runtime.sessions[0]?.options.systemMessage;
+        return message && message.mode !== "replace" ? message.content : undefined;
+      },
+    };
   },
 };
 
@@ -2130,6 +2156,78 @@ test("CopilotEngine: a session opened without onArchiveFile offers no archive_fi
 
   assert.ok(!runtime.session.options.tools?.some((t) => t.name === "archive_file"));
   await session.close();
+});
+
+test("CopilotEngine: remember is registered with its four fields, and only when onRemember is given", async () => {
+  const withIt = new FakeCopilotRuntime();
+  const session = await engineOn(withIt).open({ ...openOptions(), onRemember: async () => ({ saved: false, reason: "unused" }) });
+  const tool = withIt.session.options.tools?.find((t) => t.name === "remember");
+  assert.ok(tool, "remember is offered to the Engine");
+  assert.deepEqual((tool.parameters as { required?: string[] }).required,["scope", "name", "description", "content"]);
+  await session.close();
+
+  const without = new FakeCopilotRuntime();
+  const bare = await engineOn(without).open(openOptions());
+  assert.ok(!without.session.options.tools?.some((t) => t.name === "remember"));
+  await bare.close();
+});
+
+test("CopilotEngine: a remember call missing a field fails without reaching onRemember", async () => {
+  const runtime = new FakeCopilotRuntime();
+  let called = false;
+  const session = await engineOn(runtime).open({
+    ...openOptions(),
+    onRemember: async () => {
+      called = true;
+      return { saved: true, index: "" };
+    },
+  });
+  const reply = await runtime.session.callTool("remember", { name: "x" }, "call_mem");
+  assert.ok("result" in reply && typeof reply.result !== "string" && reply.result.resultType === "failure");
+  assert.equal(called, false);
+  await session.close();
+});
+
+test("CopilotEngine: the startup text is appended to Copilot's system message on create and on resume, and memory stays unset", async () => {
+  for (const resume of [undefined, "copilot-existing"]) {
+    const runtime = new FakeCopilotRuntime();
+    const session = await engineOn(runtime).open({ ...openOptions({ resume }), startupText: async () => STARTUP_TEXT });
+    assert.deepEqual(runtime.session.options.systemMessage, { mode: "append", content: STARTUP_TEXT });
+    assert.ok(!("memory" in runtime.session.options));
+    await session.close();
+  }
+});
+
+test("CopilotEngine: no startup text means no system message option", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open({ ...openOptions(), startupText: async () => undefined });
+  assert.ok(!("systemMessage" in runtime.session.options));
+  await session.close();
+});
+
+test("a Memory saved by a Copilot Session is told to a new Session, and one saved by another Engine reaches Copilot", async () => {
+  const root = mkdtempSync(join(tmpdir(), "copilot-memory-"));
+  try {
+    const first = new FakeCopilotRuntime();
+    const copilotSession = await engineOn(first).open({ ...openOptions(), ...memoryOptions(root, root) });
+    const { toolUseId, ...call } = REMEMBER_CALL;
+    await first.session.callTool("remember", call, toolUseId);
+    await copilotSession.close();
+    assert.ok((await memoryOptions(root, root).startupText!())?.includes("commit-style: How the person likes commits"));
+
+    await memoryOptions(root, root).onRemember!(
+      { toolUseId: "pi-1", scope: "global", name: "editor", description: "Preferred editor", content: "vim" },
+      new AbortController().signal,
+    );
+    const second = new FakeCopilotRuntime();
+    const next = await engineOn(second).open({ ...openOptions(), ...memoryOptions(root, root) });
+    const appended = second.session.options.systemMessage;
+    assert.ok(appended && appended.mode !== "replace" && appended.content?.includes("editor: Preferred editor"));
+    assert.ok(appended.content?.includes("commit-style"));
+    await next.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // --- Permissions ------------------------------------------------------------

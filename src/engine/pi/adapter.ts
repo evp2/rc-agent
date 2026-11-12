@@ -113,6 +113,7 @@ export class PiEngine implements Engine {
       cwd,
       previous ? SessionManager.open(previous) : SessionManager.create(cwd),
       connectorTools(options, tasks, this.deps.provider.subagents),
+      await options.startupText?.(),
     );
     piSession = session;
     opened = new PiEngineSession(
@@ -135,6 +136,7 @@ export class PiEngine implements Engine {
     cwd: string,
     sessionManager: SessionManager,
     customTools: ToolDefinition[] = [],
+    startupText?: string,
   ): Promise<AgentSession> {
     const { provider } = this.deps;
     const agentDir = getAgentDir();
@@ -169,6 +171,13 @@ export class PiEngine implements Engine {
         ...(provider.guardrail ? [createGuardrailExtension(provider.guardrail)] : []),
       ],
       additionalSkillPaths: claudeSkills,
+      ...(startupText
+        ? {
+            agentsFilesOverride: (base) => ({
+              agentsFiles: [...base.agentsFiles, { path: join(agentDir, "memories.md"), content: startupText }],
+            }),
+          }
+        : {}),
     });
     await resourceLoader.reload();
     const { session } = await createAgentSession({

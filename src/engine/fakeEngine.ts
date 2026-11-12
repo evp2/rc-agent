@@ -10,12 +10,17 @@ import type {
   EngineFile,
   EngineImage,
   EngineKind,
+  EngineForget,
+  EngineMemory,
   EngineQuestion,
   EngineSession,
   EngineUsage,
   OpenOptions,
+  ForgetOutcome,
+  RememberOutcome,
   ShowImageOutcome,
 } from "./types";
+import { forgottenText, rememberedText } from "./memoryTools";
 
 /** What a scripted Turn's body can do and observe, handed to a {@link FakeTurnHandler}. */
 export interface FakeTurnContext {
@@ -34,6 +39,12 @@ export interface FakeTurnContext {
   showImage(image: EngineImage): Promise<ShowImageOutcome>;
   /** Like {@link showImage}, for an `archive_file` call and `onArchiveFile`. */
   archiveFile(file: EngineFile): Promise<ArchiveFileOutcome>;
+  /** Like {@link showImage}, for a `remember` call and `onRemember`. */
+  remember(memory: EngineMemory): Promise<RememberOutcome>;
+  /** Like {@link showImage}, for a `forget` call and `onForget`. */
+  forget(forget: EngineForget): Promise<ForgetOutcome>;
+  /** The memory text the session was opened with, as the model would have been given it. */
+  readonly startupText: string | undefined;
   /**
    * Resolves the next time `steer()` is called while this Turn is running,
    * with the steered text. A handler that means to be steerable races this
@@ -141,6 +152,18 @@ class TurnController implements FakeTurnContext {
     return this.session.archiveFile(file, this);
   }
 
+  remember(memory: EngineMemory): Promise<RememberOutcome> {
+    return this.session.remember(memory, this);
+  }
+
+  forget(forget: EngineForget): Promise<ForgetOutcome> {
+    return this.session.forget(forget, this);
+  }
+
+  get startupText(): string | undefined {
+    return this.session.startupText;
+  }
+
   waitForSteer(): Promise<string> {
     // A Turn that ends (or is stopped) without ever being Steered leaves this
     // hanging rather than rejecting, since nothing is left that will ever
@@ -203,6 +226,7 @@ class FakeEngineSessionImpl implements FakeEngineSession {
   constructor(
     private readonly script: FakeEngineScript,
     private readonly options: OpenOptions,
+    readonly startupText?: string,
   ) {
     this.canSteer = script.capabilities?.steer ?? true;
     this.pumpPromise = this.pump();
@@ -249,6 +273,33 @@ class FakeEngineSessionImpl implements FakeEngineSession {
       { path: file.path },
       (signal) => onArchiveFile(file, signal),
       (outcome) => (outcome.archived ? { text: "archived", isError: false } : { text: outcome.reason, isError: true }),
+    );
+  }
+
+  async remember(memory: EngineMemory, turn: TurnController): Promise<RememberOutcome> {
+    const onRemember = this.options.onRemember;
+    if (!onRemember) throw new Error("this session was opened without onRemember");
+    return this.runTool(
+      turn,
+      memory.toolUseId,
+      "remember",
+      { scope: memory.scope, name: memory.name, description: memory.description, content: memory.content },
+      (signal) => onRemember(memory, signal),
+      (outcome) =>
+        outcome.saved ? { text: rememberedText(memory.scope, outcome.index, outcome.replaced), isError: false } : { text: outcome.reason, isError: true },
+    );
+  }
+
+  async forget(forget: EngineForget, turn: TurnController): Promise<ForgetOutcome> {
+    const onForget = this.options.onForget;
+    if (!onForget) throw new Error("this session was opened without onForget");
+    return this.runTool(
+      turn,
+      forget.toolUseId,
+      "forget",
+      { scope: forget.scope, name: forget.name },
+      (signal) => onForget(forget, signal),
+      (outcome) => (outcome.forgotten ? { text: forgottenText(forget.scope, outcome.index), isError: false } : { text: outcome.reason, isError: true }),
     );
   }
 
@@ -463,7 +514,7 @@ export class FakeEngine implements Engine {
 
   async open(options: OpenOptions): Promise<FakeEngineSession> {
     if (this.script.failOpen) throw this.script.failOpen;
-    return new FakeEngineSessionImpl(this.script, options);
+    return new FakeEngineSessionImpl(this.script, options, await options.startupText?.());
   }
 }
 

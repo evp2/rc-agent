@@ -11,6 +11,7 @@ import {
   type ModelInfo,
   type PermissionHandler,
   type SessionEvent,
+  type SystemMessageConfig,
   type Tool,
 } from "@github/copilot-sdk";
 
@@ -113,6 +114,7 @@ export interface CopilotSessionOptions {
   onUserInputRequest: (request: CopilotUserInputRequest) => Promise<CopilotUserInputResponse>;
   /** The connector's own tools, run in this process when the model calls them. */
   tools?: Tool[];
+  systemMessage?: SystemMessageConfig;
   /** Effort and context tier from the developer's own Copilot settings. */
   reasoningEffort?: ReasoningEffort;
   contextTier?: ContextTier;
@@ -322,6 +324,7 @@ export function sdkSessionConfig(options: CopilotSessionOptions) {
     // asked can carry on without an answer rather than wait for one.
     onElicitationRequest: () => ({ action: "decline" as const }),
     ...(options.tools ? { tools: options.tools } : {}),
+    ...(options.systemMessage ? { systemMessage: options.systemMessage } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     ...(options.contextTier ? { contextTier: options.contextTier } : {}),
   };

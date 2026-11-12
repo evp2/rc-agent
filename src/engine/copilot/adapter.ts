@@ -9,6 +9,25 @@ import type { CopilotProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
 import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION, archivedText, forwardArchiveFile } from "../archiveFileTool";
 import {
+  forwardRemember,
+  REMEMBER_CONTENT_DESCRIPTION,
+  REMEMBER_DESCRIPTION,
+  REMEMBER_DESCRIPTION_DESCRIPTION,
+  REMEMBER_NAME_DESCRIPTION,
+  REMEMBER_SCOPE_DESCRIPTION,
+  REMEMBER_SCOPES,
+  isRememberScope,
+  rememberedText,
+  forgottenText,
+  forwardForget,
+  forgetNameMissingText,
+  forgetScopeInvalidText,
+  rememberFieldsMissingText,
+  rememberScopeInvalidText,
+  FORGET_DESCRIPTION,
+  FORGET_NAME_DESCRIPTION,
+} from "../memoryTools";
+import {
   forwardShowImage,
   IMAGE_SHOWN,
   SHOW_IMAGE_CAPTION_DESCRIPTION,
@@ -142,11 +161,84 @@ function archiveFileTool(
   };
 }
 
+/** Like {@link showImageTool}, for `remember` and `onRemember`. */
+function rememberTool(onRemember: NonNullable<OpenOptions["onRemember"]>): Tool {
+  return {
+    name: "remember",
+    description: REMEMBER_DESCRIPTION,
+    parameters: {
+      type: "object",
+      properties: {
+        scope: { type: "string", enum: [...REMEMBER_SCOPES], description: REMEMBER_SCOPE_DESCRIPTION },
+        name: { type: "string", description: REMEMBER_NAME_DESCRIPTION },
+        description: { type: "string", description: REMEMBER_DESCRIPTION_DESCRIPTION },
+        content: { type: "string", description: REMEMBER_CONTENT_DESCRIPTION },
+      },
+      required: ["scope", "name", "description", "content"],
+    },
+    skipPermission: true,
+    defer: "never",
+    handler: async (args, invocation): Promise<ToolResultObject> => {
+      const { scope, name, description, content } = (args ?? {}) as {
+        scope?: unknown;
+        name?: unknown;
+        description?: unknown;
+        content?: unknown;
+      };
+      if (!isRememberScope(scope)) return failure(rememberScopeInvalidText());
+      if (typeof name !== "string" || typeof description !== "string" || typeof content !== "string") {
+        return failure(rememberFieldsMissingText());
+      }
+      const outcome = await forwardRemember(
+        onRemember,
+        { toolUseId: invocation.toolCallId, scope, name, description, content },
+        invocation.signal ?? new AbortController().signal,
+      );
+      return outcome.saved
+        ? { textResultForLlm: rememberedText(scope, outcome.index, outcome.replaced), resultType: "success" }
+        : failure(outcome.reason);
+    },
+  };
+}
+
+/** Like {@link showImageTool}, for `forget` and `onForget`. */
+function forgetTool(onForget: NonNullable<OpenOptions["onForget"]>): Tool {
+  return {
+    name: "forget",
+    description: FORGET_DESCRIPTION,
+    parameters: {
+      type: "object",
+      properties: {
+        scope: { type: "string", enum: [...REMEMBER_SCOPES], description: REMEMBER_SCOPE_DESCRIPTION },
+        name: { type: "string", description: FORGET_NAME_DESCRIPTION },
+      },
+      required: ["scope", "name"],
+    },
+    skipPermission: true,
+    defer: "never",
+    handler: async (args, invocation): Promise<ToolResultObject> => {
+      const { scope, name } = (args ?? {}) as { scope?: unknown; name?: unknown };
+      if (!isRememberScope(scope)) return failure(forgetScopeInvalidText());
+      if (typeof name !== "string") return failure(forgetNameMissingText());
+      const outcome = await forwardForget(
+        onForget,
+        { toolUseId: invocation.toolCallId, scope, name },
+        invocation.signal ?? new AbortController().signal,
+      );
+      return outcome.forgotten
+        ? { textResultForLlm: forgottenText(scope, outcome.index), resultType: "success" }
+        : failure(outcome.reason);
+    },
+  };
+}
+
 /** The connector's own tools, each offered only when the session was opened with its callback. */
 function connectorTools(options: OpenOptions, stoppable: Set<AbortController>): Tool[] {
   return [
     ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
     ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile, stoppable)] : []),
+    ...(options.onRemember ? [rememberTool(options.onRemember)] : []),
+    ...(options.onForget ? [forgetTool(options.onForget)] : []),
   ];
 }
 
@@ -1272,6 +1364,7 @@ export class CopilotEngine implements Engine {
     let engineSession: CopilotEngineSession | undefined;
     const stoppable = new Set<AbortController>();
     const tools = connectorTools(options, stoppable);
+    const startupText = await options.startupText?.();
     const sessionOptions: CopilotSessionOptions = {
       model: this.deps.model,
       workingDirectory: options.projectDir,
@@ -1279,6 +1372,7 @@ export class CopilotEngine implements Engine {
       onUserInputRequest: (request) =>
         engineSession ? engineSession.ask(request) : Promise.reject(new Error("the session isn't open yet")),
       ...(tools.length ? { tools } : {}),
+      ...(startupText ? { systemMessage: { mode: "append" as const, content: startupText } } : {}),
     };
     // The menu is read before the session is handed over, so the first
     // Command can already be told apart from a Local command.

@@ -16,6 +16,8 @@ import { type ModelRuntime, SessionManager } from "@earendil-works/pi-coding-age
 import type { Engine, EngineAnswer, EngineEvent, EngineQuestion, EngineSession } from "../src/engine/types.ts";
 import {
   ARCHIVE_FILE_CALL,
+  FORGET_CALL,
+  REMEMBER_CALL,
   runEngineGuaranteeSuite,
   SHOW_IMAGE_CALL,
   type EngineGuaranteeHarness,
@@ -71,6 +73,24 @@ const harness: EngineGuaranteeHarness = {
     const { toolUseId: id, path, caption } = SHOW_IMAGE_CALL;
     const model = callingTools([{ name: "show_image", args: { path, caption: caption! }, id }]);
     return { engine: piEngineOn(model.steps).engine, toolResult: () => model.results().get(id) };
+  },
+  makeRememberEngine: () => {
+    const { toolUseId: id, scope, name, description, content } = REMEMBER_CALL;
+    const model = callingTools([{ name: "remember", args: { scope, name, description, content }, id }]);
+    return { engine: piEngineOn(model.steps).engine, toolResult: () => model.results().get(id) };
+  },
+  makeForgetEngine: () => {
+    const { toolUseId: id, scope, name } = FORGET_CALL;
+    const model = callingTools([{ name: "forget", args: { scope, name }, id }]);
+    return { engine: piEngineOn(model.steps).engine, toolResult: () => model.results().get(id) };
+  },
+  makeStartupTextEngine: () => {
+    let prompt: string | undefined;
+    const step: FauxResponseStep = (context) => {
+      prompt = JSON.stringify(context.messages.filter((m) => m.role === "system")).replaceAll("\\n", "\n");
+      return fauxAssistantMessage("hi");
+    };
+    return { engine: piEngineOn([step]).engine, startupText: () => prompt };
   },
   makeArchiveFileEngine: () => {
     const { toolUseId: id, path } = ARCHIVE_FILE_CALL;

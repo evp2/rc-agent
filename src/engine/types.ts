@@ -51,6 +51,22 @@ export interface OpenOptions {
    * Absent means the Engine offers no `archive_file` tool at all.
    */
   onArchiveFile?(file: EngineFile, signal: AbortSignal): Promise<ArchiveFileOutcome>;
+  /**
+   * Called when the Engine uses its `remember` tool, the same way as
+   * `onShowImage`. Absent means the Engine offers no `remember` tool at all.
+   */
+  onRemember?(memory: EngineMemory, signal: AbortSignal): Promise<RememberOutcome>;
+  /**
+   * Called when the Engine uses its `forget` tool, the same way as
+   * `onRemember`. Absent means the Engine offers no `forget` tool at all.
+   */
+  onForget?(forget: EngineForget, signal: AbortSignal): Promise<ForgetOutcome>;
+  /**
+   * The Memory text -- what to do with Memories and which exist -- to give
+   * the model at the start of the Session. Absent, or resolving to
+   * undefined, means the Engine adds nothing.
+   */
+  startupText?(): Promise<string | undefined>;
 }
 
 export interface EngineSession {
@@ -112,6 +128,31 @@ export interface EngineFile {
 export type ArchiveFileOutcome =
   | { archived: true; filename: string; byteLength: number }
   | { archived: false; reason: string };
+
+/** Where a Memory lives: for every project, or for this repository only. */
+export type RememberScope = "global" | "project";
+
+/** One `remember` call: a Memory the Engine was asked to save. */
+export interface EngineMemory {
+  toolUseId: string;
+  scope: RememberScope;
+  name: string;
+  description: string;
+  content: string;
+}
+
+/** Either the Memory is written, with the index of the scope it was saved into as it now stands, or the reason it is not. */
+export type RememberOutcome = { saved: true; index: string; replaced?: boolean } | { saved: false; reason: string };
+
+/** One `forget` call: the scope and name of the Memory the Engine was asked to forget. */
+export interface EngineForget {
+  toolUseId: string;
+  scope: RememberScope;
+  name: string;
+}
+
+/** Either the Memory is moved aside, with that scope's index as it now stands, or the reason it is not. */
+export type ForgetOutcome = { forgotten: true; index: string } | { forgotten: false; reason: string };
 
 export interface EngineAnswer {
   answers: Record<string, string>;

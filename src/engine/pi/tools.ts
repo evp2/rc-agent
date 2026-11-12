@@ -3,6 +3,20 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 
 import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION, archivedText, forwardArchiveFile } from "../archiveFileTool";
 import {
+  forwardRemember,
+  REMEMBER_CONTENT_DESCRIPTION,
+  REMEMBER_DESCRIPTION,
+  REMEMBER_DESCRIPTION_DESCRIPTION,
+  REMEMBER_NAME_DESCRIPTION,
+  REMEMBER_SCOPE_DESCRIPTION,
+  REMEMBER_SCOPES,
+  rememberedText,
+  forgottenText,
+  forwardForget,
+  FORGET_DESCRIPTION,
+  FORGET_NAME_DESCRIPTION,
+} from "../memoryTools";
+import {
   forwardShowImage,
   IMAGE_SHOWN,
   SHOW_IMAGE_CAPTION_DESCRIPTION,
@@ -103,6 +117,50 @@ function archiveFileTool(onArchiveFile: NonNullable<OpenOptions["onArchiveFile"]
   });
 }
 
+function rememberTool(onRemember: NonNullable<OpenOptions["onRemember"]>): ToolDefinition {
+  return defineTool({
+    name: "remember",
+    label: "Remember",
+    description: REMEMBER_DESCRIPTION,
+    parameters: Type.Object({
+      scope: Type.Union(
+        REMEMBER_SCOPES.map((s) => Type.Literal(s)),
+        { description: REMEMBER_SCOPE_DESCRIPTION },
+      ),
+      name: Type.String({ description: REMEMBER_NAME_DESCRIPTION }),
+      description: Type.String({ description: REMEMBER_DESCRIPTION_DESCRIPTION }),
+      content: Type.String({ description: REMEMBER_CONTENT_DESCRIPTION }),
+    }),
+    execute: async (toolCallId, { scope, name, description, content }, signal) => {
+      const outcome = await forwardRemember(
+        onRemember,
+        { toolUseId: toolCallId, scope, name, description, content },
+        signal ?? new AbortController().signal,
+      );
+      return outcome.saved ? text(rememberedText(scope, outcome.index, outcome.replaced)) : text(outcome.reason, true);
+    },
+  });
+}
+
+function forgetTool(onForget: NonNullable<OpenOptions["onForget"]>): ToolDefinition {
+  return defineTool({
+    name: "forget",
+    label: "Forget",
+    description: FORGET_DESCRIPTION,
+    parameters: Type.Object({
+      scope: Type.Union(
+        REMEMBER_SCOPES.map((s) => Type.Literal(s)),
+        { description: REMEMBER_SCOPE_DESCRIPTION },
+      ),
+      name: Type.String({ description: FORGET_NAME_DESCRIPTION }),
+    }),
+    execute: async (toolCallId, { scope, name }, signal) => {
+      const outcome = await forwardForget(onForget, { toolUseId: toolCallId, scope, name }, signal ?? new AbortController().signal);
+      return outcome.forgotten ? text(forgottenText(scope, outcome.index)) : text(outcome.reason, true);
+    },
+  });
+}
+
 const BASH_BACKGROUND_DESCRIPTION =
   "Run a shell command in the background and return at once with a task id. Use it for a dev server, a long " +
   "build or any command you do not need to wait for. The command keeps running after this turn ends; when it " +
@@ -170,5 +228,7 @@ export function connectorTools(options: OpenOptions, tasks: TaskRegistry, profil
     subagentTool(tasks, profiles?.profiles),
     ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
     ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile)] : []),
+    ...(options.onRemember ? [rememberTool(options.onRemember)] : []),
+    ...(options.onForget ? [forgetTool(options.onForget)] : []),
   ];
 }

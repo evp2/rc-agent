@@ -69,6 +69,18 @@ test("a session hands Copilot the connector's own tools, and none when there are
   assert.equal("tools" in sdkSessionConfig(base), false);
 });
 
+test("a session's system message reaches Copilot as given, and is absent when there is none", () => {
+  const base = {
+    model: "auto",
+    workingDirectory: "/p",
+    onPermissionRequest: () => ({ kind: "approve-once" as const }),
+    onUserInputRequest: async () => ({ answer: "x", wasFreeform: false }),
+  };
+  const systemMessage = { mode: "append" as const, content: "notes" };
+  assert.deepEqual(sdkSessionConfig({ ...base, systemMessage }).systemMessage, systemMessage);
+  assert.equal("systemMessage" in sdkSessionConfig(base), false);
+});
+
 test("saved effort is passed only when the model lists that level", () => {
   const model = { supportedReasoningEfforts: ["low", "high"] as ("low" | "high")[] };
   assert.deepEqual(resolveModelSettings({ effortLevel: "high" }, model), { reasoningEffort: "high" });
