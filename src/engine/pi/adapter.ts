@@ -197,6 +197,8 @@ export class PiEngine implements Engine {
       await checkRunnable(chosen, provider, modelRuntime);
       await checkSubagentModels(provider, modelRuntime);
       await session.bindExtensions({});
+      // The extension registers codemode inactive.
+      session.setActiveToolsByName([...new Set([...session.getActiveToolNames(), "codemode"])]);
     } catch (e) {
       await endSession(session);
       throw e;
