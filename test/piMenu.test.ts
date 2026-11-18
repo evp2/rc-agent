@@ -3,13 +3,13 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, type FauxResponseStep } from "@earendil-works/pi-ai";
 
 import type { EngineAnswer, EngineEvent, EngineSession } from "../src/engine/types.ts";
 import { maybeSubmitAutoCompact } from "../src/session/loop.ts";
 import { runTurn } from "../src/session/turn.ts";
 import { cmd, makeTurnHarness, until } from "./doubles.ts";
-import { answeringByPrompt, freshProjectDir, piEngineOn, writePiSettings } from "./piDoubles.ts";
+import { answeringByPrompt, FAUX_MODEL, freshProjectDir, piEngineOn, writePiSettings } from "./piDoubles.ts";
 
 // Pi keeps the last 20,000 tokens out of a compaction by default, more than any of these Conversations holds.
 before(() => writePiSettings({ compaction: { enabled: false, keepRecentTokens: 300 } }));
@@ -121,6 +121,37 @@ const summarising = () =>
   answeringByPrompt((prompt) =>
     prompt.includes("checkpoint") ? fauxAssistantMessage("## Goal\nchatted") : fauxAssistantMessage("ok ".repeat(200)),
   );
+
+test("PiEngine: /compact on Bedrock sends the summary request with the configured guardrail", async () => {
+  const summaryRequests: unknown[] = [];
+  const step: FauxResponseStep = async (context, options, _state, model) => {
+    const user = context.messages.filter((m) => m.role === "user").at(-1);
+    const prompt = typeof user?.content === "string" ? user.content : JSON.stringify(user?.content);
+    const sent = (await options?.onPayload?.({ modelId: "m", messages: [] }, model)) ?? { modelId: "m" };
+    if (prompt.includes("checkpoint")) {
+      summaryRequests.push(sent);
+      return fauxAssistantMessage("## Goal\nchatted");
+    }
+    return fauxAssistantMessage("ok ".repeat(200));
+  };
+  const pi = piEngineOn(
+    Array.from({ length: 20 }, () => step),
+    {
+      piProvider: "amazon-bedrock",
+      provider: { type: "bedrock", model: FAUX_MODEL, guardrail: { identifier: "gr-abc123", version: "DRAFT" } },
+    },
+  );
+  const session = await pi.engine.open(openOptions(pi.projectDir));
+  session.send("hello");
+  session.send("and again");
+  session.send("/compact");
+  await readTurns(session, 3);
+  await session.close();
+
+  assert.deepEqual(summaryRequests, [
+    { modelId: "m", messages: [], guardrailConfig: { guardrailIdentifier: "gr-abc123", guardrailVersion: "DRAFT" } },
+  ]);
+});
 
 test("PiEngine: /compact runs Pi's own compaction as a Turn of its own, with its Usage", async () => {
   const model = summarising();

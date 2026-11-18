@@ -38,7 +38,7 @@ import { type FinishedTask, TaskRegistry } from "./backgroundTasks";
 import { chooseEffort, chooseModel } from "./modelCommands";
 import { type SubagentCommand, subagentSettings } from "./subagent";
 import { refreshAwsProfileFiles } from "./awsProfile";
-import { createGuardrailExtension } from "./guardrail";
+import { applyGuardrail } from "./guardrail";
 import { CredentialRenewal, renewExpiredCredentials, runCommand, type RunCommand } from "./awsAuthRefresh";
 import { connectorTools, QUESTION_TOOL } from "./tools";
 
@@ -142,6 +142,7 @@ export class PiEngine implements Engine {
     const agentDir = getAgentDir();
     const modelRuntime = await this.createModelRuntime();
     if (this.renewal) renewExpiredCredentials(modelRuntime, this.renewal);
+    if (provider.guardrail) applyGuardrail(modelRuntime, provider.guardrail);
     const piProvider = PI_PROVIDERS[provider.type];
     const branch = sessionManager.getBranch();
     const chosenAlready = switchedIn(branch, "model_change");
@@ -168,7 +169,6 @@ export class PiEngine implements Engine {
         createCodemodeExtension({ mode: "on" }),
         createToolSearchExtension(),
         createMcpExtension(),
-        ...(provider.guardrail ? [createGuardrailExtension(provider.guardrail)] : []),
       ],
       additionalSkillPaths: claudeSkills,
       ...(startupText
