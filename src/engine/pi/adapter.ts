@@ -197,14 +197,18 @@ export class PiEngine implements Engine {
       await checkRunnable(chosen, provider, modelRuntime);
       await checkSubagentModels(provider, modelRuntime);
       await session.bindExtensions({});
-      // The extension registers codemode inactive.
-      session.setActiveToolsByName([...new Set([...session.getActiveToolNames(), "codemode"])]);
+      activateCodemode(session);
     } catch (e) {
       await endSession(session);
       throw e;
     }
     return session;
   }
+}
+
+// The extension registers codemode inactive, and navigateTree restores the transcript's recorded tools, which may predate it.
+function activateCodemode(session: AgentSession): void {
+  session.setActiveToolsByName([...new Set([...session.getActiveToolNames(), "codemode"])]);
 }
 
 // dispose() alone skips session_shutdown, which is what closes the MCP servers' connections and child processes.
@@ -571,6 +575,7 @@ class PiEngineSession implements EngineSession {
     try {
       if (first) {
         await this.session.navigateTree(first.id);
+        activateCodemode(this.session);
         // Pi persists no leaf; a reopen resumes from the file's last entry, so the cleared point needs one.
         manager.appendCustomEntry("connector-clear");
       }
