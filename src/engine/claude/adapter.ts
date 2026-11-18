@@ -19,6 +19,16 @@ import type { ClaudeProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
 import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION, archivedText, forwardArchiveFile } from "../archiveFileTool";
 import {
+  DISPATCH_HELD,
+  forwardListSiblings,
+  forwardSendDispatch,
+  LIST_SIBLINGS_DESCRIPTION,
+  SEND_DISPATCH_DESCRIPTION,
+  SEND_DISPATCH_TEXT_DESCRIPTION,
+  SEND_DISPATCH_TO_DESCRIPTION,
+  siblingsText,
+} from "../dispatchTools";
+import {
   forwardShowImage,
   IMAGE_SHOWN,
   SHOW_IMAGE_CAPTION_DESCRIPTION,
@@ -120,6 +130,8 @@ function connectorToolsServer(options: OpenOptions): McpSdkServerConfigWithInsta
   const tools = [
     ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
     ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile)] : []),
+    ...(options.onListSiblings ? [listSiblingsTool(options.onListSiblings)] : []),
+    ...(options.onSendDispatch ? [sendDispatchTool(options.onSendDispatch)] : []),
   ];
   return tools.length ? createSdkMcpServer({ name: MCP_SERVER_NAME, tools, alwaysLoad: true }) : undefined;
 }
@@ -176,6 +188,32 @@ function archiveFileTool(onArchiveFile: NonNullable<OpenOptions["onArchiveFile"]
       const outcome = await forwardArchiveFile(onArchiveFile, { toolUseId, path }, signal);
       return outcome.archived
         ? { content: [{ type: "text", text: archivedText(outcome.filename, outcome.byteLength) }] }
+        : { content: [{ type: "text", text: outcome.reason }], isError: true };
+    },
+  );
+}
+
+function listSiblingsTool(onListSiblings: NonNullable<OpenOptions["onListSiblings"]>) {
+  return tool("list_siblings", LIST_SIBLINGS_DESCRIPTION, {}, async (_args, extra) => {
+    const outcome = await forwardListSiblings(onListSiblings, callOf(extra).signal);
+    return "siblings" in outcome
+      ? { content: [{ type: "text", text: siblingsText(outcome.siblings) }] }
+      : { content: [{ type: "text", text: outcome.reason }], isError: true };
+  });
+}
+
+function sendDispatchTool(onSendDispatch: NonNullable<OpenOptions["onSendDispatch"]>) {
+  return tool(
+    "send_dispatch",
+    SEND_DISPATCH_DESCRIPTION,
+    {
+      to: z.string().describe(SEND_DISPATCH_TO_DESCRIPTION),
+      text: z.string().describe(SEND_DISPATCH_TEXT_DESCRIPTION),
+    },
+    async ({ to, text }, extra) => {
+      const outcome = await forwardSendDispatch(onSendDispatch, { to, text }, callOf(extra).signal);
+      return outcome.sent
+        ? { content: [{ type: "text", text: DISPATCH_HELD }] }
         : { content: [{ type: "text", text: outcome.reason }], isError: true };
     },
   );

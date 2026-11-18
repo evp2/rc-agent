@@ -52,6 +52,16 @@ export interface OpenOptions {
    */
   onArchiveFile?(file: EngineFile, signal: AbortSignal): Promise<ArchiveFileOutcome>;
   /**
+   * Called when the Engine uses its `list_siblings` tool, the same way as
+   * `onShowImage`. Absent means the Engine offers no `list_siblings` tool at all.
+   */
+  onListSiblings?(signal: AbortSignal): Promise<ListSiblingsOutcome>;
+  /**
+   * Called when the Engine uses its `send_dispatch` tool, the same way as
+   * `onListSiblings`. Absent means the Engine offers no `send_dispatch` tool at all.
+   */
+  onSendDispatch?(dispatch: EngineDispatch, signal: AbortSignal): Promise<SendDispatchOutcome>;
+  /**
    * Called when the Engine uses its `remember` tool, the same way as
    * `onShowImage`. Absent means the Engine offers no `remember` tool at all.
    */
@@ -128,6 +138,26 @@ export interface EngineFile {
 export type ArchiveFileOutcome =
   | { archived: true; filename: string; byteLength: number }
   | { archived: false; reason: string };
+
+/** One session the Engine can address a Dispatch to. Never carries a Control code or secret. */
+export interface EngineSibling {
+  sessionId: string;
+  projectDir: string;
+  engine: EngineKind;
+  name: string;
+}
+
+/** Either the sessions the Engine can reach, or the reason it could not find out. */
+export type ListSiblingsOutcome = { siblings: EngineSibling[] } | { reason: string };
+
+/** One `send_dispatch` call: plain text addressed to one sibling by session id. */
+export interface EngineDispatch {
+  to: string;
+  text: string;
+}
+
+/** Either the relay is holding the Dispatch for a human to promote, or the reason it is not, for the Engine to act on. */
+export type SendDispatchOutcome = { sent: true } | { sent: false; reason: string };
 
 /** Where a Memory lives: for every project, or for this repository only. */
 export type RememberScope = "global" | "project";

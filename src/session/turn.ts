@@ -1,6 +1,7 @@
 import { DEFAULT_CONTEXT_WARNING_THRESHOLD_PERCENT } from "../config";
 import { SessionEndedError, type CommandRecord, type EventInput } from "../relay/client";
 import { persist } from "./commands";
+import { engineText } from "./dispatch";
 import { attributionKey, measureContribution, readPosition, type Position } from "./contribution";
 import type { CurrentTurn, SessionContext, TurnCause, TurnEndedEvent } from "./context";
 import type { TurnClaims } from "./inFlight";
@@ -120,7 +121,7 @@ class CommandChain implements CurrentTurn {
 
   constructor(
     private readonly ctx: SessionContext,
-    private readonly command: CommandRecord,
+    readonly command: CommandRecord,
     private readonly claims: TurnClaims,
     readonly abortController: AbortController,
     private readonly repo: string | undefined,
@@ -268,11 +269,11 @@ export async function runTurn(ctx: SessionContext, command: CommandRecord): Prom
       // Turn, just as it would Steer a Command's. No await between the Steer
       // and the chain taking over: the pump must find the chain in place
       // before the Steer's own Turn can start.
-      const firstCause = ctx.engineTurn?.steer(command.text) ? "steer" : "command";
+      const firstCause = command.source !== "dispatch" && ctx.engineTurn?.steer(command.text) ? "steer" : "command";
       const chain = new CommandChain(ctx, command, claims, abortController, repo, firstCause);
       ctx.currentTurn = chain;
       if (firstCause === "command") {
-        deliverWithWithdrawnNote(ctx, command.text, (text) => ctx.engineSession.send(text));
+        deliverWithWithdrawnNote(ctx, engineText(command), (text) => ctx.engineSession.send(text));
       }
       await chain.done;
       // Discarded visibly, as a pending Steer always is under Stop: the

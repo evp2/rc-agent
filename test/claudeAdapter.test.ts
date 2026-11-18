@@ -13,8 +13,11 @@ import type {
   EngineAnswer,
   EngineEvent,
   EngineImage,
+  EngineDispatch,
   EngineQuestion,
   EngineUsage,
+  ListSiblingsOutcome,
+  SendDispatchOutcome,
   ShowImageOutcome,
 } from "../src/engine/types.ts";
 import {
@@ -1064,5 +1067,128 @@ test("ClaudeEngine: an archive_file that fails comes back to the Engine as an er
 
   assert.equal(result.isError, true);
   assert.deepEqual(result.content, [{ type: "text", text: "no file there" }]);
+  await close();
+});
+
+// --- list_siblings and send_dispatch forward to the connector ---------------
+
+async function openWithDispatchTools(callbacks: {
+  onListSiblings?: (signal: AbortSignal) => Promise<ListSiblingsOutcome>;
+  onSendDispatch?: (dispatch: EngineDispatch, signal: AbortSignal) => Promise<SendDispatchOutcome>;
+}): Promise<{ client: Client; close(): Promise<void> }> {
+  let capturedOptions: Options | undefined;
+  const { query } = scriptedQuery([init()], {
+    onOptions: (options) => {
+      capturedOptions = options;
+    },
+  });
+  const engine = new ClaudeEngine({ query, env: {} });
+  const session = await engine.open({ projectDir: "/tmp/x", onQuestion: noQuestionsExpected(), ...callbacks });
+  const it = session.events[Symbol.asyncIterator]();
+  session.send("hand it over");
+  await collect(it, (e) => e.type === "turn_started");
+
+  const client = await connectToConnectorToolsServer(capturedOptions);
+  return {
+    client,
+    async close() {
+      await client.close();
+      await session.close();
+    },
+  };
+}
+
+const textOf = (result: object): string => ((result as { content: unknown }).content as { text: string }[])[0].text;
+
+test("ClaudeEngine: list_siblings and send_dispatch are offered when the session can reach siblings", async () => {
+  const { client, close } = await openWithDispatchTools({
+    onListSiblings: async () => ({ siblings: [] }),
+    onSendDispatch: async () => ({ sent: true }),
+  });
+
+  const { tools } = await client.listTools();
+  assert.deepEqual(tools.map((t) => t.name).sort(), ["list_siblings", "send_dispatch"]);
+  await close();
+});
+
+test("ClaudeEngine: list_siblings returns each sibling's id, project directory, Engine and name", async () => {
+  const { client, close } = await openWithDispatchTools({
+    onListSiblings: async () => ({
+      siblings: [{ sessionId: "s2", projectDir: "/work/connector", engine: "pi", name: "connector" }],
+    }),
+  });
+
+  const result = await client.callTool({ name: "list_siblings", arguments: {} });
+
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(JSON.parse(textOf(result)), {
+    siblings: [{ session_id: "s2", project_dir: "/work/connector", engine: "pi", name: "connector" }],
+  });
+  await close();
+});
+
+test("ClaudeEngine: list_siblings says so when no sibling can be reached", async () => {
+  const { client, close } = await openWithDispatchTools({ onListSiblings: async () => ({ siblings: [] }) });
+
+  const result = await client.callTool({ name: "list_siblings", arguments: {} });
+
+  assert.equal(result.isError, undefined);
+  assert.match(textOf(result), /no sibling/i);
+  await close();
+});
+
+test("ClaudeEngine: a list_siblings that fails comes back as an error carrying the reason", async () => {
+  const { client, close } = await openWithDispatchTools({
+    onListSiblings: async () => ({ reason: "the relay is unreachable" }),
+  });
+
+  const result = await client.callTool({ name: "list_siblings", arguments: {} });
+
+  assert.equal(result.isError, true);
+  assert.deepEqual(result.content, [{ type: "text", text: "the relay is unreachable" }]);
+  await close();
+});
+
+test("ClaudeEngine: send_dispatch reaches onSendDispatch with its target and text, and reports the Dispatch held", async () => {
+  let received: EngineDispatch | undefined;
+  const { client, close } = await openWithDispatchTools({
+    onSendDispatch: async (dispatch) => {
+      received = dispatch;
+      return { sent: true };
+    },
+  });
+
+  const result = await client.callTool({ name: "send_dispatch", arguments: { to: "s2", text: "run the migration" } });
+
+  assert.deepEqual(received, { to: "s2", text: "run the migration" });
+  assert.equal(result.isError, undefined);
+  assert.match(textOf(result), /held/i);
+  assert.match(textOf(result), /no reply/i);
+  await close();
+});
+
+test("ClaudeEngine: a refused send_dispatch comes back as an error carrying the reason", async () => {
+  const { client, close } = await openWithDispatchTools({
+    onSendDispatch: async () => ({ sent: false, reason: "that session has ended" }),
+  });
+
+  const result = await client.callTool({ name: "send_dispatch", arguments: { to: "s2", text: "x" } });
+
+  assert.equal(result.isError, true);
+  assert.deepEqual(result.content, [{ type: "text", text: "that session has ended" }]);
+  await close();
+});
+
+test("ClaudeEngine: a callback that throws still returns an error result to the Engine", async () => {
+  const { client, close } = await openWithDispatchTools({
+    onSendDispatch: async () => {
+      throw new Error("socket hang up");
+    },
+  });
+
+  const result = await client.callTool({ name: "send_dispatch", arguments: { to: "s2", text: "x" } });
+
+  assert.equal(result.isError, true);
+  assert.match(textOf(result), /socket hang up/);
   await close();
 });

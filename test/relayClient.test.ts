@@ -248,3 +248,106 @@ async function withFakeResume(): Promise<RelayClientType> {
     globalThis.fetch = realFetch;
   }
 }
+
+async function withRelayAnswering(
+  respond: (url: string, init: RequestInit) => Response,
+  run: (client: RelayClientType, calls: { url: string; init: RequestInit }[]) => Promise<void>,
+): Promise<void> {
+  const client = await withFakeResume();
+  const realFetch = globalThis.fetch;
+  const calls: { url: string; init: RequestInit }[] = [];
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    calls.push({ url, init: init! });
+    return respond(url, init!);
+  }) as typeof fetch;
+  try {
+    await run(client, calls);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+test("listSiblings asks with the session secret and returns each sibling's four fields", async () => {
+  const siblings = [{ session_id: "s2", project_dir: "/work/connector", engine: "pi", name: "connector" }];
+  await withRelayAnswering(
+    () => new Response(JSON.stringify({ siblings }), { status: 200 }),
+    async (client, calls) => {
+      assert.deepEqual(await client.listSiblings(), siblings);
+      assert.equal(calls[0].url, "http://relay.test/sessions/sess-1/siblings");
+      assert.equal((calls[0].init.headers as Record<string, string>)["Authorization"], "Bearer secret");
+    },
+  );
+});
+
+test("sendDispatch posts the target and text under the session secret and reports it held", async () => {
+  await withRelayAnswering(
+    () => new Response(JSON.stringify({ state: "held" }), { status: 200 }),
+    async (client, calls) => {
+      assert.deepEqual(await client.sendDispatch("s2", "run the migration"), { held: true });
+      assert.equal(calls[0].url, "http://relay.test/sessions/sess-1/dispatches");
+      assert.equal(calls[0].init.method, "POST");
+      assert.equal((calls[0].init.headers as Record<string, string>)["Authorization"], "Bearer secret");
+      assert.deepEqual(JSON.parse(calls[0].init.body as string), { to: "s2", text: "run the migration" });
+    },
+  );
+});
+
+test("sendDispatch tells the relay when the sending Turn was started by a Dispatch", async () => {
+  await withRelayAnswering(
+    () => new Response(JSON.stringify({ error: "nope", reason: "from_dispatch_turn" }), { status: 403 }),
+    async (client, calls) => {
+      assert.deepEqual(await client.sendDispatch("s2", "x", "dispatch"), {
+        held: false,
+        reason: "from_dispatch_turn",
+        error: "nope",
+      });
+      assert.deepEqual(JSON.parse(calls[0].init.body as string), { to: "s2", text: "x", turn_source: "dispatch" });
+    },
+  );
+});
+
+for (const status of [403, 404, 410, 413, 429]) {
+  test(`sendDispatch returns a ${status} refusal's reason and message instead of throwing`, async () => {
+    await withRelayAnswering(
+      () => new Response(JSON.stringify({ error: "nope", reason: "some_reason" }), { status }),
+      async (client) => {
+        assert.deepEqual(await client.sendDispatch("s2", "x"), { held: false, reason: "some_reason", error: "nope" });
+      },
+    );
+  });
+}
+
+test("sendDispatch throws SessionEndedError when the sender's own session is gone", async () => {
+  await withRelayAnswering(
+    () => new Response(JSON.stringify({ error: "session has ended" }), { status: 410 }),
+    async (client) => {
+      await assert.rejects(client.sendDispatch("s2", "x"), { name: "SessionEndedError" });
+    },
+  );
+});
+
+test("sendDispatch throws on an unexpected failure", async () => {
+  await withRelayAnswering(
+    () => new Response("boom", { status: 502 }),
+    async (client) => {
+      await assert.rejects(client.sendDispatch("s2", "x"), /502/);
+    },
+  );
+});
+
+test("a polled Command promoted from a Dispatch carries its sender", async () => {
+  const command = {
+    seq: "c1",
+    text: "do it",
+    created_at: "2026-01-01T00:00:00.000Z",
+    source: "dispatch",
+    dispatched_from_session: "s2",
+    dispatched_from_project_dir: "/work/relay",
+  };
+  await withRelayAnswering(
+    () => new Response(JSON.stringify({ commands: [command] }), { status: 200 }),
+    async (client) => {
+      assert.deepEqual(await client.pollCommands(), [command]);
+    },
+  );
+});

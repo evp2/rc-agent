@@ -13,6 +13,7 @@ import { isReusableState, readState, writeState, type ConnectorState } from "../
 import { archiveFile } from "./archivedFiles";
 import { persist } from "./commands";
 import type { SessionContext } from "./context";
+import { listSiblings, sendDispatch } from "./dispatch";
 import { createBannerDeduper } from "./engineEvents";
 import { flushEvents } from "./events";
 import { showImage } from "./images";
@@ -218,6 +219,8 @@ export async function runConnector(config: ResolvedConnectorConfig): Promise<Run
     onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
     onShowImage: (image, signal) => showImage(ctx, image, signal),
     onArchiveFile: (file, signal) => archiveFile(ctx, file, signal),
+    onListSiblings: () => listSiblings(ctx),
+    onSendDispatch: (dispatch) => sendDispatch(ctx, dispatch),
     ...(engine.kind === "pi" || engine.kind === "copilot" ? memoryOptions(config.projectDir) : {}),
   });
 

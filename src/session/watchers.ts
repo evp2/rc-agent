@@ -85,7 +85,7 @@ export async function checkForSteer(ctx: SessionContext): Promise<void> {
   }
 
   const [first, ...rest] = commands;
-  if (!turn.steeredThisSubTurn && turn.running) {
+  if (first.source !== "dispatch" && !turn.steeredThisSubTurn && turn.running) {
     turn.steeredThisSubTurn = true;
     // Claimed and delivered with no await in between: the claim marks the
     // Steer pending synchronously, so by the time the Engine's Turn

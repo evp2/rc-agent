@@ -1,9 +1,10 @@
 import { FakeEngine, sayAndFinish, type FakeEngineScript, type FakeEngineSession } from "../src/engine/fakeEngine.ts";
 import type { Engine, EngineSession } from "../src/engine/types.ts";
-import type { CommandRecord, EventInput, FileUpload, ImageUpload, RelayClient } from "../src/relay/client.ts";
+import type { CommandRecord, DispatchResult, EventInput, FileUpload, ImageUpload, RelayClient, Sibling } from "../src/relay/client.ts";
 import { archiveFile } from "../src/session/archivedFiles.ts";
 import type { SessionContext } from "../src/session/context.ts";
 import { createBannerDeduper } from "../src/session/engineEvents.ts";
+import { listSiblings, sendDispatch } from "../src/session/dispatch.ts";
 import { InFlight, type InFlightDeps } from "../src/session/inFlight.ts";
 import { showImage } from "../src/session/images.ts";
 import { pumpEngineEvents } from "../src/session/pump.ts";
@@ -118,6 +119,37 @@ export class FakeRelay {
     await this.duringFileUpload?.(path, signal);
   }
 
+  /** What the relay lists as siblings, with whatever extra fields it might add. */
+  siblings: (Sibling & Record<string, unknown>)[] = [];
+  /** Set to make the next listSiblings reject. */
+  failNextListSiblings: Error | undefined;
+
+  async listSiblings(): Promise<Sibling[]> {
+    if (this.failNextListSiblings) {
+      const e = this.failNextListSiblings;
+      this.failNextListSiblings = undefined;
+      throw e;
+    }
+    return this.siblings;
+  }
+
+  /** Every Dispatch the relay was asked to hold. */
+  readonly dispatches: { to: string; text: string }[] = [];
+  /** What the relay answers to a Dispatch: held, unless a test sets a refusal. */
+  dispatchResult: DispatchResult = { held: true };
+  /** Set to make the next sendDispatch reject. */
+  failNextDispatch: Error | undefined;
+
+  async sendDispatch(to: string, text: string): Promise<DispatchResult> {
+    this.dispatches.push({ to, text });
+    if (this.failNextDispatch) {
+      const e = this.failNextDispatch;
+      this.failNextDispatch = undefined;
+      throw e;
+    }
+    return this.dispatchResult;
+  }
+
   /** Every putSkills call, so a test can assert what the periodic report carried. */
   readonly putSkillsCalls: {
     skills: unknown;
@@ -187,6 +219,16 @@ export function cmd(text: string, seq?: string, source?: "phone" | "auto"): Comm
   };
 }
 
+/** A Command a human promoted from a Dispatch sent by `fromSession`, working in `fromProjectDir`. */
+export function dispatchCmd(text: string, fromSession = "s-relay", fromProjectDir = "/work/relay"): CommandRecord {
+  return {
+    ...cmd(text),
+    source: "dispatch",
+    dispatched_from_session: fromSession,
+    dispatched_from_project_dir: fromProjectDir,
+  };
+}
+
 export interface TurnHarness {
   ctx: SessionContext;
   ledger: InFlight;
@@ -244,6 +286,8 @@ export async function makeTurnHarness(
     onQuestion: (question, signal) => answerQuestion(ctx, question, signal),
     onShowImage: (image, signal) => showImage(ctx, image, signal),
     onArchiveFile: (file, signal) => archiveFile(ctx, file, signal),
+    onListSiblings: () => listSiblings(ctx),
+    onSendDispatch: (dispatch) => sendDispatch(ctx, dispatch),
   });
 
   ctx = {

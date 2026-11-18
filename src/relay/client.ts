@@ -12,15 +12,29 @@ export interface SkillInfo {
   argumentHint: string;
 }
 
-/** Who submitted a Command. `auto` is this connector's own idle-triggered Auto-compact; `phone` (the default when absent) is the phone client. */
-export type CommandSource = "phone" | "auto";
+/** Who submitted a Command. `auto` is this connector's own idle-triggered Auto-compact; `dispatch` is a Dispatch a human promoted; `phone` (the default when absent) is the phone client. */
+export type CommandSource = "phone" | "auto" | "dispatch";
 
 export interface CommandRecord {
   seq: string;
   text: string;
   created_at: string;
   source?: CommandSource;
+  /** On a `dispatch` Command: the sending session and its project directory. */
+  dispatched_from_session?: string;
+  dispatched_from_project_dir?: string;
 }
+
+/** One session this session's Connector credential also created, as the relay lists it for an Engine. */
+export interface Sibling {
+  session_id: string;
+  project_dir: string;
+  engine: EngineKind;
+  name: string;
+}
+
+/** Whether the relay now holds a Dispatch, or why it refused: `reason` is the relay's machine code, `error` its message. */
+export type DispatchResult = { held: true } | { held: false; reason: string; error: string };
 
 /** The phone's structured reply to a pending Question, as the relay stores and reports it. */
 export interface AnswerRecord {
@@ -370,6 +384,42 @@ export class RelayClient {
       throw new Error(`postCommand failed: HTTP ${res.status} ${await res.text()}`);
     }
     return (await res.json()) as { seq: string; created_at: string };
+  }
+
+  /** Throws {@link SessionEndedError} once the relay reports the session gone. */
+  async listSiblings(): Promise<Sibling[]> {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/siblings`, {
+      headers: this.authHeaders(),
+    });
+    await checkTerminal(res);
+    if (!res.ok) throw new Error(`listSiblings failed: HTTP ${res.status} ${await res.text()}`);
+    return ((await res.json()) as { siblings: Sibling[] }).siblings;
+  }
+
+  /**
+   * Sends a Dispatch to a sibling. A refusal about the target comes back as a
+   * result, not a throw; a 404 or 410 with no reason code is this session's
+   * own end, which throws {@link SessionEndedError}.
+   */
+  async sendDispatch(to: string, text: string, turnSource?: "dispatch"): Promise<DispatchResult> {
+    const res = await this.fetch(`${this.relayBaseUrl}/sessions/${this.sessionId}/dispatches`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...this.authHeaders() },
+      body: JSON.stringify({ to, text, ...(turnSource ? { turn_source: turnSource } : {}) }),
+    });
+    if (res.ok) return { held: true };
+    const raw = await res.text();
+    let body: { error?: unknown; reason?: unknown } = {};
+    try {
+      body = JSON.parse(raw) as typeof body;
+    } catch {
+      // Not JSON: handled below as an unexpected failure.
+    }
+    if (typeof body.reason === "string") {
+      return { held: false, reason: body.reason, error: typeof body.error === "string" ? body.error : body.reason };
+    }
+    await checkTerminal(res);
+    throw new Error(`sendDispatch failed: HTTP ${res.status} ${raw}`);
   }
 
   /** Throws {@link SessionEndedError} once the relay reports the session gone. */

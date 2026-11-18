@@ -6,6 +6,7 @@ import type {
   ArchiveFileOutcome,
   Engine,
   EngineAnswer,
+  EngineDispatch,
   EngineEvent,
   EngineFile,
   EngineImage,
@@ -15,11 +16,14 @@ import type {
   EngineQuestion,
   EngineSession,
   EngineUsage,
+  ListSiblingsOutcome,
   OpenOptions,
   ForgetOutcome,
+  SendDispatchOutcome,
   RememberOutcome,
   ShowImageOutcome,
 } from "./types";
+import { DISPATCH_HELD, siblingsText } from "./dispatchTools";
 import { forgottenText, rememberedText } from "./memoryTools";
 
 /** What a scripted Turn's body can do and observe, handed to a {@link FakeTurnHandler}. */
@@ -39,6 +43,10 @@ export interface FakeTurnContext {
   showImage(image: EngineImage): Promise<ShowImageOutcome>;
   /** Like {@link showImage}, for an `archive_file` call and `onArchiveFile`. */
   archiveFile(file: EngineFile): Promise<ArchiveFileOutcome>;
+  /** Like {@link showImage}, for a `list_siblings` call and `onListSiblings`. */
+  listSiblings(): Promise<ListSiblingsOutcome>;
+  /** Like {@link showImage}, for a `send_dispatch` call and `onSendDispatch`. */
+  sendDispatch(dispatch: EngineDispatch): Promise<SendDispatchOutcome>;
   /** Like {@link showImage}, for a `remember` call and `onRemember`. */
   remember(memory: EngineMemory): Promise<RememberOutcome>;
   /** Like {@link showImage}, for a `forget` call and `onForget`. */
@@ -150,6 +158,14 @@ class TurnController implements FakeTurnContext {
 
   archiveFile(file: EngineFile): Promise<ArchiveFileOutcome> {
     return this.session.archiveFile(file, this);
+  }
+
+  listSiblings(): Promise<ListSiblingsOutcome> {
+    return this.session.listSiblings(this);
+  }
+
+  sendDispatch(dispatch: EngineDispatch): Promise<SendDispatchOutcome> {
+    return this.session.sendDispatch(dispatch, this);
   }
 
   remember(memory: EngineMemory): Promise<RememberOutcome> {
@@ -273,6 +289,32 @@ class FakeEngineSessionImpl implements FakeEngineSession {
       { path: file.path },
       (signal) => onArchiveFile(file, signal),
       (outcome) => (outcome.archived ? { text: "archived", isError: false } : { text: outcome.reason, isError: true }),
+    );
+  }
+
+  async listSiblings(turn: TurnController): Promise<ListSiblingsOutcome> {
+    const onListSiblings = this.options.onListSiblings;
+    if (!onListSiblings) throw new Error("this session was opened without onListSiblings");
+    return this.runTool(
+      turn,
+      `fake-list-siblings-${randomUUID()}`,
+      "list_siblings",
+      {},
+      (signal) => onListSiblings(signal),
+      (outcome) => ("siblings" in outcome ? { text: siblingsText(outcome.siblings), isError: false } : { text: outcome.reason, isError: true }),
+    );
+  }
+
+  async sendDispatch(dispatch: EngineDispatch, turn: TurnController): Promise<SendDispatchOutcome> {
+    const onSendDispatch = this.options.onSendDispatch;
+    if (!onSendDispatch) throw new Error("this session was opened without onSendDispatch");
+    return this.runTool(
+      turn,
+      `fake-send-dispatch-${randomUUID()}`,
+      "send_dispatch",
+      { to: dispatch.to, text: dispatch.text },
+      (signal) => onSendDispatch(dispatch, signal),
+      (outcome) => (outcome.sent ? { text: DISPATCH_HELD, isError: false } : { text: outcome.reason, isError: true }),
     );
   }
 

@@ -18,6 +18,8 @@ import type { ConnectorState } from "../state";
  * copies drifting is what left a Steer claimed forever.
  */
 export interface CurrentTurn {
+  /** The Command whose Turn started the chain. */
+  readonly command: CommandRecord;
   abortController: AbortController;
   /** Whether the chain's Turn running right now has already taken its one allowed Steer. */
   steeredThisSubTurn: boolean;
