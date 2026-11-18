@@ -84,17 +84,29 @@ export async function checkForSteer(ctx: SessionContext): Promise<void> {
     return;
   }
 
-  const [first, ...rest] = commands;
-  if (first.source !== "dispatch" && !turn.steeredThisSubTurn && turn.running) {
+  for (const command of commands) {
+    // A Dispatch never Steers, so it queues in its place and the next Command can still take the Steer.
+    const steers =
+      command.source !== "dispatch" &&
+      !turn.steeredThisSubTurn &&
+      turn.running &&
+      ctx.inFlight.current() === held &&
+      !turn.abortController.signal.aborted &&
+      !ctx.questionPending;
+    if (!steers) {
+      await ctx.inFlight.hold(command, "queued");
+      ctx.handBackBuffer.push(command);
+      continue;
+    }
     turn.steeredThisSubTurn = true;
     // Claimed and delivered with no await in between: the claim marks the
     // Steer pending synchronously, so by the time the Engine's Turn
     // boundaries reach the pump it already knows a Steer is on its way --
     // and a refusal below un-marks it before the pump can see it.
-    const claiming = held.steer(first);
+    const claiming = held.steer(command);
     let refused: unknown;
     try {
-      deliverWithWithdrawnNote(ctx, first.text, (text) => ctx.engineSession.steer(text));
+      deliverWithWithdrawnNote(ctx, command.text, (text) => ctx.engineSession.steer(text));
     } catch (e) {
       refused = e;
       held.withdrawSteer();
@@ -105,15 +117,8 @@ export async function checkForSteer(ctx: SessionContext): Promise<void> {
       // Engine refused it. It is still a Command the human sent: run it as a
       // Turn of its own, after this one, rather than drop it.
       console.log(`A Steer arrived as its Turn ended; running it next instead: ${(refused as Error).message}`);
-      ctx.handBackBuffer.push(first);
+      ctx.handBackBuffer.push(command);
     }
-  } else {
-    await ctx.inFlight.hold(first, "queued");
-    ctx.handBackBuffer.push(first);
-  }
-  for (const extra of rest) {
-    await ctx.inFlight.hold(extra, "queued");
-    ctx.handBackBuffer.push(extra);
   }
 }
 

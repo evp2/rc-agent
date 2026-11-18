@@ -412,9 +412,7 @@ export class RelayClient {
     let body: { error?: unknown; reason?: unknown } = {};
     try {
       body = JSON.parse(raw) as typeof body;
-    } catch {
-      // Not JSON: handled below as an unexpected failure.
-    }
+    } catch {}
     if (typeof body.reason === "string") {
       return { held: false, reason: body.reason, error: typeof body.error === "string" ? body.error : body.reason };
     }

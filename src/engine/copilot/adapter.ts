@@ -171,7 +171,6 @@ function archiveFileTool(
   };
 }
 
-/** Like {@link showImageTool}, for `list_siblings` and `onListSiblings`. */
 function listSiblingsTool(onListSiblings: NonNullable<OpenOptions["onListSiblings"]>): Tool {
   return {
     name: "list_siblings",
@@ -188,7 +187,6 @@ function listSiblingsTool(onListSiblings: NonNullable<OpenOptions["onListSibling
   };
 }
 
-/** Like {@link showImageTool}, for `send_dispatch` and `onSendDispatch`. */
 function sendDispatchTool(onSendDispatch: NonNullable<OpenOptions["onSendDispatch"]>): Tool {
   return {
     name: "send_dispatch",

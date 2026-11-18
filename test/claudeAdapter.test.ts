@@ -1070,8 +1070,6 @@ test("ClaudeEngine: an archive_file that fails comes back to the Engine as an er
   await close();
 });
 
-// --- list_siblings and send_dispatch forward to the connector ---------------
-
 async function openWithDispatchTools(callbacks: {
   onListSiblings?: (signal: AbortSignal) => Promise<ListSiblingsOutcome>;
   onSendDispatch?: (dispatch: EngineDispatch, signal: AbortSignal) => Promise<SendDispatchOutcome>;
@@ -1133,7 +1131,7 @@ test("ClaudeEngine: list_siblings says so when no sibling can be reached", async
   const result = await client.callTool({ name: "list_siblings", arguments: {} });
 
   assert.equal(result.isError, undefined);
-  assert.match(textOf(result), /no sibling/i);
+  assert.match(textOf(result), /no other sessions/i);
   await close();
 });
 

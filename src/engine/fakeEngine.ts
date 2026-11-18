@@ -43,9 +43,7 @@ export interface FakeTurnContext {
   showImage(image: EngineImage): Promise<ShowImageOutcome>;
   /** Like {@link showImage}, for an `archive_file` call and `onArchiveFile`. */
   archiveFile(file: EngineFile): Promise<ArchiveFileOutcome>;
-  /** Like {@link showImage}, for a `list_siblings` call and `onListSiblings`. */
   listSiblings(): Promise<ListSiblingsOutcome>;
-  /** Like {@link showImage}, for a `send_dispatch` call and `onSendDispatch`. */
   sendDispatch(dispatch: EngineDispatch): Promise<SendDispatchOutcome>;
   /** Like {@link showImage}, for a `remember` call and `onRemember`. */
   remember(memory: EngineMemory): Promise<RememberOutcome>;

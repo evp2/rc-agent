@@ -122,9 +122,7 @@ export interface EngineGuaranteeHarness {
   makeRememberEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
   /** Like {@link makeShowImageEngine}, for a `forget` call as {@link FORGET_CALL}. */
   makeForgetEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
-  /** Like {@link makeShowImageEngine}, for a `list_siblings` call as {@link LIST_SIBLINGS_CALL}. */
   makeListSiblingsEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
-  /** Like {@link makeShowImageEngine}, for a `send_dispatch` call as {@link SEND_DISPATCH_CALL}. */
   makeSendDispatchEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
   /** A Turn that finishes on its own; `promptText()` is the text the Engine gave its model for what was sent, read once the Turn has ended. */
   makePromptEngine?(): { engine: Engine; promptText(): string | undefined };
@@ -485,7 +483,7 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
     });
   }
 
-  test(`${name}: a promoted Dispatch's framing reaches the model whole, naming the sibling that sent it`, { skip: !harness.makePromptEngine }, async () => {
+  test(`${name}: a promoted Dispatch's framing reaches the model whole, naming the session that sent it`, { skip: !harness.makePromptEngine }, async () => {
     const framed = engineText({
       ...DISPATCH_COMMAND,
       text: "run the migration",

@@ -134,18 +134,21 @@ export class FakeRelay {
   }
 
   /** Every Dispatch the relay was asked to hold. */
-  readonly dispatches: { to: string; text: string }[] = [];
+  readonly dispatches: { to: string; text: string; turnSource?: "dispatch" }[] = [];
   /** What the relay answers to a Dispatch: held, unless a test sets a refusal. */
   dispatchResult: DispatchResult = { held: true };
   /** Set to make the next sendDispatch reject. */
   failNextDispatch: Error | undefined;
 
-  async sendDispatch(to: string, text: string): Promise<DispatchResult> {
-    this.dispatches.push({ to, text });
+  async sendDispatch(to: string, text: string, turnSource?: "dispatch"): Promise<DispatchResult> {
+    this.dispatches.push({ to, text, ...(turnSource ? { turnSource } : {}) });
     if (this.failNextDispatch) {
       const e = this.failNextDispatch;
       this.failNextDispatch = undefined;
       throw e;
+    }
+    if (turnSource === "dispatch") {
+      return { held: false, reason: "from_dispatch_turn", error: "a Turn started by a Dispatch cannot send a Dispatch" };
     }
     return this.dispatchResult;
   }

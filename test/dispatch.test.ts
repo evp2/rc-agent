@@ -71,7 +71,7 @@ test("send_dispatch hands the relay the target and text and reports it held", as
 });
 
 const REFUSALS: [reason: string, expected: RegExp][] = [
-  ["no_such_sibling", /no sibling session with that id/i],
+  ["no_such_sibling", /no other session with that id/i],
   ["target_ended", /ended/i],
   ["text_too_long", /too long/i],
   ["too_many_held", /too many/i],
@@ -122,12 +122,20 @@ test("send_dispatch reports a relay failure as a reason", async () => {
   await h.close();
 });
 
-test("a Turn a promoted Dispatch started cannot send a Dispatch, and the relay is never asked", async () => {
+test("a send from a Turn a promoted Dispatch started tells the relay so, and the relay's refusal reaches the agent", async () => {
   const { h, result } = await inTurn(dispatchCmd("do the thing"), (turn) => turn.sendDispatch({ to: "s2", text: "and you" }));
 
   assert.ok(!result.sent);
   assert.match(result.reason, /started by a Dispatch/i);
-  assert.deepEqual(h.relay.dispatches, []);
+  assert.deepEqual(h.relay.dispatches, [{ to: "s2", text: "and you", turnSource: "dispatch" }]);
+  await h.close();
+});
+
+test("a send from a Turn a person started names no Turn source and is held", async () => {
+  const { h, result } = await inTurn(cmd("hand it over"), (turn) => turn.sendDispatch({ to: "s2", text: "go" }));
+
+  assert.deepEqual(result, { sent: true });
+  assert.deepEqual(h.relay.dispatches, [{ to: "s2", text: "go" }]);
   await h.close();
 });
 
@@ -204,6 +212,37 @@ test("a promoted Dispatch arriving mid-Turn queues behind it instead of Steering
   h.ctx.engineSession.stop();
   await turn;
   assert.deepEqual(causes, ["command"]);
+  await h.close();
+});
+
+test("a promoted Dispatch ahead of a person's own Command in the poll queues, and does not stop that Command Steering", async () => {
+  const causes: string[] = [];
+  const h = await makeTurnHarness({
+    handlerFor: (cause) => {
+      causes.push(cause);
+      return cause === "steer" ? sayAndFinish("steered") : workUntilInterrupted;
+    },
+  });
+  const dispatched = dispatchCmd("a dispatched task");
+  const correction = cmd("a correction from the person");
+  const later = cmd("a later message");
+  let served = false;
+  h.relay.pollCommands = async () => {
+    if (served) return [];
+    served = true;
+    return [dispatched, correction, later];
+  };
+
+  const turn = runTurn(h.ctx, cmd("first"));
+  await until(() => !!h.ctx.currentTurn?.running);
+  await checkForSteer(h.ctx);
+  await turn;
+
+  assert.deepEqual(causes, ["command", "steer"]);
+  assert.ok(h.ctx.eventBuffer.some((e) => e.text === "steered"));
+  assert.deepEqual(h.ctx.handBackBuffer, [dispatched, later]);
+  assert.equal(h.ledger.snapshot()?.length, 2);
+  assert.equal(h.ledger.cursor, later.seq);
   await h.close();
 });
 
