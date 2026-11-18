@@ -3,6 +3,16 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 
 import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION, archivedText, forwardArchiveFile } from "../archiveFileTool";
 import {
+  DISPATCH_HELD,
+  forwardListSiblings,
+  forwardSendDispatch,
+  LIST_SIBLINGS_DESCRIPTION,
+  SEND_DISPATCH_DESCRIPTION,
+  SEND_DISPATCH_TEXT_DESCRIPTION,
+  SEND_DISPATCH_TO_DESCRIPTION,
+  siblingsText,
+} from "../dispatchTools";
+import {
   forwardRemember,
   REMEMBER_CONTENT_DESCRIPTION,
   REMEMBER_DESCRIPTION,
@@ -113,6 +123,39 @@ function archiveFileTool(onArchiveFile: NonNullable<OpenOptions["onArchiveFile"]
       return outcome.archived
         ? text(archivedText(outcome.filename, outcome.byteLength))
         : text(outcome.reason, true);
+    },
+  });
+}
+
+function listSiblingsTool(onListSiblings: NonNullable<OpenOptions["onListSiblings"]>): ToolDefinition {
+  return defineTool({
+    name: "list_siblings",
+    label: "List siblings",
+    description: LIST_SIBLINGS_DESCRIPTION,
+    parameters: Type.Object({}),
+    execute: async (_toolCallId, _params, signal) => {
+      const outcome = await forwardListSiblings(onListSiblings, signal ?? new AbortController().signal);
+      return "siblings" in outcome ? text(siblingsText(outcome.siblings)) : text(outcome.reason, true);
+    },
+  });
+}
+
+function sendDispatchTool(onSendDispatch: NonNullable<OpenOptions["onSendDispatch"]>): ToolDefinition {
+  return defineTool({
+    name: "send_dispatch",
+    label: "Send Dispatch",
+    description: SEND_DISPATCH_DESCRIPTION,
+    parameters: Type.Object({
+      to: Type.String({ description: SEND_DISPATCH_TO_DESCRIPTION }),
+      text: Type.String({ description: SEND_DISPATCH_TEXT_DESCRIPTION }),
+    }),
+    execute: async (_toolCallId, { to, text: dispatchText }, signal) => {
+      const outcome = await forwardSendDispatch(
+        onSendDispatch,
+        { to, text: dispatchText },
+        signal ?? new AbortController().signal,
+      );
+      return outcome.sent ? text(DISPATCH_HELD) : text(outcome.reason, true);
     },
   });
 }
@@ -228,6 +271,8 @@ export function connectorTools(options: OpenOptions, tasks: TaskRegistry, profil
     subagentTool(tasks, profiles?.profiles),
     ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
     ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile)] : []),
+    ...(options.onListSiblings ? [listSiblingsTool(options.onListSiblings)] : []),
+    ...(options.onSendDispatch ? [sendDispatchTool(options.onSendDispatch)] : []),
     ...(options.onRemember ? [rememberTool(options.onRemember)] : []),
     ...(options.onForget ? [forgetTool(options.onForget)] : []),
   ];

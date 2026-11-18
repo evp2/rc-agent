@@ -9,6 +9,12 @@ import type { SessionEvent } from "@github/copilot-sdk";
 import { approveEverything, CopilotEngine } from "../src/engine/copilot/adapter.ts";
 import type { CopilotRuntime } from "../src/engine/copilot/runtime.ts";
 import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION } from "../src/engine/archiveFileTool.ts";
+import {
+  LIST_SIBLINGS_DESCRIPTION,
+  SEND_DISPATCH_DESCRIPTION,
+  SEND_DISPATCH_TEXT_DESCRIPTION,
+  SEND_DISPATCH_TO_DESCRIPTION,
+} from "../src/engine/dispatchTools.ts";
 import { memoryOptions } from "../src/session/memory.ts";
 import type {
   ArchiveFileOutcome,
@@ -30,6 +36,8 @@ import {
 } from "./copilotDoubles.ts";
 import {
   ARCHIVE_FILE_CALL,
+  LIST_SIBLINGS_CALL,
+  SEND_DISPATCH_CALL,
   FORGET_CALL,
   REMEMBER_CALL,
   runEngineGuaranteeSuite,
@@ -139,6 +147,18 @@ const harness: EngineGuaranteeHarness = {
   makeArchiveFileEngine: () => {
     const { toolUseId, path } = ARCHIVE_FILE_CALL;
     return toolCallingEngine("archive_file", toolUseId, { path });
+  },
+
+  makeListSiblingsEngine: () => toolCallingEngine("list_siblings", LIST_SIBLINGS_CALL.toolUseId, {}),
+
+  makeSendDispatchEngine: () => {
+    const { toolUseId, to, text } = SEND_DISPATCH_CALL;
+    return toolCallingEngine("send_dispatch", toolUseId, { to, text });
+  },
+
+  makePromptEngine: () => {
+    const runtime = new FakeCopilotRuntime({ onSend: (s) => s.emit(simpleTurn()) });
+    return { engine: engineOn(runtime), promptText: () => runtime.sessions[0]?.sent[0] };
   },
 
   makeRememberEngine: () => {
@@ -2023,6 +2043,39 @@ test("CopilotEngine: a session opened without onShowImage offers no show_image t
   const session = await engineOn(runtime).open(openOptions());
 
   assert.ok(!runtime.session.options.tools?.some((t) => t.name === "show_image"));
+  await session.close();
+});
+
+test("CopilotEngine: list_siblings and send_dispatch are offered with Claude's descriptions when the session can reach siblings", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open({
+    ...openOptions(),
+    onListSiblings: async () => ({ siblings: [] }),
+    onSendDispatch: async () => ({ sent: true }),
+  });
+
+  const tools = runtime.session.options.tools ?? [];
+  const list = tools.find((t) => t.name === "list_siblings");
+  const send = tools.find((t) => t.name === "send_dispatch");
+  assert.equal(list?.description, LIST_SIBLINGS_DESCRIPTION);
+  assert.equal(send?.description, SEND_DISPATCH_DESCRIPTION);
+  assert.deepEqual(send?.parameters, {
+    type: "object",
+    properties: {
+      to: { type: "string", description: SEND_DISPATCH_TO_DESCRIPTION },
+      text: { type: "string", description: SEND_DISPATCH_TEXT_DESCRIPTION },
+    },
+    required: ["to", "text"],
+  });
+  await session.close();
+});
+
+test("CopilotEngine: a session opened without the dispatch callbacks offers neither dispatch tool", async () => {
+  const runtime = new FakeCopilotRuntime();
+  const session = await engineOn(runtime).open(openOptions());
+
+  const names = (runtime.session.options.tools ?? []).map((t) => t.name);
+  assert.ok(!names.includes("list_siblings") && !names.includes("send_dispatch"), names.join(", "));
   await session.close();
 });
 

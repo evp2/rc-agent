@@ -6,13 +6,17 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { archivedText } from "../src/engine/archiveFileTool.ts";
+import { DISPATCH_HELD, siblingsText } from "../src/engine/dispatchTools.ts";
 import { forgetUnknownText, forgottenText, memoryFolderUnavailableText, memoryTooLargeText, rememberedText } from "../src/engine/memoryTools.ts";
 import { createMemoryStore } from "../src/memory/store.ts";
+import type { CommandRecord } from "../src/relay/client.ts";
+import { engineText } from "../src/session/dispatch.ts";
 import { memoryOptions } from "../src/session/memory.ts";
 import type {
   ArchiveFileOutcome,
   Engine,
   EngineAnswer,
+  EngineDispatch,
   EngineEvent,
   EngineFile,
   EngineForget,
@@ -20,7 +24,9 @@ import type {
   EngineMemory,
   EngineQuestion,
   ForgetOutcome,
+  ListSiblingsOutcome,
   RememberOutcome,
+  SendDispatchOutcome,
   ShowImageOutcome,
 } from "../src/engine/types.ts";
 import { IMAGE_SHOWN } from "../src/engine/showImageTool.ts";
@@ -52,6 +58,25 @@ export const FORGET_CALL: EngineForget = {
   toolUseId: "forget-1",
   scope: "project",
   name: "commit-style",
+};
+
+/** The `send_dispatch` call every {@link EngineGuaranteeHarness.makeSendDispatchEngine} Turn makes. */
+export const SEND_DISPATCH_CALL: { toolUseId: string } & EngineDispatch = {
+  toolUseId: "send-dispatch-1",
+  to: "s2",
+  text: "run the migration",
+};
+
+/** The `list_siblings` call every {@link EngineGuaranteeHarness.makeListSiblingsEngine} Turn makes. */
+export const LIST_SIBLINGS_CALL = { toolUseId: "list-siblings-1" };
+
+const DISPATCH_COMMAND: CommandRecord = {
+  seq: "1",
+  text: "",
+  created_at: "2026-11-18T00:00:00.000Z",
+  source: "dispatch",
+  dispatched_from_session: "s1",
+  dispatched_from_project_dir: "/work/relay",
 };
 
 /** The startup text every {@link EngineGuaranteeHarness.makeStartupTextEngine} session is opened with. */
@@ -97,6 +122,12 @@ export interface EngineGuaranteeHarness {
   makeRememberEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
   /** Like {@link makeShowImageEngine}, for a `forget` call as {@link FORGET_CALL}. */
   makeForgetEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
+  /** Like {@link makeShowImageEngine}, for a `list_siblings` call as {@link LIST_SIBLINGS_CALL}. */
+  makeListSiblingsEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
+  /** Like {@link makeShowImageEngine}, for a `send_dispatch` call as {@link SEND_DISPATCH_CALL}. */
+  makeSendDispatchEngine?(): { engine: Engine; toolResult(): ConnectorToolResult | undefined };
+  /** A Turn that finishes on its own; `promptText()` is the text the Engine gave its model for what was sent, read once the Turn has ended. */
+  makePromptEngine?(): { engine: Engine; promptText(): string | undefined };
   /** A Turn that finishes on its own; `startupText()` is the memory text the Engine gave its model at the start of the Session, read once the Turn has ended. */
   makeStartupTextEngine?(): { engine: Engine; startupText(): string | undefined };
 }
@@ -110,6 +141,8 @@ function openOptions(
     onForget?: (forget: EngineForget, signal: AbortSignal) => Promise<ForgetOutcome>;
     onShowImage?: (image: EngineImage, signal: AbortSignal) => Promise<ShowImageOutcome>;
     onArchiveFile?: (file: EngineFile, signal: AbortSignal) => Promise<ArchiveFileOutcome>;
+    onListSiblings?: (signal: AbortSignal) => Promise<ListSiblingsOutcome>;
+    onSendDispatch?: (dispatch: EngineDispatch, signal: AbortSignal) => Promise<SendDispatchOutcome>;
   } = {},
 ): {
   projectDir: string;
@@ -120,6 +153,8 @@ function openOptions(
   onQuestion: (q: EngineQuestion, signal: AbortSignal) => Promise<EngineAnswer>;
   onShowImage?: (image: EngineImage, signal: AbortSignal) => Promise<ShowImageOutcome>;
   onArchiveFile?: (file: EngineFile, signal: AbortSignal) => Promise<ArchiveFileOutcome>;
+  onListSiblings?: (signal: AbortSignal) => Promise<ListSiblingsOutcome>;
+  onSendDispatch?: (dispatch: EngineDispatch, signal: AbortSignal) => Promise<SendDispatchOutcome>;
 } {
   return {
     projectDir: "/tmp/engine-guarantee-suite",
@@ -392,6 +427,80 @@ export function runEngineGuaranteeSuite(name: string, harness: EngineGuaranteeHa
       await session.close();
     });
   }
+
+  for (const outcome of [
+    { siblings: [{ sessionId: "s2", projectDir: "/work/connector", engine: "pi", name: "connector" }] },
+    { siblings: [] },
+    { reason: "the relay is unreachable" },
+  ] satisfies ListSiblingsOutcome[]) {
+    const kind = "reason" in outcome ? "failure" : outcome.siblings.length ? "list" : "empty list";
+    test(`${name}: a list_siblings call reaches onListSiblings, and its ${kind} comes back as the tool result`, { skip: !harness.makeListSiblingsEngine }, async () => {
+      const { engine, toolResult } = harness.makeListSiblingsEngine!();
+      let calls = 0;
+      const session = await engine.open(
+        openOptions({
+          onListSiblings: async () => {
+            calls++;
+            return outcome;
+          },
+        }),
+      );
+      const it = session.events[Symbol.asyncIterator]();
+      session.send("who else is there");
+      await readUntil(it, turnEnded);
+      assert.equal(calls, 1);
+      const result = toolResult();
+      assert.ok(result, "the call returned a tool result to the SDK");
+      assert.equal(result.isError, "reason" in outcome);
+      assert.equal(result.text, "reason" in outcome ? outcome.reason : siblingsText(outcome.siblings));
+      await session.close();
+    });
+  }
+
+  for (const outcome of [
+    { sent: true },
+    { sent: false, reason: "The Dispatch was refused: that session has ended, so nothing can be handed to it." },
+  ] satisfies SendDispatchOutcome[]) {
+    const kind = outcome.sent ? "held confirmation" : "refusal";
+    test(`${name}: a send_dispatch call reaches onSendDispatch, and its ${kind} comes back as the tool result`, { skip: !harness.makeSendDispatchEngine }, async () => {
+      const { engine, toolResult } = harness.makeSendDispatchEngine!();
+      const received: EngineDispatch[] = [];
+      const session = await engine.open(
+        openOptions({
+          onSendDispatch: async (dispatch) => {
+            received.push(dispatch);
+            return outcome;
+          },
+        }),
+      );
+      const it = session.events[Symbol.asyncIterator]();
+      session.send("hand it over");
+      await readUntil(it, turnEnded);
+      assert.deepEqual(received, [{ to: SEND_DISPATCH_CALL.to, text: SEND_DISPATCH_CALL.text }]);
+      const result = toolResult();
+      assert.ok(result, "the call returned a tool result to the SDK");
+      assert.equal(result.isError, !outcome.sent);
+      assert.equal(result.text, outcome.sent ? DISPATCH_HELD : outcome.reason);
+      await session.close();
+    });
+  }
+
+  test(`${name}: a promoted Dispatch's framing reaches the model whole, naming the sibling that sent it`, { skip: !harness.makePromptEngine }, async () => {
+    const framed = engineText({
+      ...DISPATCH_COMMAND,
+      text: "run the migration",
+    });
+    const { engine, promptText } = harness.makePromptEngine!();
+    const session = await engine.open(openOptions());
+    const it = session.events[Symbol.asyncIterator]();
+    session.send(framed);
+    await readUntil(it, turnEnded);
+    const prompt = promptText() ?? "";
+    assert.ok(prompt.includes(framed), `the model's prompt carries the framed text intact: ${prompt}`);
+    assert.match(prompt, /^\[Dispatch from another session, not from the user\. It was sent by session s1, working in \/work\/relay;/);
+    assert.match(prompt, /run the migration$/);
+    await session.close();
+  });
 
   for (const outcome of [
     { saved: true, index: "- commit-style: How the person likes commits" },

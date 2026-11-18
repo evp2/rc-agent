@@ -16,6 +16,8 @@ import { type ModelRuntime, SessionManager } from "@earendil-works/pi-coding-age
 import type { Engine, EngineAnswer, EngineEvent, EngineQuestion, EngineSession } from "../src/engine/types.ts";
 import {
   ARCHIVE_FILE_CALL,
+  LIST_SIBLINGS_CALL,
+  SEND_DISPATCH_CALL,
   FORGET_CALL,
   REMEMBER_CALL,
   runEngineGuaranteeSuite,
@@ -73,6 +75,24 @@ const harness: EngineGuaranteeHarness = {
     const { toolUseId: id, path, caption } = SHOW_IMAGE_CALL;
     const model = callingTools([{ name: "show_image", args: { path, caption: caption! }, id }]);
     return { engine: piEngineOn(model.steps).engine, toolResult: () => model.results().get(id) };
+  },
+  makeListSiblingsEngine: () => {
+    const model = callingTools([{ name: "list_siblings", args: {}, id: LIST_SIBLINGS_CALL.toolUseId }]);
+    return { engine: piEngineOn(model.steps).engine, toolResult: () => model.results().get(LIST_SIBLINGS_CALL.toolUseId) };
+  },
+  makeSendDispatchEngine: () => {
+    const { toolUseId: id, to, text } = SEND_DISPATCH_CALL;
+    const model = callingTools([{ name: "send_dispatch", args: { to, text }, id }]);
+    return { engine: piEngineOn(model.steps).engine, toolResult: () => model.results().get(id) };
+  },
+  makePromptEngine: () => {
+    let prompt: string | undefined;
+    const step: FauxResponseStep = (context) => {
+      const user = context.messages.findLast((m) => m.role === "user");
+      prompt = typeof user?.content === "string" ? user.content : user?.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+      return fauxAssistantMessage("hi");
+    };
+    return { engine: piEngineOn([step]).engine, promptText: () => prompt };
   },
   makeRememberEngine: () => {
     const { toolUseId: id, scope, name, description, content } = REMEMBER_CALL;

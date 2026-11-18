@@ -9,6 +9,16 @@ import type { CopilotProviderConfig } from "../../provider";
 import type { SkillInfo } from "../../relay/client";
 import { ARCHIVE_FILE_DESCRIPTION, ARCHIVE_FILE_PATH_DESCRIPTION, archivedText, forwardArchiveFile } from "../archiveFileTool";
 import {
+  DISPATCH_HELD,
+  forwardListSiblings,
+  forwardSendDispatch,
+  LIST_SIBLINGS_DESCRIPTION,
+  SEND_DISPATCH_DESCRIPTION,
+  SEND_DISPATCH_TEXT_DESCRIPTION,
+  SEND_DISPATCH_TO_DESCRIPTION,
+  siblingsText,
+} from "../dispatchTools";
+import {
   forwardRemember,
   REMEMBER_CONTENT_DESCRIPTION,
   REMEMBER_DESCRIPTION,
@@ -161,6 +171,53 @@ function archiveFileTool(
   };
 }
 
+/** Like {@link showImageTool}, for `list_siblings` and `onListSiblings`. */
+function listSiblingsTool(onListSiblings: NonNullable<OpenOptions["onListSiblings"]>): Tool {
+  return {
+    name: "list_siblings",
+    description: LIST_SIBLINGS_DESCRIPTION,
+    parameters: { type: "object", properties: {} },
+    skipPermission: true,
+    defer: "never",
+    handler: async (_args, invocation): Promise<ToolResultObject> => {
+      const outcome = await forwardListSiblings(onListSiblings, invocation.signal ?? new AbortController().signal);
+      return "siblings" in outcome
+        ? { textResultForLlm: siblingsText(outcome.siblings), resultType: "success" }
+        : failure(outcome.reason);
+    },
+  };
+}
+
+/** Like {@link showImageTool}, for `send_dispatch` and `onSendDispatch`. */
+function sendDispatchTool(onSendDispatch: NonNullable<OpenOptions["onSendDispatch"]>): Tool {
+  return {
+    name: "send_dispatch",
+    description: SEND_DISPATCH_DESCRIPTION,
+    parameters: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: SEND_DISPATCH_TO_DESCRIPTION },
+        text: { type: "string", description: SEND_DISPATCH_TEXT_DESCRIPTION },
+      },
+      required: ["to", "text"],
+    },
+    skipPermission: true,
+    defer: "never",
+    handler: async (args, invocation): Promise<ToolResultObject> => {
+      const { to, text } = (args ?? {}) as { to?: unknown; text?: unknown };
+      if (typeof to !== "string" || !to || typeof text !== "string" || !text) {
+        return failure("the Dispatch wasn't sent: it needs both a session id (to) and text");
+      }
+      const outcome = await forwardSendDispatch(
+        onSendDispatch,
+        { to, text },
+        invocation.signal ?? new AbortController().signal,
+      );
+      return outcome.sent ? { textResultForLlm: DISPATCH_HELD, resultType: "success" } : failure(outcome.reason);
+    },
+  };
+}
+
 /** Like {@link showImageTool}, for `remember` and `onRemember`. */
 function rememberTool(onRemember: NonNullable<OpenOptions["onRemember"]>): Tool {
   return {
@@ -237,6 +294,8 @@ function connectorTools(options: OpenOptions, stoppable: Set<AbortController>): 
   return [
     ...(options.onShowImage ? [showImageTool(options.onShowImage)] : []),
     ...(options.onArchiveFile ? [archiveFileTool(options.onArchiveFile, stoppable)] : []),
+    ...(options.onListSiblings ? [listSiblingsTool(options.onListSiblings)] : []),
+    ...(options.onSendDispatch ? [sendDispatchTool(options.onSendDispatch)] : []),
     ...(options.onRemember ? [rememberTool(options.onRemember)] : []),
     ...(options.onForget ? [forgetTool(options.onForget)] : []),
   ];
