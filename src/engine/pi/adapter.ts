@@ -39,6 +39,7 @@ import { chooseEffort, chooseModel } from "./modelCommands";
 import { type SubagentCommand, subagentSettings } from "./subagent";
 import { refreshAwsProfileFiles } from "./awsProfile";
 import { applyGuardrail } from "./guardrail";
+import { retryTransportErrors } from "./transportRetry";
 import { CredentialRenewal, renewExpiredCredentials, runCommand, type RunCommand } from "./awsAuthRefresh";
 import { connectorTools, QUESTION_TOOL } from "./tools";
 
@@ -191,6 +192,7 @@ export class PiEngine implements Engine {
       ...(model ? { model } : {}),
       ...(provider.thinkingLevel && !effortChosenAlready && !chosenAlready ? { thinkingLevel: provider.thinkingLevel } : {}),
     });
+    retryTransportErrors(session);
     // With no model to pick, Pi leaves a placeholder in place rather than none.
     const chosen = session.model && modelRuntime.getModel(session.model.provider, session.model.id);
     try {
